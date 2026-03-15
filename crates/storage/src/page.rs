@@ -43,7 +43,6 @@ pub struct BPlusTreeInternalPage<K> {
     pub header: BPlusTreeInternalPageHeader,
 
     // This is conceptually an array where Index 0 has an empty Key, 
-    // and just holds the leftmost Child PageId.
     pub elements: Vec<InternalKV<K>>,
     
 }
