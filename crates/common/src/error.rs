@@ -121,3 +121,9 @@ pub enum TypeNameError {
     #[error("invalid UTF-8 in type name: {0}")]
     InvalidUtf8(#[from] std::str::Utf8Error),
 }
+
+#[derive(Debug, Error)]
+pub enum LockManagerError {
+    #[error("record not found")]
+    RecordNotFound,
+}

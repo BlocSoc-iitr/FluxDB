@@ -133,6 +133,9 @@ dependencies = [
 [[package]]
 name = "concurrency"
 version = "0.1.0"
+dependencies = [
+ "common",
+]
 
 [[package]]
 name = "crc32fast"
