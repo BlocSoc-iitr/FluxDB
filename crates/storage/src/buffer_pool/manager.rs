@@ -101,9 +101,7 @@ impl BufferPoolManager {
 
         if needs_load {
             let mut data = shard.pages[frame_id].write().unwrap();
-            shard
-                .disk_manager
-                .read_page(page_id, data.0.as_mut())?;
+            shard.disk_manager.read_page(page_id, data.0.as_mut())?;
         }
 
         let data = shard.pages[frame_id].read().unwrap();
@@ -142,9 +140,7 @@ impl BufferPoolManager {
 
         let mut data = shard.pages[frame_id].write().unwrap();
         if needs_load {
-            shard
-                .disk_manager
-                .read_page(page_id, data.0.as_mut())?;
+            shard.disk_manager.read_page(page_id, data.0.as_mut())?;
         }
 
         Ok(PageWriteGuard {

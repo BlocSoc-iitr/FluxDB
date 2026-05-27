@@ -1,7 +1,7 @@
+use crate::TypeNameError;
 use std::cmp::Ordering;
 use std::fmt::Debug;
 use std::mem::size_of;
-use crate::TypeNameError;
 
 #[derive(Eq, PartialEq, Debug, Clone)]
 enum TypeClassification {

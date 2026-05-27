@@ -27,9 +27,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::vec;
 
-use common::WalError;
 use crate::disk::DiskManager;
 use crate::page::Lsn;
+use common::WalError;
 
 pub type Result<T> = std::result::Result<T, WalError>;
 

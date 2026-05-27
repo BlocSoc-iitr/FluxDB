@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Condvar, Mutex},
 };
 
@@ -27,8 +27,13 @@ struct LockQueue {
     cond_var: Condvar,
 }
 
+struct WaitForGraph {
+    waits: HashMap<u64, HashSet<u64>>,
+}
+
 pub struct LockManager {
     map: Mutex<HashMap<u64, Arc<LockQueue>>>,
+    waits: Mutex<WaitForGraph>,
 }
 
 impl Default for LockManager {
@@ -37,14 +42,67 @@ impl Default for LockManager {
     }
 }
 
+impl WaitForGraph {
+    pub fn new() -> Self {
+        Self {
+            waits: HashMap::new(),
+        }
+    }
+
+    pub fn add_wait(&mut self, waiter: u64, holder: u64) {
+        self.waits
+            .entry(waiter)
+            .or_insert_with(HashSet::new)
+            .insert(holder);
+    }
+
+    pub fn remove_wait(&mut self, waiter: u64, holder: u64) {
+        if let Some(set) = self.waits.get_mut(&waiter) {
+            set.remove(&holder);
+            if set.is_empty() {
+                self.waits.remove(&waiter);
+            }
+        }
+    }
+
+    pub fn has_cycle(&self, start_tx: u64) -> bool {
+        let mut visited = HashSet::new();
+        self.dfs(start_tx, &mut visited)
+    }
+
+    fn dfs(&self, curr_tx: u64, visited: &mut HashSet<u64>) -> bool {
+        if visited.contains(&curr_tx) {
+            return true;
+        }
+        visited.insert(curr_tx);
+
+        if let Some(waits_for) = self.waits.get(&curr_tx) {
+            for &next_tx in waits_for {
+                if self.dfs(next_tx, visited) {
+                    return true;
+                }
+            }
+        }
+
+        visited.remove(&curr_tx);
+        false
+    }
+}
+
 impl LockManager {
     pub fn new() -> Self {
         Self {
             map: Mutex::new(HashMap::new()),
+            waits: Mutex::new(WaitForGraph::new()),
         }
     }
 
-    pub fn acquire_lock(&self, transaction_id: u64, page_id: u64, lock_type: LockType) {
+    pub fn acquire_lock(
+        &self,
+        transaction_id: u64,
+        page_id: u64,
+        lock_type: LockType,
+    ) -> Result<(), LockManagerError> {
         let queue = {
             let mut map_guard = self.map.lock().unwrap();
             map_guard
@@ -81,7 +139,33 @@ impl LockManager {
         });
 
         if can_grant {
-            return;
+            return Ok(());
+        }
+
+        let holders: Vec<u64> = guard
+            .requests
+            .iter()
+            .filter(|r| r.is_granted)
+            .map(|r| r.transaction_id)
+            .collect();
+
+        {
+            let mut wait_guard = self.waits.lock().unwrap();
+            // Edge direction is: WAITER -> HOLDER
+            for &holder_id in &holders {
+                wait_guard.add_wait(transaction_id, holder_id);
+            }
+
+            if wait_guard.has_cycle(transaction_id) {
+                for &holder_id in &holders {
+                    wait_guard.remove_wait(transaction_id, holder_id);
+                }
+                
+                let idx = guard.requests.iter().position(|r| r.transaction_id == transaction_id).unwrap();
+                guard.requests.remove(idx);
+                
+                return Err(LockManagerError::DeadLock);
+            }
         }
 
         loop {
@@ -96,12 +180,17 @@ impl LockManager {
                 break;
             }
         }
+
+        Ok(())
     }
 
     pub fn release_lock(&self, transaction_id: u64, page_id: u64) -> Result<(), LockManagerError> {
         let queue_guard = {
             let map_guard = self.map.lock().unwrap();
-            map_guard.get(&page_id).ok_or(LockManagerError::RecordNotFound)?.clone()
+            map_guard
+                .get(&page_id)
+                .ok_or(LockManagerError::RecordNotFound)?
+                .clone()
         };
 
         let mut guard = queue_guard.state.lock().unwrap();
@@ -119,6 +208,7 @@ impl LockManager {
 
         let mut any_granted = false;
         let mut exclusive_seen = false;
+        let mut newly_granted_txs = Vec::new();
 
         for request in guard.requests.iter_mut() {
             if request.is_granted {
@@ -134,6 +224,7 @@ impl LockManager {
 
                 if can_grant {
                     request.is_granted = true;
+                    newly_granted_txs.push(request.transaction_id);
                     any_granted = true;
                     if request.lock_type == LockType::ExclusiveLock {
                         exclusive_seen = true;
@@ -146,6 +237,24 @@ impl LockManager {
             }
         }
 
+        let remaining_waiters: Vec<u64> = guard
+            .requests
+            .iter()
+            .filter(|r| !r.is_granted)
+            .map(|r| r.transaction_id)
+            .collect();
+
+        {
+            let mut wait_guard = self.waits.lock().unwrap();
+            for waiter_id in newly_granted_txs {
+                wait_guard.remove_wait(waiter_id, transaction_id);
+            }
+            
+            for waiter_id in remaining_waiters {
+                wait_guard.remove_wait(waiter_id, transaction_id);
+            }
+        }
+
         queue_guard.cond_var.notify_all();
         Ok(())
     }
@@ -153,7 +262,10 @@ impl LockManager {
     pub fn upgrade_lock(&self, transaction_id: u64, page_id: u64) -> Result<(), LockManagerError> {
         let queue_guard = {
             let map_guard = self.map.lock().unwrap();
-            map_guard.get(&page_id).ok_or(LockManagerError::RecordNotFound)?.clone()
+            map_guard
+                .get(&page_id)
+                .ok_or(LockManagerError::RecordNotFound)?
+                .clone()
         };
 
         let mut guard = queue_guard.state.lock().unwrap();
@@ -174,7 +286,7 @@ impl LockManager {
         }
 
         if guard.is_upgrading {
-            return Err(LockManagerError::UpgradeConflict); 
+            return Err(LockManagerError::UpgradeConflict);
         }
 
         guard.is_upgrading = true;
@@ -194,7 +306,11 @@ impl LockManager {
         guard.requests.insert(insert_index, req);
 
         loop {
-            let my_req = guard.requests.iter().find(|r| r.transaction_id == transaction_id).unwrap();
+            let my_req = guard
+                .requests
+                .iter()
+                .find(|r| r.transaction_id == transaction_id)
+                .unwrap();
             if my_req.is_granted {
                 guard.is_upgrading = false;
                 break;

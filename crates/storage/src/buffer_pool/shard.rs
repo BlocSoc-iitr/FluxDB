@@ -4,9 +4,9 @@
 //! reduces lock contention by allowing multiple threads to access different
 //! partitions of the buffer pool simultaneously.
 
-use common::BufferPoolError;
 use crate::buffer_pool::replacer::ClockReplacer;
 use crate::disk::DiskManager;
+use common::BufferPoolError;
 use common::{INVALID_FRAME_ID, MAX_PAGE_SIZE};
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
@@ -293,10 +293,8 @@ impl BufferPoolShard {
             buf.copy_from_slice(&data[..]);
         }
 
-        self.disk_manager
-            .write_page(page_id, &buf)?;
-        self.disk_manager
-            .sync_data()?;
+        self.disk_manager.write_page(page_id, &buf)?;
+        self.disk_manager.sync_data()?;
         Ok(())
     }
 

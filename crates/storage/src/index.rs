@@ -14,12 +14,12 @@ use std::sync::{Arc, Mutex};
 use common::{Key, MAX_KEY_SIZE, Value};
 use db_core::transaction_manager::TransactionManager;
 
-use common::IndexError;
 use crate::buffer_pool::{BufferPoolManager, PageReadGuard, PageWriteGuard};
 use crate::page::{
     INTERNAL, InternalPageAccessor, InternalPageBuilder, InternalPageMutator, LEAF,
     LeafPageAccessor, LeafPageBuilder, LeafPageMutator, PageId,
 };
+use common::IndexError;
 
 use db_core::transaction::Transaction;
 
@@ -694,15 +694,13 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
 
         if target_pid == leaf_pid_actual {
             let (s, _) = LeafPageAccessor::<K, V>::new(&leaf_guard[..]).position(key);
-            LeafPageMutator::<K, V>::new(&mut leaf_guard[..])
-                .insert(s, key, value)?;
+            LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).insert(s, key, value)?;
             LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmin(s, txn_id);
         } else {
             drop(leaf_guard);
             let mut right = self.pool.fetch_page_mut(target_pid)?;
             let (s, _) = LeafPageAccessor::<K, V>::new(&right[..]).position(key);
-            LeafPageMutator::<K, V>::new(&mut right[..])
-                .insert(s, key, value)?;
+            LeafPageMutator::<K, V>::new(&mut right[..]).insert(s, key, value)?;
             LeafPageMutator::<K, V>::new(&mut right[..]).set_xmin(s, txn_id);
         }
 
@@ -859,8 +857,11 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             let acc = InternalPageAccessor::<K>::new(&parent_guard[..]);
             if acc.can_fit(sep_key.len()) {
                 let (idx, _) = acc.find_child(&K::from_bytes(&sep_key));
-                InternalPageMutator::<K>::new(&mut parent_guard[..])
-                    .insert_key_and_right_child(idx, &K::from_bytes(&sep_key), right_pid)?;
+                InternalPageMutator::<K>::new(&mut parent_guard[..]).insert_key_and_right_child(
+                    idx,
+                    &K::from_bytes(&sep_key),
+                    right_pid,
+                )?;
                 return Ok(());
             }
 
