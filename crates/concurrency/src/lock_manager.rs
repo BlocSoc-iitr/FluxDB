@@ -100,6 +100,36 @@ impl LockManager {
             .ok_or(LockManagerError::RecordNotFound)?;
 
         guard.remove(index);
+
+        let mut any_granted = false;
+        let mut exclusive_seen = false;
+
+        for request in guard.iter_mut() {
+            if request.is_granted {
+                any_granted = true;
+                if request.lock_type == LockType::ExclusiveLock {
+                    exclusive_seen = true;
+                }
+            } else {
+                let can_grant = match request.lock_type {
+                    LockType::SharedLock => !exclusive_seen,
+                    LockType::ExclusiveLock => !any_granted,
+                };
+
+                if can_grant {
+                    request.is_granted = true;
+                    any_granted = true;
+                    if request.lock_type == LockType::ExclusiveLock {
+                        exclusive_seen = true;
+                    }
+                } else {
+                    if request.lock_type == LockType::ExclusiveLock {
+                        exclusive_seen = true;
+                    }
+                }
+            }
+        }
+
         queue_guard.cond_var.notify_all();
         Ok(())
     }
