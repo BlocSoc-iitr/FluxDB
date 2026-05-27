@@ -1,3 +1,15 @@
+//! Centralized Concurrency Control and Lock Management.
+//!
+//! The `LockManager` enforces strict Two-Phase Locking (2PL) across all transactions
+//! in FluxDB. It manages granular, resource-level queues and condition variables to
+//! allow highly concurrent, non-spinning lock acquisition.
+//!
+//! ## Core Features
+//!
+//! - **Strict 2PL:** Prevents dirty reads, unrepeatable reads, and phantom reads.
+//! - **Writer-Starvation Prevention:** Ensures that exclusive lock requests don't starve behind a constant stream of shared locks.
+//! - **Deadlock Detection:** Synchronously detects deadlocks using a Waits-For Graph (WFG) cycle detection algorithm upon every lock queueing event.
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Condvar, Mutex},
@@ -5,32 +17,55 @@ use std::{
 
 use common::LockManagerError;
 
+/// The type of lock requested by a transaction.
+///
+/// FluxDB uses a standard Multiple-Granularity Locking scheme with
+/// strict two-phase locking (2PL).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockType {
     SharedLock,
     ExclusiveLock,
 }
 
+/// Represents an active or pending lock request in a queue.
+#[derive(Debug)]
 struct LockRequest {
     transaction_id: u64,
     lock_type: LockType,
     is_granted: bool,
 }
 
+/// The internal state of a lock queue for a specific resource (e.g. a page).
+/// Tracks granted and pending locks, and prevents upgrade deadlocks.
+#[derive(Debug)]
 struct LockQueueState {
     requests: VecDeque<LockRequest>,
     is_upgrading: bool,
 }
 
+/// A synchronization queue for a single resource.
+/// Uses a Condition Variable to efficiently block transactions until they
+/// can acquire the requested lock.
+#[derive(Debug)]
 struct LockQueue {
     state: Mutex<LockQueueState>,
     cond_var: Condvar,
 }
 
+/// A Directed Graph tracking which transactions are waiting on which.
+/// Used for synchronous deadlock detection during lock acquisition.
+#[derive(Debug)]
 struct WaitForGraph {
     waits: HashMap<u64, HashSet<u64>>,
 }
 
+/// The centralized manager for all concurrency control locks in FluxDB.
+///
+/// Features:
+/// 1. **Strict 2PL:** Prevents dirty reads and non-repeatable reads.
+/// 2. **Writer-Starvation Prevention:** Shared lock requests will queue behind pending Exclusive requests.
+/// 3. **Deadlock Detection:** Automatically detects cycles in a Waits-For Graph and aborts deadlocking transactions.
+#[derive(Debug)]
 pub struct LockManager {
     map: Mutex<HashMap<u64, Arc<LockQueue>>>,
     waits: Mutex<WaitForGraph>,
@@ -97,6 +132,11 @@ impl LockManager {
         }
     }
 
+    /// Attempts to acquire a lock on a page for a transaction.
+    ///
+    /// If the lock cannot be granted immediately (e.g. due to conflict),
+    /// the transaction will block until the lock becomes available.
+    /// If blocking would cause a deadlock, returns `Err(LockManagerError::DeadLock)`.
     pub fn acquire_lock(
         &self,
         transaction_id: u64,
@@ -184,6 +224,9 @@ impl LockManager {
         Ok(())
     }
 
+    /// Releases a lock held by a transaction on a specific page.
+    ///
+    /// Automatically promotes queued transactions using Writer-Starvation Prevention logic.
     pub fn release_lock(&self, transaction_id: u64, page_id: u64) -> Result<(), LockManagerError> {
         let queue_guard = {
             let map_guard = self.map.lock().unwrap();
@@ -259,6 +302,11 @@ impl LockManager {
         Ok(())
     }
 
+    /// Upgrades an existing `SharedLock` to an `ExclusiveLock`.
+    ///
+    /// Requires the transaction to already hold a `SharedLock`.
+    /// Puts the upgrade request at the front of the queue to avoid starvation,
+    /// but will return `UpgradeConflict` if another transaction is already upgrading.
     pub fn upgrade_lock(&self, transaction_id: u64, page_id: u64) -> Result<(), LockManagerError> {
         let queue_guard = {
             let map_guard = self.map.lock().unwrap();

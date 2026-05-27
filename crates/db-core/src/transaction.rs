@@ -22,7 +22,9 @@
 //! `WriteConflict`). The first transaction to set `xmax` wins.
 
 use crate::transaction_manager::TransactionManager;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::{Arc, Mutex}};
+use concurrency::lock_manager::{LockManager, LockType};
+use common::LockManagerError;
 
 /// A transaction's identity and its point-in-time view of the database.
 ///
@@ -30,12 +32,11 @@ use std::sync::Arc;
 /// take a `&Transaction` to determine visibility and ownership.
 #[derive(Debug, Clone)]
 pub struct Transaction {
-    /// This transaction's unique, monotonically increasing ID.
     pub txn_id: u64,
-    /// The snapshot taken at the start of this transaction.
     pub snapshot: Snapshot,
-    /// The manager tracking commit log entries for visibility checking.
     pub tm: Arc<TransactionManager>,
+    pub lock_manager: Arc<LockManager>,
+    pub locked_pages: Arc<Mutex<HashSet<u64>>>
 }
 
 impl Transaction {
@@ -55,6 +56,55 @@ impl Transaction {
     /// perspective?
     pub fn is_in_progress(&self, txn_id: u64) -> bool {
         self.snapshot.is_in_progress(txn_id, &self.tm)
+    }
+
+    /// Acquires a shared lock on the given page.
+    pub fn acquire_shared_lock(&self, page_id: u64) -> Result<(), LockManagerError> {
+        self.lock_manager.acquire_lock(self.txn_id, page_id, LockType::SharedLock)?;
+        self.locked_pages.lock().unwrap().insert(page_id);
+        Ok(())
+    }
+
+    /// Acquires an exclusive lock on the given page.
+    pub fn acquire_exclusive_lock(&self, page_id: u64) -> Result<(), LockManagerError> {
+        self.lock_manager.acquire_lock(self.txn_id, page_id, LockType::ExclusiveLock)?;
+        self.locked_pages.lock().unwrap().insert(page_id);
+        Ok(())
+    }
+
+    /// Upgrades an existing shared lock to an exclusive lock.
+    pub fn upgrade_lock(&self, page_id: u64) -> Result<(), LockManagerError> {
+        self.lock_manager.upgrade_lock(self.txn_id, page_id)?;
+        self.locked_pages.lock().unwrap().insert(page_id);
+        Ok(())
+    }
+
+    /// Commits the transaction and releases all held locks.
+    pub fn commit(&self) {
+        self.tm.commit(self.txn_id);
+        let pages: Vec<u64> = {
+            let mut guard = self.locked_pages.lock().unwrap();
+            let p = guard.iter().copied().collect();
+            guard.clear();
+            p
+        };
+        for page_id in pages {
+            let _ = self.lock_manager.release_lock(self.txn_id, page_id);
+        }
+    }
+
+    /// Aborts the transaction and releases all held locks.
+    pub fn abort(&self) {
+        self.tm.abort(self.txn_id);
+        let pages: Vec<u64> = {
+            let mut guard = self.locked_pages.lock().unwrap();
+            let p = guard.iter().copied().collect();
+            guard.clear();
+            p
+        };
+        for page_id in pages {
+            let _ = self.lock_manager.release_lock(self.txn_id, page_id);
+        }
     }
 }
 

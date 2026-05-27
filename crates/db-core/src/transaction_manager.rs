@@ -34,6 +34,8 @@ use std::{
 };
 
 use crate::transaction::{Snapshot, Transaction};
+use concurrency::lock_manager::LockManager;
+use std::sync::Arc;
 
 /// Represents the deterministic final state of a transaction.
 ///
@@ -60,6 +62,7 @@ pub struct TransactionManager {
     pub next_txn_id: AtomicU64,
     pub clog: RwLock<HashMap<u64, TransactionStatus>>,
     pub active_txns: RwLock<HashSet<u64>>,
+    pub lock_manager: Arc<LockManager>,
 }
 
 impl TransactionManager {
@@ -69,6 +72,7 @@ impl TransactionManager {
             next_txn_id: AtomicU64::new(1),
             clog: RwLock::new(HashMap::new()),
             active_txns: RwLock::new(HashSet::new()),
+            lock_manager: Arc::new(LockManager::new()),
         }
     }
 
@@ -98,7 +102,7 @@ impl TransactionManager {
     /// race conditions. It acquires a write-lock on the active set *before*
     /// generating the new ID, ensuring that concurrent snapshot generators
     /// always see a consistent state.
-    pub fn begin(self: &std::sync::Arc<Self>) -> Transaction {
+    pub fn begin(self: &Arc<Self>) -> Transaction {
         // Write-lock active_txns FIRST to prevent race conditions with get_snapshot.
         // We must lock before fetching TXN_ID to ensure that no snapshot is
         // generated in between ID creation and active set insertion.
@@ -125,7 +129,9 @@ impl TransactionManager {
                 xmax,
                 active: active_vec,
             },
-            tm: std::sync::Arc::clone(self),
+            tm: self.clone(),
+            lock_manager: self.lock_manager.clone(),
+            locked_pages: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
 

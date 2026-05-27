@@ -149,6 +149,10 @@ dependencies = [
 [[package]]
 name = "db-core"
 version = "0.1.0"
+dependencies = [
+ "common",
+ "concurrency",
+]
 
 [[package]]
 name = "equivalent"

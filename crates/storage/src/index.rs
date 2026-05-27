@@ -1021,7 +1021,8 @@ mod tests {
     use crate::buffer_pool::manager::BufferPoolManager;
     use crate::disk::DiskManager;
     use common::MAX_PAGE_SIZE;
-    use std::mem::forget;
+    use std::collections::HashSet;
+use std::mem::forget;
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     use std::sync::{Arc, OnceLock};
     use tempfile::tempdir;
@@ -1047,6 +1048,8 @@ mod tests {
         Transaction {
             txn_id: TEST_TXN_ID.fetch_add(1, Relaxed),
             snapshot: db_core::transaction::Snapshot::latest(),
+            lock_manager: tm.lock_manager.clone(),
+            locked_pages: Arc::new(Mutex::new(HashSet::new())),
             tm,
         }
     }

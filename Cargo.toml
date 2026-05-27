@@ -7,3 +7,4 @@ clap = { version = "4", features = ["derive"] }
 common = { path = "crates/common" }
 thiserror = "1"
 db-core = { path = "crates/db-core"}
+concurrency = { path = "crates/concurrency" }

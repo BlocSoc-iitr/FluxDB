@@ -123,6 +123,7 @@ pub enum TypeNameError {
     InvalidUtf8(#[from] std::str::Utf8Error),
 }
 
+/// Errors that can occur during concurrency control operations.
 #[derive(Debug, Error)]
 pub enum LockManagerError {
     #[error("record not found")]
