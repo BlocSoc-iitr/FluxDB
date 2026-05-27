@@ -16,6 +16,7 @@ use std::{
 };
 
 use common::LockManagerError;
+use common::constants::LOCK_MANAGER_SHARDS;
 
 /// The type of lock requested by a transaction.
 ///
@@ -67,7 +68,7 @@ struct WaitForGraph {
 /// 3. **Deadlock Detection:** Automatically detects cycles in a Waits-For Graph and aborts deadlocking transactions.
 #[derive(Debug)]
 pub struct LockManager {
-    map: Mutex<HashMap<u64, Arc<LockQueue>>>,
+    shards: Vec<Mutex<HashMap<u64, Arc<LockQueue>>>>,
     waits: Mutex<WaitForGraph>,
 }
 
@@ -126,10 +127,20 @@ impl WaitForGraph {
 
 impl LockManager {
     pub fn new() -> Self {
+        let mut shards = Vec::with_capacity(LOCK_MANAGER_SHARDS);
+        for _ in 0..LOCK_MANAGER_SHARDS {
+            shards.push(Mutex::new(HashMap::new()));
+        }
         Self {
-            map: Mutex::new(HashMap::new()),
+            shards,
             waits: Mutex::new(WaitForGraph::new()),
         }
+    }
+
+    #[inline]
+    fn get_shard(&self, page_id: u64) -> &Mutex<HashMap<u64, Arc<LockQueue>>> {
+        let idx = (page_id as usize) % LOCK_MANAGER_SHARDS;
+        &self.shards[idx]
     }
 
     /// Attempts to acquire a lock on a page for a transaction.
@@ -144,7 +155,7 @@ impl LockManager {
         lock_type: LockType,
     ) -> Result<(), LockManagerError> {
         let queue = {
-            let mut map_guard = self.map.lock().unwrap();
+            let mut map_guard = self.get_shard(page_id).lock().unwrap();
             map_guard
                 .entry(page_id)
                 .or_insert_with(|| {
@@ -200,10 +211,14 @@ impl LockManager {
                 for &holder_id in &holders {
                     wait_guard.remove_wait(transaction_id, holder_id);
                 }
-                
-                let idx = guard.requests.iter().position(|r| r.transaction_id == transaction_id).unwrap();
+
+                let idx = guard
+                    .requests
+                    .iter()
+                    .position(|r| r.transaction_id == transaction_id)
+                    .unwrap();
                 guard.requests.remove(idx);
-                
+
                 return Err(LockManagerError::DeadLock);
             }
         }
@@ -229,7 +244,7 @@ impl LockManager {
     /// Automatically promotes queued transactions using Writer-Starvation Prevention logic.
     pub fn release_lock(&self, transaction_id: u64, page_id: u64) -> Result<(), LockManagerError> {
         let queue_guard = {
-            let map_guard = self.map.lock().unwrap();
+            let map_guard = self.get_shard(page_id).lock().unwrap();
             map_guard
                 .get(&page_id)
                 .ok_or(LockManagerError::RecordNotFound)?
@@ -292,7 +307,7 @@ impl LockManager {
             for waiter_id in newly_granted_txs {
                 wait_guard.remove_wait(waiter_id, transaction_id);
             }
-            
+
             for waiter_id in remaining_waiters {
                 wait_guard.remove_wait(waiter_id, transaction_id);
             }
@@ -309,7 +324,7 @@ impl LockManager {
     /// but will return `UpgradeConflict` if another transaction is already upgrading.
     pub fn upgrade_lock(&self, transaction_id: u64, page_id: u64) -> Result<(), LockManagerError> {
         let queue_guard = {
-            let map_guard = self.map.lock().unwrap();
+            let map_guard = self.get_shard(page_id).lock().unwrap();
             map_guard
                 .get(&page_id)
                 .ok_or(LockManagerError::RecordNotFound)?
@@ -353,6 +368,19 @@ impl LockManager {
         }
         guard.requests.insert(insert_index, req);
 
+        let any_other_granted = guard
+            .requests
+            .iter()
+            .any(|r| r.is_granted && r.transaction_id != transaction_id);
+        if !any_other_granted {
+            let my_req = guard
+                .requests
+                .iter_mut()
+                .find(|r| r.transaction_id == transaction_id)
+                .unwrap();
+            my_req.is_granted = true;
+        }
+
         loop {
             let my_req = guard
                 .requests
@@ -368,5 +396,106 @@ impl LockManager {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn test_single_shared_lock() {
+        let lm = LockManager::new();
+        assert!(lm.acquire_lock(1, 100, LockType::SharedLock).is_ok());
+        assert!(lm.release_lock(1, 100).is_ok());
+    }
+
+    #[test]
+    fn test_single_exclusive_lock() {
+        let lm = LockManager::new();
+        assert!(lm.acquire_lock(1, 100, LockType::ExclusiveLock).is_ok());
+        assert!(lm.release_lock(1, 100).is_ok());
+    }
+
+    #[test]
+    fn test_multiple_shared_locks() {
+        let lm = LockManager::new();
+        assert!(lm.acquire_lock(1, 100, LockType::SharedLock).is_ok());
+        assert!(lm.acquire_lock(2, 100, LockType::SharedLock).is_ok());
+        assert!(lm.acquire_lock(3, 100, LockType::SharedLock).is_ok());
+
+        assert!(lm.release_lock(1, 100).is_ok());
+        assert!(lm.release_lock(2, 100).is_ok());
+        assert!(lm.release_lock(3, 100).is_ok());
+    }
+
+    #[test]
+    fn test_upgrade_lock_success() {
+        let lm = LockManager::new();
+        assert!(lm.acquire_lock(1, 100, LockType::SharedLock).is_ok());
+        assert!(lm.upgrade_lock(1, 100).is_ok());
+        assert!(lm.release_lock(1, 100).is_ok());
+    }
+
+    #[test]
+    fn test_upgrade_conflict() {
+        let lm = Arc::new(LockManager::new());
+        lm.acquire_lock(1, 100, LockType::SharedLock).unwrap();
+        lm.acquire_lock(2, 100, LockType::SharedLock).unwrap();
+
+        let lm_clone = Arc::clone(&lm);
+        let t1 = thread::spawn(move || lm_clone.upgrade_lock(1, 100));
+
+        thread::sleep(Duration::from_millis(50));
+        let res2 = lm.upgrade_lock(2, 100);
+        assert!(matches!(res2, Err(LockManagerError::UpgradeConflict)));
+
+        lm.release_lock(2, 100).unwrap();
+        assert!(t1.join().unwrap().is_ok());
+        lm.release_lock(1, 100).unwrap();
+    }
+
+    #[test]
+    fn test_deadlock_detection() {
+        let lm = Arc::new(LockManager::new());
+        lm.acquire_lock(1, 100, LockType::ExclusiveLock).unwrap();
+        lm.acquire_lock(2, 200, LockType::ExclusiveLock).unwrap();
+
+        let lm_clone1 = Arc::clone(&lm);
+        let t1 = thread::spawn(move || lm_clone1.acquire_lock(1, 200, LockType::ExclusiveLock));
+
+        thread::sleep(Duration::from_millis(50));
+        let res2 = lm.acquire_lock(2, 100, LockType::ExclusiveLock);
+        assert!(matches!(res2, Err(LockManagerError::DeadLock)));
+
+        lm.release_lock(1, 100).unwrap();
+        lm.release_lock(2, 200).unwrap();
+        assert!(t1.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn test_writer_starvation_prevention() {
+        let lm = Arc::new(LockManager::new());
+        lm.acquire_lock(1, 100, LockType::SharedLock).unwrap();
+
+        let lm_clone1 = Arc::clone(&lm);
+        let t1 = thread::spawn(move || lm_clone1.acquire_lock(2, 100, LockType::ExclusiveLock));
+
+        thread::sleep(Duration::from_millis(50));
+
+        let lm_clone2 = Arc::clone(&lm);
+        let t2 = thread::spawn(move || lm_clone2.acquire_lock(3, 100, LockType::SharedLock));
+
+        thread::sleep(Duration::from_millis(50));
+
+        lm.release_lock(1, 100).unwrap();
+
+        assert!(t1.join().unwrap().is_ok());
+        lm.release_lock(2, 100).unwrap();
+
+        assert!(t2.join().unwrap().is_ok());
+        lm.release_lock(3, 100).unwrap();
     }
 }

@@ -1022,7 +1022,7 @@ mod tests {
     use crate::disk::DiskManager;
     use common::MAX_PAGE_SIZE;
     use std::collections::HashSet;
-use std::mem::forget;
+    use std::mem::forget;
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     use std::sync::{Arc, OnceLock};
     use tempfile::tempdir;

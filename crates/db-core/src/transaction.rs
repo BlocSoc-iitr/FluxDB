@@ -22,9 +22,12 @@
 //! `WriteConflict`). The first transaction to set `xmax` wins.
 
 use crate::transaction_manager::TransactionManager;
-use std::{collections::HashSet, sync::{Arc, Mutex}};
-use concurrency::lock_manager::{LockManager, LockType};
 use common::LockManagerError;
+use concurrency::lock_manager::{LockManager, LockType};
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+};
 
 /// A transaction's identity and its point-in-time view of the database.
 ///
@@ -36,7 +39,7 @@ pub struct Transaction {
     pub snapshot: Snapshot,
     pub tm: Arc<TransactionManager>,
     pub lock_manager: Arc<LockManager>,
-    pub locked_pages: Arc<Mutex<HashSet<u64>>>
+    pub locked_pages: Arc<Mutex<HashSet<u64>>>,
 }
 
 impl Transaction {
@@ -60,14 +63,16 @@ impl Transaction {
 
     /// Acquires a shared lock on the given page.
     pub fn acquire_shared_lock(&self, page_id: u64) -> Result<(), LockManagerError> {
-        self.lock_manager.acquire_lock(self.txn_id, page_id, LockType::SharedLock)?;
+        self.lock_manager
+            .acquire_lock(self.txn_id, page_id, LockType::SharedLock)?;
         self.locked_pages.lock().unwrap().insert(page_id);
         Ok(())
     }
 
     /// Acquires an exclusive lock on the given page.
     pub fn acquire_exclusive_lock(&self, page_id: u64) -> Result<(), LockManagerError> {
-        self.lock_manager.acquire_lock(self.txn_id, page_id, LockType::ExclusiveLock)?;
+        self.lock_manager
+            .acquire_lock(self.txn_id, page_id, LockType::ExclusiveLock)?;
         self.locked_pages.lock().unwrap().insert(page_id);
         Ok(())
     }
