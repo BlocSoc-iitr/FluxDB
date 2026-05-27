@@ -126,4 +126,8 @@ pub enum TypeNameError {
 pub enum LockManagerError {
     #[error("record not found")]
     RecordNotFound,
+    #[error("upgrade conflict - another transaction is already upgrading")]
+    UpgradeConflict,
+    #[error("invalid lock state - lock not granted or already exclusive")]
+    InvalidLockState,
 }
