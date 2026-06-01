@@ -64,6 +64,13 @@ pub enum BufferPoolError {
     #[error("No evictable frames available")]
     NoEvictableFrames,
 
+    #[error("Page {page_id} checksum mismatch: expected {expected}, got {actual}")]
+    PageCorruption {
+        page_id: u64,
+        expected: u32,
+        actual: u32,
+    },
+
     /// A disk I/O error propagated from the [`DiskError`] layer.
     #[error("Disk error: {0}")]
     Disk(#[from] DiskError),

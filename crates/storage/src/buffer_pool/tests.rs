@@ -124,6 +124,70 @@ fn test_buffer_pool_manager_concurrency() {
 }
 
 #[test]
+fn test_checksum_survives_reopen() {
+    // A page flushed with a valid checksum must verify cleanly when loaded from
+    // disk by a fresh buffer pool (no cache hit).
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test.db");
+    let disk_manager = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
+
+    let pid;
+    {
+        let bpm = BufferPoolManager::new(disk_manager.clone());
+        let mut page = bpm.new_page().unwrap();
+        pid = page.page_id;
+        page[0] = crate::page::LEAF; // valid page type → checksum applies
+        page[100] = 42;
+        drop(page);
+        bpm.flush_page(pid).unwrap();
+    }
+
+    let bpm = BufferPoolManager::new(disk_manager);
+    let page = bpm.fetch_page(pid).unwrap();
+    assert_eq!(page[0], crate::page::LEAF);
+    assert_eq!(page[100], 42);
+}
+
+#[test]
+fn test_checksum_detects_corruption() {
+    use common::BufferPoolError;
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test.db");
+    let disk_manager = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
+
+    let pid;
+    {
+        let bpm = BufferPoolManager::new(disk_manager.clone());
+        let mut page = bpm.new_page().unwrap();
+        pid = page.page_id;
+        page[0] = crate::page::LEAF;
+        page[100] = 42;
+        drop(page);
+        bpm.flush_page(pid).unwrap();
+    }
+
+    // Corrupt a byte on disk directly, bypassing the checksum-stamping flush path.
+    let mut raw = vec![0u8; MAX_PAGE_SIZE];
+    disk_manager.read_page(pid, &mut raw).unwrap();
+    raw[100] ^= 0xFF;
+    disk_manager.write_page(pid, &raw).unwrap();
+    disk_manager.sync_data().unwrap();
+
+    // A fresh pool must load from disk and reject the corrupted page. A failed
+    // verify also discards the frame, so the bad bytes are never cached — both
+    // fetch paths on the same pool keep reloading from disk and keep rejecting.
+    let bpm = BufferPoolManager::new(disk_manager);
+    assert!(matches!(
+        bpm.fetch_page(pid),
+        Err(BufferPoolError::PageCorruption { .. })
+    ));
+    assert!(matches!(
+        bpm.fetch_page_mut(pid),
+        Err(BufferPoolError::PageCorruption { .. })
+    ));
+}
+
+#[test]
 fn test_buffer_pool_manager_pin_count() {
     use common::BufferPoolError;
     let dir = tempdir().unwrap();

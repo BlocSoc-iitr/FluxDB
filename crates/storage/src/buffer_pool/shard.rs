@@ -286,12 +286,32 @@ impl BufferPoolShard {
         Ok(())
     }
 
+    
+    /// The caller must have just loaded `page_id` into a frame and released its
+    /// page-data guard before calling this.
+    pub fn discard_frame(&self, page_id: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(frame_id) = inner.page_table.remove(&page_id) {
+            let meta = &mut inner.metadata[frame_id];
+            meta.page_id = INVALID_FRAME_ID;
+            meta.pin_count = 0;
+            meta.is_dirty = false;
+            //pin the frame so it does not get flushed 
+            inner.replacer.pin(frame_id);
+            // push the frame to free list directly so its reused
+            inner.free_list.push(frame_id);
+        }
+    }
+
     pub fn write_frame_to_disk(&self, frame_id: usize, page_id: u64) -> Result<()> {
         let mut buf = vec![0u8; MAX_PAGE_SIZE];
         {
             let data = self.pages[frame_id].read().unwrap();
             buf.copy_from_slice(&data[..]);
         }
+
+        // Stamp the CRC32 on the outgoing copy so corruption is detectable on the next load
+        crate::page::stamp_checksum(&mut buf);
 
         self.disk_manager
             .write_page(page_id, &buf)?;

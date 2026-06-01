@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────┐
-//! │ FIXED HEADER — 32 bytes (fully 8-byte aligned)          │
+//! │ FIXED HEADER — 40 bytes (fully 8-byte aligned)          │
 //! ├────────┬───────────┬──────────────────────────────────  ┤
 //! │ Off  0 │ u8        │ page_type                           │
 //! │ Off  1 │ u8        │ _reserved (0)                       │
@@ -15,11 +15,13 @@
 //! │ Off  8 │ u64       │ page_id          [8-byte aligned ✓] │
 //! │ Off 16 │ u64       │ lsn              [8-byte aligned ✓] │
 //! │ Off 24 │ u64       │ rightlink         [8-byte aligned ✓] │
+//! │ Off 32 │ u32       │ checksum (CRC32)                    │
+//! │ Off 36 │ u32       │ _padding2                           │
 //! └────────┴───────────┴───────────────────────────────────  ┘
 //!
 //! ┌──────────────────────────────────────────────────────────┐
 //! │ SECTION A — Child page IDs  [(num_keys + 1) × 8 bytes]   │
-//! │  child[i] offset = 32 + i*8                              │
+//! │  child[i] offset = 40 + i*8                              │
 //! └──────────────────────────────────────────────────────────┘
 //!
 //! ┌──────────────────────────────────────────────────────────┐
@@ -55,7 +57,8 @@ const OFF_INT_NUM_KEYS: usize = 2; // u16
 const OFF_INT_HIGH_KEY_LEN: usize = 4; // u16
 // bytes 6..8: u16 padding
 const OFF_INT_RIGHTLINK: usize = 24; // u64
-const INT_HEADER_SIZE: usize = 32;
+// bytes 32..36: u32 CRC32 checksum (see page::mod), 36..40: padding
+const INT_HEADER_SIZE: usize = 40;
 
 // ── Offset calculation helpers ────────────────────────────────────────────────
 

@@ -39,6 +39,57 @@ pub(super) const OFF_PAGE_TYPE: usize = 0; // u8
 pub(super) const OFF_PAGE_ID: usize = 8; // u64
 pub(super) const OFF_LSN: usize = 16; // u64
 
+const CHECKSUM_LEN: usize = 4;
+/// Checksum offset for a leaf page .
+const OFF_LEAF_CHECKSUM: usize = 44;
+/// Checksum offset for an internal page (first word of the fixed header).
+const OFF_INT_CHECKSUM: usize = 32;
+
+/// Byte offset of the CRC32 field for the given page-type marker, or `None` for
+/// an unrecognised type (e.g. a never-initialised, all-zero page) which carries
+/// no checksum to verify.
+#[inline]
+fn checksum_offset(page_type: u8) -> Option<usize> {
+    match page_type {
+        LEAF => Some(OFF_LEAF_CHECKSUM),
+        INTERNAL => Some(OFF_INT_CHECKSUM),
+        _ => None,
+    }
+}
+
+/// CRC32 over the whole page with the 4-byte checksum field itself treated as
+/// zero, so the result is independent of whatever is currently stored there.
+fn compute_checksum(page: &[u8], off: usize) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&page[..off]);
+    hasher.update(&[0u8; CHECKSUM_LEN]);
+    hasher.update(&page[off + CHECKSUM_LEN..]);
+    hasher.finalize()
+}
+
+/// Recompute and write the page's CRC32. Call immediately before flushing a page
+/// to disk. No-op for unrecognised page types (nothing to protect yet).
+pub fn stamp_checksum(page: &mut [u8]) {
+    if let Some(off) = checksum_offset(read_u8(page, OFF_PAGE_TYPE)) {
+        let crc = compute_checksum(page, off);
+        write_u32(page, off, crc);
+    }
+}
+
+/// Verify a page loaded from disk against its stored CRC32. Returns
+/// `Err((expected, actual))` on mismatch, `Ok(())` when the checksum matches or
+/// the page type carries no checksum.
+pub fn verify_checksum(page: &[u8]) -> Result<(), (u32, u32)> {
+    if let Some(off) = checksum_offset(read_u8(page, OFF_PAGE_TYPE)) {
+        let stored = read_u32(page, off);
+        let actual = compute_checksum(page, off);
+        if stored != actual {
+            return Err((stored, actual));
+        }
+    }
+    Ok(())
+}
+
 // ── ChildSide — used when removing a separator key during a merge ─────────────
 
 /// Which adjacent child to keep when a separator key is removed during a merge.
