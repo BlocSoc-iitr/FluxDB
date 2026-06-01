@@ -195,15 +195,11 @@ impl Wal {
         let initial_lsn = if path.exists() {
             match WalIterator::new(path) {
                 Ok(iter) => {
-                    let max_lsn = iter
-                        .filter_map(|entry| entry.ok())
-                        .map(|e| e.lsn)
-                        .max()
-                        .unwrap_or(0);
+                    let max_lsn = iter.map_while(Result::ok).map(|e| e.lsn).max().unwrap_or(0);
                     max_lsn + 1
                 }
-                // File exists but cannot be opened for reading then start fresh
-                Err(_) => 0,
+                // File exists but cannot be opened for reading; abort to avoid duplicating LSNs.
+                Err(e) => return Err(WalError::Io(e)),
             }
         } else {
             0
@@ -266,18 +262,18 @@ impl Wal {
 
     /// Record a transaction commit marker.
     ///
-    /// Equivalent to `append(txn_id, 0, WalEntryType::Commit, b"", None)` but
+    /// Equivalent to `append(txn_id, PageId::MAX, WalEntryType::Commit, b"", None)` but
     /// hides the sentinel `page_id` and empty key/value from callers.
     pub fn append_commit(&mut self, txn_id: u64) -> Result<Lsn> {
-        self.append(txn_id, 0, WalEntryType::Commit, b"", None)
+        self.append(txn_id, PageId::MAX, WalEntryType::Commit, b"", None)
     }
 
     /// Record a transaction abort marker.
     ///
-    /// Equivalent to `append(txn_id, 0, WalEntryType::Abort, b"", None)` but
+    /// Equivalent to `append(txn_id, PageId::MAX, WalEntryType::Abort, b"", None)` but
     /// hides the sentinel `page_id` and empty key/value from callers.
     pub fn append_abort(&mut self, txn_id: u64) -> Result<Lsn> {
-        self.append(txn_id, 0, WalEntryType::Abort, b"", None)
+        self.append(txn_id, PageId::MAX, WalEntryType::Abort, b"", None)
     }
 
     pub fn flush(&mut self) -> Result<()> {
