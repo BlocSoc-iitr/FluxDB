@@ -1,9 +1,6 @@
 /// Centralized error types for the entire codebase.
-
 // Every submodule's error enum is now written here.
 // Using the `thiserror` crate we easily write clean reusable code without the boilerplate
-
-
 use std::io;
 use thiserror::Error;
 
@@ -30,7 +27,11 @@ pub enum WalError {
     Io(#[from] io::Error),
 
     #[error("Checksum mismatch for LSN {lsn}: expected {expected}, got {actual}")]
-    ChecksumMismatch { lsn: u64, expected: u32, actual: u32 },
+    ChecksumMismatch {
+        lsn: u64,
+        expected: u32,
+        actual: u32,
+    },
 
     #[error("Corrupted log: {0}")]
     CorruptedLog(String),
