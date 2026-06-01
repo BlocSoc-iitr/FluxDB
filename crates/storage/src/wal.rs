@@ -260,21 +260,6 @@ impl Wal {
         Ok(lsn)
     }
 
-    /// Record a transaction commit marker.
-    ///
-    /// Equivalent to `append(txn_id, PageId::MAX, WalEntryType::Commit, b"", None)` but
-    /// hides the sentinel `page_id` and empty key/value from callers.
-    pub fn append_commit(&mut self, txn_id: u64) -> Result<Lsn> {
-        self.append(txn_id, PageId::MAX, WalEntryType::Commit, b"", None)
-    }
-
-    /// Record a transaction abort marker.
-    ///
-    /// Equivalent to `append(txn_id, PageId::MAX, WalEntryType::Abort, b"", None)` but
-    /// hides the sentinel `page_id` and empty key/value from callers.
-    pub fn append_abort(&mut self, txn_id: u64) -> Result<Lsn> {
-        self.append(txn_id, PageId::MAX, WalEntryType::Abort, b"", None)
-    }
 
     pub fn flush(&mut self) -> Result<()> {
         self.file.flush()?;
@@ -299,7 +284,7 @@ mod tests {
         let lsn1 = wal.append(10, 1, WalEntryType::Put, b"key1", Some(b"value1"))?;
         let lsn2 = wal.append(10, 1, WalEntryType::Put, b"key2", Some(b"value2"))?;
         let lsn3 = wal.append(10, 1, WalEntryType::Delete, b"key1", None)?;
-        let lsn4 = wal.append_commit(10)?;
+        let lsn4 = wal.append(10, PageId::MAX, WalEntryType::Commit, b"", None)?;
         wal.flush()?;
 
         let mut iter = WalIterator::new(&wal_path).map_err(|e| WalError::Io(e))?;
@@ -348,7 +333,7 @@ mod tests {
 
         // Re-open: LSN counter must resume from max_lsn + 1
         let mut wal = Wal::new(&wal_path)?;
-        let next_lsn = wal.append_commit(2)?;
+        let next_lsn = wal.append(2, PageId::MAX, WalEntryType::Commit, b"", None)?;
         assert_eq!(next_lsn, 2, "resumed lsn should be 2 (after 0 and 1)");
 
         Ok(())
@@ -361,7 +346,7 @@ mod tests {
 
         let mut wal = Wal::new(&wal_path)?;
         wal.append(99, 5, WalEntryType::Put, b"key", Some(b"val"))?;
-        let abort_lsn = wal.append_abort(99)?;
+        let abort_lsn = wal.append(99, PageId::MAX, WalEntryType::Abort, b"", None)?;
         wal.flush()?;
 
         let entries: Vec<_> = WalIterator::new(&wal_path)
