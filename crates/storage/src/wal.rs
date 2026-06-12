@@ -28,7 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::vec;
 
 use crate::disk::DiskManager;
-use crate::page::Lsn;
+use crate::page::{Lsn, PAGE_SIZE, PageId};
 use common::WalError;
 
 pub type Result<T> = std::result::Result<T, WalError>;
@@ -51,12 +51,24 @@ impl TryFrom<u8> for WalEntryType {
 }
 
 #[derive(Debug)]
-pub struct WalEntry {
+struct Block {
+    page_id: PageId,
+    blk_flags: u8,
+    data_len: u16,
+    fpi: Option<[u8; PAGE_SIZE]>,
+    data: Option<Vec<u8>>,
+}
+
+#[derive(Debug)]
+struct WalRecord {
     pub lsn: Lsn,
-    pub entry_type: WalEntryType,
-    pub key: Vec<u8>,
-    pub value: Option<Vec<u8>>,
-    pub timestamp: u64,
+    pub rec_len: u32,
+    pub log_type: u8,
+    pub nblocks: u8,
+    pub txn_id: u64, 
+    pub main_len: u16,
+    pub blocks: Vec<Block>,
+    pub main_data: Vec<u8>,
 }
 
 // Layout of a WAL record
