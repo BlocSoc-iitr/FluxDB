@@ -88,7 +88,7 @@ pub struct WalRecord {
     pub rec_len: u32,
     pub entry_type: WalRecordType,
     pub nblocks: u8,
-    pub txn_id: u64, 
+    pub txn_id: u64,
     pub main_len: u16,
     pub blocks: Vec<Block>,
     pub main_data: Option<Vec<u8>>,
@@ -127,8 +127,8 @@ impl Iterator for WalIterator {
             if e.kind() == io::ErrorKind::UnexpectedEof {
                 return None;
             }
-            return Some(Err(e.into()))
-        } 
+            return Some(Err(e.into()));
+        }
         let rec_len = u32::from_le_bytes(rec_len_buf);
 
         hasher.update(&rec_len_buf);
@@ -184,7 +184,7 @@ impl Iterator for WalIterator {
                 return Some(Err(e.into()));
             }
             let blk_flags = blk_flags_buf[0];
-            
+
             hasher.update(&blk_flags_buf);
 
             let mut data_len_buf = [0u8; 2];
@@ -252,7 +252,6 @@ impl Iterator for WalIterator {
         }
         let expected_checksum = u32::from_le_bytes(checksum_buf);
 
-
         let actual_checksum = hasher.finalize();
 
         if actual_checksum != expected_checksum {
@@ -289,18 +288,21 @@ impl WalIterator {
 impl Wal {
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        
+
         let mut next_lsn = 0;
 
         match OpenOptions::new().read(true).open(path) {
             Ok(file) => {
-                let file_len = file.metadata().map_err(|e| WalError::Io(e))?.len();
-                let mut iter = WalIterator { reader: BufReader::new(file) };
+                let file_len = file.metadata().map_err(WalError::Io)?.len();
+                let mut iter = WalIterator {
+                    reader: BufReader::new(file),
+                };
 
                 loop {
-                    use std::io::{Seek};
-                    let current_offset = iter.reader.stream_position().map_err(|e| WalError::Io(e))?;
-                    
+                    use std::io::Seek;
+                    let current_offset =
+                        iter.reader.stream_position().map_err(WalError::Io)?;
+
                     match iter.next() {
                         Some(Ok(record)) => {
                             if record.lsn >= next_lsn {
@@ -308,19 +310,24 @@ impl Wal {
                             }
                         }
                         Some(Err(e)) => {
-                            let err_pos = iter.reader.stream_position().map_err(|e| WalError::Io(e))?;
-                            
+                            let err_pos = iter.reader.stream_position().map_err(WalError::Io)?;
+
                             let is_eof = match &e {
-                                WalError::Io(io_err) => io_err.kind() == io::ErrorKind::UnexpectedEof,
+                                WalError::Io(io_err) => {
+                                    io_err.kind() == io::ErrorKind::UnexpectedEof
+                                }
                                 _ => false,
                             };
 
                             // If the file is corrupted at the end, truncate it
                             if is_eof || err_pos == file_len {
-                                let f = OpenOptions::new().write(true).open(path).map_err(|e| WalError::Io(e))?;
+                                let f = OpenOptions::new()
+                                    .write(true)
+                                    .open(path)
+                                    .map_err(WalError::Io)?;
                                 // chops off the corrupted part
-                                f.set_len(current_offset).map_err(|e| WalError::Io(e))?;
-                                f.sync_all().map_err(|e| WalError::Io(e))?;
+                                f.set_len(current_offset).map_err(WalError::Io)?;
+                                f.sync_all().map_err(WalError::Io)?;
                                 break;
                             } else {
                                 return Err(e);
@@ -339,8 +346,12 @@ impl Wal {
             }
         };
 
-        let file = OpenOptions::new().create(true).append(true).open(path).map_err(|e| WalError::Io(e))?;
-        
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(WalError::Io)?;
+
         Ok(Wal {
             path: path.to_path_buf(),
             file: BufWriter::new(file),
@@ -349,6 +360,7 @@ impl Wal {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn append(
         &mut self,
         rec_len: u32,
@@ -361,22 +373,25 @@ impl Wal {
     ) -> Result<Lsn> {
         let lsn = self.next_lsn;
         self.next_lsn += 1;
-    
+
         self.scratch_pad.clear();
 
-        let blocks_size = blocks.iter().map(|block| {
-            let mut size = 8 + 1 + 2;
-            if block.fpi.is_some() {
-                size += PAGE_SIZE;
-            }
-            if let Some(ref data) = block.data {
-                size += data.len();
-            }
-            size
-        }).sum::<usize>();
-        
+        let blocks_size = blocks
+            .iter()
+            .map(|block| {
+                let mut size = 8 + 1 + 2;
+                if block.fpi.is_some() {
+                    size += PAGE_SIZE;
+                }
+                if let Some(ref data) = block.data {
+                    size += data.len();
+                }
+                size
+            })
+            .sum::<usize>();
+
         let main_data_size = main_data.as_ref().map_or(0, |data| data.len());
-        
+
         let record_size = 4 + 1 + 1 + 8 + 2 + blocks_size + main_data_size;
         self.scratch_pad.reserve(record_size);
 
@@ -388,9 +403,11 @@ impl Wal {
         self.scratch_pad.extend_from_slice(&main_len.to_le_bytes());
 
         for block in blocks {
-            self.scratch_pad.extend_from_slice(&block.page_id.to_le_bytes());
+            self.scratch_pad
+                .extend_from_slice(&block.page_id.to_le_bytes());
             self.scratch_pad.push(block.blk_flags);
-            self.scratch_pad.extend_from_slice(&block.data_len.to_le_bytes());
+            self.scratch_pad
+                .extend_from_slice(&block.data_len.to_le_bytes());
             if let Some(ref fpi) = block.fpi {
                 self.scratch_pad.extend_from_slice(fpi);
             }
@@ -442,15 +459,7 @@ mod tests {
             data: Some(vec![1, 2, 3, 4]),
         };
 
-        wal.append(
-            32, 
-            WalRecordType::Insert,
-            1,
-            42,
-            0,
-            vec![block1],
-            None,
-        )?;
+        wal.append(32, WalRecordType::Insert, 1, 42, 0, vec![block1], None)?;
 
         let block2 = Block {
             page_id: 101,
@@ -489,7 +498,10 @@ mod tests {
         assert_eq!(entry2.blocks.len(), 1);
         assert_eq!(entry2.blocks[0].page_id, 101);
         assert!(entry2.blocks[0].fpi.is_some());
-        assert_eq!(entry2.main_data.as_ref().unwrap(), &vec![8, 7, 6, 5, 4, 3, 2, 1]);
+        assert_eq!(
+            entry2.main_data.as_ref().unwrap(),
+            &vec![8, 7, 6, 5, 4, 3, 2, 1]
+        );
 
         assert!(iter.next().is_none());
 
@@ -497,41 +509,115 @@ mod tests {
     }
 
     #[test]
-    fn test_wal_corruption() -> Result<()> {
+    fn test_wal_recovery_clean() -> Result<()> {
         let dir = tempdir().map_err(|e| WalError::Io(e))?;
-        let wal_path = dir.path().join("corrupt.wal");
+        let wal_path = dir.path().join("clean.wal");
 
-        let mut wal = Wal::new(&wal_path)?;
-        let block1 = Block {
-            page_id: 100,
-            blk_flags: 2,
-            data_len: 4,
-            fpi: None,
-            data: Some(vec![1, 2, 3, 4]),
-        };
-        wal.append(
-            32,
-            WalRecordType::Insert,
-            1,
-            42,
-            0,
-            vec![block1],
-            None,
-        )?;
-        wal.flush_up_to(1)?;
+        {
+            let mut wal = Wal::new(&wal_path)?;
+            let block1 = Block {
+                page_id: 100,
+                blk_flags: 2,
+                data_len: 4,
+                fpi: None,
+                data: Some(vec![1, 2, 3, 4]),
+            };
+            wal.append(32, WalRecordType::Insert, 1, 42, 0, vec![block1], None)?;
+            let block2 = Block {
+                page_id: 101,
+                blk_flags: 0,
+                data_len: 0,
+                fpi: None,
+                data: None,
+            };
+            wal.append(32, WalRecordType::Commit, 1, 43, 0, vec![block2], None)?;
+            wal.flush_up_to(1)?;
+        }
+
+        let wal = Wal::new(&wal_path)?;
+        assert_eq!(wal.next_lsn, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_wal_recovery_torn_tail() -> Result<()> {
+        let dir = tempdir().map_err(|e| WalError::Io(e))?;
+        let wal_path = dir.path().join("torntail.wal");
+
+        {
+            let mut wal = Wal::new(&wal_path)?;
+            let block1 = Block {
+                page_id: 100,
+                blk_flags: 2,
+                data_len: 4,
+                fpi: None,
+                data: Some(vec![1, 2, 3, 4]),
+            };
+            wal.append(32, WalRecordType::Insert, 1, 42, 0, vec![block1], None)?;
+            let block2 = Block {
+                page_id: 101,
+                blk_flags: 0,
+                data_len: 0,
+                fpi: None,
+                data: None,
+            };
+            wal.append(32, WalRecordType::Commit, 1, 43, 0, vec![block2], None)?;
+            wal.flush_up_to(1)?;
+        }
 
         let mut file = OpenOptions::new().write(true).open(&wal_path)?;
         let file_len = file.metadata()?.len();
-        file.seek(SeekFrom::Start(file_len - 2))?;
+
+        file.seek(SeekFrom::Start(file_len - 1))?;
         file.write_all(&[0xFF])?;
         file.sync_all()?;
 
-        let mut iter = WalIterator::new(&wal_path).map_err(|e| WalError::Io(e))?;
-        let result = iter.next().unwrap();
+        let wal = Wal::new(&wal_path)?;
+        assert_eq!(wal.next_lsn, 1);
 
+        let new_file_len = file.metadata()?.len();
+        assert!(new_file_len < file_len);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_wal_mid_log_corruption() -> Result<()> {
+        let dir = tempdir().map_err(|e| WalError::Io(e))?;
+        let wal_path = dir.path().join("midlog.wal");
+
+        {
+            let mut wal = Wal::new(&wal_path)?;
+            let block1 = Block {
+                page_id: 100,
+                blk_flags: 2,
+                data_len: 4,
+                fpi: None,
+                data: Some(vec![1, 2, 3, 4]),
+            };
+            wal.append(32, WalRecordType::Insert, 1, 42, 0, vec![block1], None)?;
+            let block2 = Block {
+                page_id: 101,
+                blk_flags: 0,
+                data_len: 0,
+                fpi: None,
+                data: None,
+            };
+            wal.append(32, WalRecordType::Commit, 1, 43, 0, vec![block2], None)?;
+            wal.flush_up_to(1)?;
+        }
+
+        let mut file = OpenOptions::new().write(true).open(&wal_path)?;
+
+        file.seek(SeekFrom::Start(40))?;
+        file.write_all(&[0xFF])?;
+        file.sync_all()?;
+
+        let result = Wal::new(&wal_path);
         match result {
             Err(WalError::ChecksumMismatch { lsn, .. }) => assert_eq!(lsn, 0),
-            _ => panic!("Expected ChecksumMismatch error, got {:?}", result),
+            Err(e) => panic!("Expected ChecksumMismatch error, got error: {:?}", e),
+            Ok(_) => panic!("Expected ChecksumMismatch error, got Ok(_)"),
         }
 
         Ok(())
