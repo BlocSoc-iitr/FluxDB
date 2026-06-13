@@ -23,7 +23,7 @@
 
 use crc32fast::Hasher;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write, BufRead};
 use std::path::{Path, PathBuf};
 use std::vec;
 
@@ -44,12 +44,10 @@ pub enum WalRecordType {
     InternalSPlit = 5,
     InsertDownLink = 6,
     NewRoot = 7,
-    PageAllocate = 8,
-    PageCompact = 9,
-    MarkHalfDead = 10,
-    UnlinkPage = 11,
-    Checkpoint = 12,
-    Fpi = 13,
+    PageCompact = 8,
+    MarkHalfDead = 9,
+    UnlinkPage = 10,
+    Checkpoint = 11,
 }
 
 impl TryFrom<u8> for WalRecordType {
@@ -64,12 +62,10 @@ impl TryFrom<u8> for WalRecordType {
             5 => Ok(WalRecordType::InternalSPlit),
             6 => Ok(WalRecordType::InsertDownLink),
             7 => Ok(WalRecordType::NewRoot),
-            8 => Ok(WalRecordType::PageAllocate),
-            9 => Ok(WalRecordType::PageCompact),
-            10 => Ok(WalRecordType::MarkHalfDead),
-            11 => Ok(WalRecordType::UnlinkPage),
-            12 => Ok(WalRecordType::Checkpoint),
-            13 => Ok(WalRecordType::Fpi),
+            8 => Ok(WalRecordType::PageCompact),
+            9 => Ok(WalRecordType::MarkHalfDead),
+            10 => Ok(WalRecordType::UnlinkPage),
+            11 => Ok(WalRecordType::Checkpoint),
             _ => Err(WalError::InvalidEntryType(value)),
         }
     }
@@ -111,19 +107,23 @@ pub struct Wal {
     file: BufWriter<File>,
     scratch_pad: Vec<u8>,
     pub next_lsn: u64,
+    pub flushed_lsn: Option<Lsn>,
 }
 
 impl Iterator for WalIterator {
     type Item = Result<WalRecord>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        match self.reader.fill_buf() {
+            Ok(buf) if buf.is_empty() => return None,
+            Ok(_) => {}
+            Err(e) => return Some(Err(e.into())),
+        }
+
         let mut hasher = Hasher::new();
 
         let mut lsn_buf = [0u8; 8];
         if let Err(e) = self.reader.read_exact(&mut lsn_buf) {
-            if e.kind() == io::ErrorKind::UnexpectedEof {
-                return None;
-            }
             return Some(Err(e.into()));
         }
         let lsn = Lsn::from_le_bytes(lsn_buf);
@@ -132,9 +132,6 @@ impl Iterator for WalIterator {
 
         let mut rec_len_buf = [0u8; 4];
         if let Err(e) = self.reader.read_exact(&mut rec_len_buf) {
-            if e.kind() == io::ErrorKind::UnexpectedEof {
-                return None;
-            }
             return Some(Err(e.into()));
         }
         let rec_len = u32::from_le_bytes(rec_len_buf);
@@ -303,6 +300,7 @@ impl Wal {
         let path = path.as_ref();
 
         let mut next_lsn = 0;
+        let mut flushed_lsn = None;
 
         match OpenOptions::new().read(true).open(path) {
             Ok(file) => {
@@ -313,14 +311,14 @@ impl Wal {
 
                 loop {
                     use std::io::Seek;
-                    let current_offset =
-                        iter.reader.stream_position().map_err(WalError::Io)?;
+                    let current_offset = iter.reader.stream_position().map_err(WalError::Io)?;
 
                     match iter.next() {
                         Some(Ok(record)) => {
                             if record.lsn >= next_lsn {
                                 next_lsn = record.lsn + 1;
                             }
+                            flushed_lsn = Some(record.lsn);
                         }
                         Some(Err(e)) => {
                             let err_pos = iter.reader.stream_position().map_err(WalError::Io)?;
@@ -370,6 +368,7 @@ impl Wal {
             file: BufWriter::new(file),
             scratch_pad: Vec::with_capacity(4096),
             next_lsn,
+            flushed_lsn,
         })
     }
 
@@ -411,7 +410,7 @@ impl Wal {
 
         let main_data_size = main_data.as_ref().map_or(0, |data| data.len());
 
-        let record_size = 4 + 1 + 1 + 8 + 2 + blocks_size + main_data_size;
+        let record_size = 8 + 4 + 1 + 1 + 8 + 2 + blocks_size + main_data_size + 4;
         self.scratch_pad.reserve(record_size);
 
         self.scratch_pad.extend_from_slice(&lsn.to_le_bytes());
@@ -452,9 +451,15 @@ impl Wal {
     ///
     /// This ensures durability for all transactions committed up to `lsn`.
     pub fn flush_up_to(&mut self, lsn: Lsn) -> Result<()> {
-        if self.next_lsn <= lsn {
-            self.file.flush()?;
+        let needs_flush = match self.flushed_lsn {
+            Some(flushed) => lsn > flushed,
+            None => true,
+        };
+
+        if needs_flush {
+            self.file.flush().map_err(WalError::Io)?;
             DiskManager::sync_file_and_dir(self.file.get_ref(), &self.path)?;
+            self.flushed_lsn = Some(self.next_lsn.saturating_sub(1));
         }
         Ok(())
     }
@@ -641,6 +646,32 @@ mod tests {
             Err(e) => panic!("Expected ChecksumMismatch error, got error: {:?}", e),
             Ok(_) => panic!("Expected ChecksumMismatch error, got Ok(_)"),
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_wal_torn_lsn() -> Result<()> {
+        let dir = tempdir().map_err(WalError::Io)?;
+        let wal_path = dir.path().join("torn_lsn.wal");
+
+        {
+            let mut wal = Wal::new(&wal_path)?;
+            let block1 = Block { page_id: 100, blk_flags: 2, data_len: 4, fpi: None, data: Some(vec![1, 2, 3, 4]) };
+            wal.append(32, WalRecordType::Insert, 1, 42, 0, vec![block1], None)?;
+            wal.flush_up_to(0)?;
+        }
+
+        let mut file = OpenOptions::new().write(true).append(true).open(&wal_path)?;
+        let clean_len = file.metadata()?.len();
+        
+        file.write_all(&[0xFF, 0xFF, 0xFF, 0xFF])?;
+        file.sync_all()?;
+
+        let _ = Wal::new(&wal_path)?;
+        
+        let new_file_len = std::fs::metadata(&wal_path).map_err(WalError::Io)?.len();
+        assert_eq!(new_file_len, clean_len, "Garbage bytes were not truncated! Expected len {}, got {}", clean_len, new_file_len);
 
         Ok(())
     }
