@@ -9,16 +9,17 @@
 //!
 //! ## Record Layout
 //!
-//! | Field      | Size (bytes) | Description                          |
-//! |------------|--------------|--------------------------------------|
-//! | LSN        | 8            | Log Sequence Number (Little Endian) |
-//! | Type       | 1            | Entry type (0: Put, 1: Delete)        |
-//! | Key Len    | 8            | Length of the key                    |
-//! | Value Len  | 8            | Length of the value (0 if None)      |
-//! | Timestamp  | 8            | Microseconds since Unix Epoch        |
-//! | Key        | variable     | The actual key bytes                 |
-//! | Value      | variable     | The actual value bytes (optional)    |
-//! | Checksum   | 4            | CRC32 of all preceding fields        |
+//! | Field         | Size (bytes) | Description                                  |
+//! |---------------|--------------|----------------------------------------------|
+//! | LSN           | 8            | Log Sequence Number (Little Endian)          |
+//! | Record Len    | 4            | Total length of the record                   |
+//! | Type          | 1            | WalRecordType (e.g. Insert, Commit, etc.)    |
+//! | Num Blocks    | 1            | Number of block references                   |
+//! | Txn ID        | 8            | Transaction ID                               |
+//! | Main Data Len | 2            | Length of the main data payload              |
+//! | Blocks        | variable     | Array of block references and their payloads |
+//! | Main Data     | variable     | The main data payload bytes (optional)       |
+//! | Checksum      | 4            | CRC32 of all preceding fields                |
 
 use crc32fast::Hasher;
 use std::fs::{File, OpenOptions};
@@ -32,6 +33,7 @@ use common::WalError;
 
 pub type Result<T> = std::result::Result<T, WalError>;
 
+/// Identifies the physiological operation that a WAL record represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalRecordType {
     Insert = 0,
@@ -73,6 +75,8 @@ impl TryFrom<u8> for WalRecordType {
     }
 }
 
+/// Represents a reference to a page modified by the transaction, potentially
+/// including a Full-Page Image (FPI) and specific redo data for that page.
 #[derive(Debug)]
 pub struct Block {
     pub page_id: PageId,
@@ -82,6 +86,7 @@ pub struct Block {
     pub data: Option<Vec<u8>>,
 }
 
+/// A fully parsed Write-Ahead Log record representing a single logged operation.
 #[derive(Debug)]
 pub struct WalRecord {
     pub lsn: Lsn,
@@ -94,10 +99,13 @@ pub struct WalRecord {
     pub main_data: Option<Vec<u8>>,
 }
 
+/// An iterator that sequentially reads and validates records from a WAL file.
 pub struct WalIterator {
     reader: BufReader<File>,
 }
 
+/// The main Write-Ahead Log manager responsible for appending records sequentially
+/// and maintaining the durability guarantees of the database.
 pub struct Wal {
     path: PathBuf,
     file: BufWriter<File>,
@@ -286,6 +294,11 @@ impl WalIterator {
 }
 
 impl Wal {
+    /// Opens an existing WAL file for appending, or creates a new one if it does not exist.
+    ///
+    /// Upon opening an existing file, this method scans the entire log to find the maximum
+    /// LSN and handles any torn-tail corruption by truncating the file to the last valid
+    /// record boundary. If mid-log corruption is detected, an error is returned.
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
 
@@ -361,6 +374,12 @@ impl Wal {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Appends a new physiological record to the WAL buffer.
+    ///
+    /// This method assigns the next available LSN, serializes the record according to the
+    /// internal wire format, calculates its CRC32 checksum, and writes it to the internal
+    /// `BufWriter`. Note that the record is not guaranteed to be durable on disk until
+    /// `flush_up_to` is called.
     pub fn append(
         &mut self,
         rec_len: u32,
@@ -429,6 +448,9 @@ impl Wal {
         Ok(lsn)
     }
 
+    /// Flushes all pending records up to and including the specified LSN to the physical disk.
+    ///
+    /// This ensures durability for all transactions committed up to `lsn`.
     pub fn flush_up_to(&mut self, lsn: Lsn) -> Result<()> {
         if self.next_lsn <= lsn {
             self.file.flush()?;
