@@ -24,7 +24,6 @@ use crc32fast::Hasher;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::vec;
 
 use crate::disk::DiskManager;
@@ -103,7 +102,7 @@ pub struct Wal {
     path: PathBuf,
     file: BufWriter<File>,
     scratch_pad: Vec<u8>,
-    pub next_lsn: u64
+    pub next_lsn: u64,
 }
 
 impl Iterator for WalIterator {
@@ -290,12 +289,63 @@ impl WalIterator {
 impl Wal {
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        
+        let mut next_lsn = 0;
+
+        match OpenOptions::new().read(true).open(path) {
+            Ok(file) => {
+                let file_len = file.metadata().map_err(|e| WalError::Io(e))?.len();
+                let mut iter = WalIterator { reader: BufReader::new(file) };
+
+                loop {
+                    use std::io::{Seek};
+                    let current_offset = iter.reader.stream_position().map_err(|e| WalError::Io(e))?;
+                    
+                    match iter.next() {
+                        Some(Ok(record)) => {
+                            if record.lsn >= next_lsn {
+                                next_lsn = record.lsn + 1;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            let err_pos = iter.reader.stream_position().map_err(|e| WalError::Io(e))?;
+                            
+                            let is_eof = match &e {
+                                WalError::Io(io_err) => io_err.kind() == io::ErrorKind::UnexpectedEof,
+                                _ => false,
+                            };
+
+                            // If the file is corrupted at the end, truncate it
+                            if is_eof || err_pos == file_len {
+                                let f = OpenOptions::new().write(true).open(path).map_err(|e| WalError::Io(e))?;
+                                // chops off the corrupted part
+                                f.set_len(current_offset).map_err(|e| WalError::Io(e))?;
+                                f.sync_all().map_err(|e| WalError::Io(e))?;
+                                break;
+                            } else {
+                                return Err(e);
+                            }
+                        }
+                        None => {
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if e.kind() != io::ErrorKind::NotFound {
+                    return Err(e.into());
+                }
+            }
+        };
+
+        let file = OpenOptions::new().create(true).append(true).open(path).map_err(|e| WalError::Io(e))?;
+        
         Ok(Wal {
             path: path.to_path_buf(),
             file: BufWriter::new(file),
             scratch_pad: Vec::with_capacity(4096),
-            next_lsn: 0,
+            next_lsn,
         })
     }
 
@@ -384,29 +434,62 @@ mod tests {
 
         let mut wal = Wal::new(&wal_path)?;
 
-        wal.append(1, WalEntryType::Put, b"key1", Some(b"value1"))?;
-        wal.append(2, WalEntryType::Put, b"key2", Some(b"value2"))?;
-        wal.append(3, WalEntryType::Delete, b"key1", None)?;
-        wal.flush()?;
+        let block1 = Block {
+            page_id: 100,
+            blk_flags: 2,
+            data_len: 4,
+            fpi: None,
+            data: Some(vec![1, 2, 3, 4]),
+        };
+
+        wal.append(
+            32, 
+            WalRecordType::Insert,
+            1,
+            42,
+            0,
+            vec![block1],
+            None,
+        )?;
+
+        let block2 = Block {
+            page_id: 101,
+            blk_flags: 1,
+            data_len: 0,
+            fpi: Some([0u8; PAGE_SIZE]),
+            data: None,
+        };
+
+        wal.append(
+            32 + PAGE_SIZE as u32,
+            WalRecordType::Commit,
+            1,
+            43,
+            8,
+            vec![block2],
+            Some(vec![8, 7, 6, 5, 4, 3, 2, 1]),
+        )?;
+
+        wal.flush_up_to(2)?;
+
         let mut iter = WalIterator::new(&wal_path).map_err(|e| WalError::Io(e))?;
 
         let entry1 = iter.next().unwrap()?;
-        assert_eq!(entry1.lsn, 1);
-        assert_eq!(entry1.entry_type, WalEntryType::Put);
-        assert_eq!(entry1.key, b"key1");
-        assert_eq!(entry1.value, Some(b"value1".to_vec()));
+        assert_eq!(entry1.lsn, 0);
+        assert_eq!(entry1.entry_type, WalRecordType::Insert);
+        assert_eq!(entry1.txn_id, 42);
+        assert_eq!(entry1.blocks.len(), 1);
+        assert_eq!(entry1.blocks[0].page_id, 100);
+        assert_eq!(entry1.blocks[0].data.as_ref().unwrap(), &vec![1, 2, 3, 4]);
 
         let entry2 = iter.next().unwrap()?;
-        assert_eq!(entry2.lsn, 2);
-        assert_eq!(entry2.entry_type, WalEntryType::Put);
-        assert_eq!(entry2.key, b"key2");
-        assert_eq!(entry2.value, Some(b"value2".to_vec()));
-
-        let entry3 = iter.next().unwrap()?;
-        assert_eq!(entry3.lsn, 3);
-        assert_eq!(entry3.entry_type, WalEntryType::Delete);
-        assert_eq!(entry3.key, b"key1");
-        assert_eq!(entry3.value, None);
+        assert_eq!(entry2.lsn, 1);
+        assert_eq!(entry2.entry_type, WalRecordType::Commit);
+        assert_eq!(entry2.txn_id, 43);
+        assert_eq!(entry2.blocks.len(), 1);
+        assert_eq!(entry2.blocks[0].page_id, 101);
+        assert!(entry2.blocks[0].fpi.is_some());
+        assert_eq!(entry2.main_data.as_ref().unwrap(), &vec![8, 7, 6, 5, 4, 3, 2, 1]);
 
         assert!(iter.next().is_none());
 
@@ -419,13 +502,27 @@ mod tests {
         let wal_path = dir.path().join("corrupt.wal");
 
         let mut wal = Wal::new(&wal_path)?;
-        wal.append(1, WalEntryType::Put, b"key1", Some(b"value1"))?;
-        wal.flush()?;
+        let block1 = Block {
+            page_id: 100,
+            blk_flags: 2,
+            data_len: 4,
+            fpi: None,
+            data: Some(vec![1, 2, 3, 4]),
+        };
+        wal.append(
+            32,
+            WalRecordType::Insert,
+            1,
+            42,
+            0,
+            vec![block1],
+            None,
+        )?;
+        wal.flush_up_to(1)?;
 
-        // Intentionally corrupt the file
         let mut file = OpenOptions::new().write(true).open(&wal_path)?;
-        // Corrupt the checksum (last 4 bytes of the first 47-byte record)
-        file.seek(SeekFrom::Start(46))?;
+        let file_len = file.metadata()?.len();
+        file.seek(SeekFrom::Start(file_len - 2))?;
         file.write_all(&[0xFF])?;
         file.sync_all()?;
 
@@ -433,7 +530,7 @@ mod tests {
         let result = iter.next().unwrap();
 
         match result {
-            Err(WalError::ChecksumMismatch { lsn, .. }) => assert_eq!(lsn, 1),
+            Err(WalError::ChecksumMismatch { lsn, .. }) => assert_eq!(lsn, 0),
             _ => panic!("Expected ChecksumMismatch error, got {:?}", result),
         }
 
