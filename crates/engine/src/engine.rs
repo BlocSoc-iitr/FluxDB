@@ -15,8 +15,11 @@ where
     V: Value,
 {
     pub(crate) index: Arc<BTreeIndex<K, V>>,
+    #[allow(dead_code)]
     pub(crate) wal: Arc<Mutex<Wal>>,
+    #[allow(dead_code)]
     pub(crate) disk_manager: Arc<DiskManager>,
+    #[allow(dead_code)]
     pub(crate) buffer_pool: Arc<BufferPoolManager>,
     pub(crate) transaction_manager: Arc<TransactionManager>,
 }
