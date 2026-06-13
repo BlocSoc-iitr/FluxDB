@@ -75,16 +75,16 @@ impl TryFrom<u8> for WalRecordType {
 }
 
 #[derive(Debug)]
-struct Block {
-    page_id: PageId,
-    blk_flags: u8,
-    data_len: u16,
-    fpi: Option<[u8; PAGE_SIZE]>,
-    data: Option<Vec<u8>>,
+pub struct Block {
+    pub page_id: PageId,
+    pub blk_flags: u8,
+    pub data_len: u16,
+    pub fpi: Option<[u8; PAGE_SIZE]>,
+    pub data: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
-struct WalRecord {
+pub struct WalRecord {
     pub lsn: Lsn,
     pub rec_len: u32,
     pub entry_type: WalRecordType,
@@ -92,11 +92,8 @@ struct WalRecord {
     pub txn_id: u64, 
     pub main_len: u16,
     pub blocks: Vec<Block>,
-    pub main_data: Vec<u8>,
+    pub main_data: Option<Vec<u8>>,
 }
-
-// Layout of a WAL record
-// | lsn (8) | entry_type (1) | key_len (8) | value_len (8) | timestamp (8) | key_bytes | value_bytes | checksum (4) |
 
 pub struct WalIterator {
     reader: BufReader<File>,
@@ -106,6 +103,7 @@ pub struct Wal {
     path: PathBuf,
     file: BufWriter<File>,
     scratch_pad: Vec<u8>,
+    pub next_lsn: u64
 }
 
 impl Iterator for WalIterator {
@@ -274,7 +272,7 @@ impl Iterator for WalIterator {
             txn_id,
             main_len,
             blocks,
-            main_data: main_data.unwrap(),
+            main_data,
         }))
     }
 }
@@ -297,43 +295,62 @@ impl Wal {
             path: path.to_path_buf(),
             file: BufWriter::new(file),
             scratch_pad: Vec::with_capacity(4096),
+            next_lsn: 0,
         })
     }
 
     pub fn append(
         &mut self,
-        lsn: Lsn,
-        entry_type: WalEntryType,
-        key: &[u8],
-        value: Option<&[u8]>,
+        rec_len: u32,
+        entry_type: WalRecordType,
+        nblocks: u8,
+        txn_id: u64,
+        main_len: u16,
+        blocks: Vec<Block>,
+        main_data: Option<Vec<u8>>,
     ) -> Result<Lsn> {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| WalError::CorruptedLog(e.to_string()))?
-            .as_micros() as u64;
-
-        let key_len = key.len() as u64;
-        let value_bytes = match entry_type {
-            WalEntryType::Put => {
-                value.ok_or_else(|| WalError::CorruptedLog("Put entry missing value".into()))?
-            }
-            WalEntryType::Delete => &[],
-        };
-        let value_len = value_bytes.len() as u64;
-
+        let lsn = self.next_lsn;
+        self.next_lsn += 1;
+    
         self.scratch_pad.clear();
 
-        // Reserve space: 8 (LSN) + 1 (type) + 8 (key_len) + 8 (value_len) + 8 (timestamp) + key + value
-        let record_size = 8 + 1 + 8 + 8 + 8 + key.len() + value_bytes.len();
+        let blocks_size = blocks.iter().map(|block| {
+            let mut size = 8 + 1 + 2;
+            if block.fpi.is_some() {
+                size += PAGE_SIZE;
+            }
+            if let Some(ref data) = block.data {
+                size += data.len();
+            }
+            size
+        }).sum::<usize>();
+        
+        let main_data_size = main_data.as_ref().map_or(0, |data| data.len());
+        
+        let record_size = 4 + 1 + 1 + 8 + 2 + blocks_size + main_data_size;
         self.scratch_pad.reserve(record_size);
 
         self.scratch_pad.extend_from_slice(&lsn.to_le_bytes());
+        self.scratch_pad.extend_from_slice(&rec_len.to_le_bytes());
         self.scratch_pad.push(entry_type as u8);
-        self.scratch_pad.extend_from_slice(&key_len.to_le_bytes());
-        self.scratch_pad.extend_from_slice(&value_len.to_le_bytes());
-        self.scratch_pad.extend_from_slice(&timestamp.to_le_bytes());
-        self.scratch_pad.extend_from_slice(key);
-        self.scratch_pad.extend_from_slice(value_bytes);
+        self.scratch_pad.push(nblocks);
+        self.scratch_pad.extend_from_slice(&txn_id.to_le_bytes());
+        self.scratch_pad.extend_from_slice(&main_len.to_le_bytes());
+
+        for block in blocks {
+            self.scratch_pad.extend_from_slice(&block.page_id.to_le_bytes());
+            self.scratch_pad.push(block.blk_flags);
+            self.scratch_pad.extend_from_slice(&block.data_len.to_le_bytes());
+            if let Some(ref fpi) = block.fpi {
+                self.scratch_pad.extend_from_slice(fpi);
+            }
+            if let Some(ref data) = block.data {
+                self.scratch_pad.extend_from_slice(data);
+            }
+        }
+        if let Some(ref data) = main_data {
+            self.scratch_pad.extend_from_slice(data);
+        }
 
         let mut hasher = Hasher::new();
         hasher.update(&self.scratch_pad);
@@ -342,12 +359,14 @@ impl Wal {
         self.file.write_all(&self.scratch_pad)?;
         self.file.write_all(&checksum.to_le_bytes())?;
 
-        Ok(lsn + 1)
+        Ok(lsn)
     }
 
-    pub fn flush(&mut self) -> Result<()> {
-        self.file.flush()?;
-        DiskManager::sync_file_and_dir(self.file.get_ref(), &self.path)?;
+    pub fn flush_up_to(&mut self, lsn: Lsn) -> Result<()> {
+        if self.next_lsn <= lsn {
+            self.file.flush()?;
+            DiskManager::sync_file_and_dir(self.file.get_ref(), &self.path)?;
+        }
         Ok(())
     }
 }
