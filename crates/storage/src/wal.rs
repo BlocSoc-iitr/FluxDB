@@ -25,7 +25,6 @@ use crc32fast::Hasher;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::vec;
 
 use crate::disk::DiskManager;
 use crate::page::{Lsn, PAGE_SIZE, PageId};
@@ -74,30 +73,31 @@ impl TryFrom<u8> for WalRecordType {
 /// Represents a reference to a page modified by the transaction, potentially
 /// including a Full-Page Image (FPI) and specific redo data for that page.
 #[derive(Debug)]
-pub struct Block {
+pub struct Block<'a> {
     pub page_id: PageId,
     pub blk_flags: u8,
     pub data_len: u16,
     pub fpi: Option<[u8; PAGE_SIZE]>,
-    pub data: Option<Vec<u8>>,
+    pub data: Option<&'a [u8]>,
 }
 
 /// A fully parsed Write-Ahead Log record representing a single logged operation.
 #[derive(Debug)]
-pub struct WalRecord {
+pub struct WalRecord<'a> {
     pub lsn: Lsn,
     pub rec_len: u32,
     pub entry_type: WalRecordType,
     pub nblocks: u8,
     pub txn_id: u64,
     pub main_len: u16,
-    pub blocks: Vec<Block>,
-    pub main_data: Option<Vec<u8>>,
+    pub blocks: Vec<Block<'a>>,
+    pub main_data: Option<&'a [u8]>,
 }
 
 /// An iterator that sequentially reads and validates records from a WAL file.
 pub struct WalIterator {
     reader: BufReader<File>,
+    scratch: Vec<u8>,
 }
 
 /// The main Write-Ahead Log manager responsible for appending records sequentially
@@ -110,15 +110,24 @@ pub struct Wal {
     pub flushed_lsn: Option<Lsn>,
 }
 
-impl Iterator for WalIterator {
-    type Item = Result<WalRecord>;
+impl WalIterator {
+    pub fn new(path: impl AsRef<Path>) -> io::Result<WalIterator> {
+        let path = path.as_ref();
+        let file = OpenOptions::new().read(true).open(path)?;
+        Ok(WalIterator {
+            reader: BufReader::new(file),
+            scratch: Vec::with_capacity(4096),
+        })
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
+    pub fn next_record(&mut self) -> Option<Result<WalRecord<'_>>> {
         match self.reader.fill_buf() {
             Ok([]) => return None,
             Ok(_) => {}
             Err(e) => return Some(Err(e.into())),
         }
+
+        self.scratch.clear();
 
         let mut hasher = Hasher::new();
 
@@ -127,7 +136,6 @@ impl Iterator for WalIterator {
             return Some(Err(e.into()));
         }
         let lsn = Lsn::from_le_bytes(lsn_buf);
-
         hasher.update(&lsn_buf);
 
         let mut rec_len_buf = [0u8; 4];
@@ -135,7 +143,6 @@ impl Iterator for WalIterator {
             return Some(Err(e.into()));
         }
         let rec_len = u32::from_le_bytes(rec_len_buf);
-
         hasher.update(&rec_len_buf);
 
         let mut type_buf = [0u8; 1];
@@ -146,7 +153,6 @@ impl Iterator for WalIterator {
             Ok(t) => t,
             Err(e) => return Some(Err(e)),
         };
-
         hasher.update(&type_buf);
 
         let mut nblocks_buf = [0u8; 1];
@@ -154,7 +160,6 @@ impl Iterator for WalIterator {
             return Some(Err(e.into()));
         }
         let nblocks = nblocks_buf[0];
-
         hasher.update(&nblocks_buf);
 
         let mut txn_id_buf = [0u8; 8];
@@ -162,7 +167,6 @@ impl Iterator for WalIterator {
             return Some(Err(e.into()));
         }
         let txn_id = u64::from_le_bytes(txn_id_buf);
-
         hasher.update(&txn_id_buf);
 
         let mut main_len_buf = [0u8; 2];
@@ -170,10 +174,9 @@ impl Iterator for WalIterator {
             return Some(Err(e.into()));
         }
         let main_len = u16::from_le_bytes(main_len_buf);
-
         hasher.update(&main_len_buf);
 
-        let mut blocks: Vec<Block> = Vec::with_capacity(nblocks as usize);
+        let mut temp_blocks = Vec::with_capacity(nblocks as usize);
 
         for _ in 0..nblocks {
             let mut page_id_buf = [0u8; 8];
@@ -181,7 +184,6 @@ impl Iterator for WalIterator {
                 return Some(Err(e.into()));
             }
             let page_id = PageId::from_le_bytes(page_id_buf);
-
             hasher.update(&page_id_buf);
 
             let mut blk_flags_buf = [0u8; 1];
@@ -189,7 +191,6 @@ impl Iterator for WalIterator {
                 return Some(Err(e.into()));
             }
             let blk_flags = blk_flags_buf[0];
-
             hasher.update(&blk_flags_buf);
 
             let mut data_len_buf = [0u8; 2];
@@ -197,7 +198,6 @@ impl Iterator for WalIterator {
                 return Some(Err(e.into()));
             }
             let data_len = u16::from_le_bytes(data_len_buf);
-
             hasher.update(&data_len_buf);
 
             let fpi = if blk_flags & 1 == 1 {
@@ -205,51 +205,40 @@ impl Iterator for WalIterator {
                 if let Err(e) = self.reader.read_exact(&mut fpi_buf) {
                     return Some(Err(e.into()));
                 }
+                hasher.update(&fpi_buf);
                 Some(fpi_buf)
             } else {
                 None
             };
 
-            if let Some(ref fpi_buf) = fpi {
-                hasher.update(fpi_buf);
-            }
-
-            let data = if data_len > 0 {
-                let mut data_buf = vec![0u8; data_len as usize];
-                if let Err(e) = self.reader.read_exact(&mut data_buf) {
+            let data_range = if data_len > 0 {
+                let start = self.scratch.len();
+                let end = start + data_len as usize;
+                self.scratch.resize(end, 0);
+                if let Err(e) = self.reader.read_exact(&mut self.scratch[start..end]) {
                     return Some(Err(e.into()));
                 }
-                Some(data_buf)
+                hasher.update(&self.scratch[start..end]);
+                Some((start, end))
             } else {
                 None
             };
 
-            if let Some(ref data_buf) = data {
-                hasher.update(data_buf);
-            }
-
-            blocks.push(Block {
-                page_id,
-                blk_flags,
-                data_len,
-                fpi,
-                data,
-            });
+            temp_blocks.push((page_id, blk_flags, data_len, fpi, data_range));
         }
 
-        let main_data = if main_len > 0 {
-            let mut main_data_buf = vec![0u8; main_len as usize];
-            if let Err(e) = self.reader.read_exact(&mut main_data_buf) {
+        let main_data_range = if main_len > 0 {
+            let start = self.scratch.len();
+            let end = start + main_len as usize;
+            self.scratch.resize(end, 0);
+            if let Err(e) = self.reader.read_exact(&mut self.scratch[start..end]) {
                 return Some(Err(e.into()));
             }
-            Some(main_data_buf)
+            hasher.update(&self.scratch[start..end]);
+            Some((start, end))
         } else {
             None
         };
-
-        if let Some(ref main_data_buf) = main_data {
-            hasher.update(main_data_buf);
-        }
 
         let mut checksum_buf = [0u8; 4];
         if let Err(e) = self.reader.read_exact(&mut checksum_buf) {
@@ -267,6 +256,22 @@ impl Iterator for WalIterator {
             }));
         }
 
+        let blocks = temp_blocks
+            .into_iter()
+            .map(|(page_id, blk_flags, data_len, fpi, data_range)| {
+                let data = data_range.map(|(s, e)| &self.scratch[s..e]);
+                Block {
+                    page_id,
+                    blk_flags,
+                    data_len,
+                    fpi,
+                    data,
+                }
+            })
+            .collect();
+
+        let main_data = main_data_range.map(|(s, e)| &self.scratch[s..e]);
+
         Some(Ok(WalRecord {
             lsn,
             rec_len,
@@ -277,16 +282,6 @@ impl Iterator for WalIterator {
             blocks,
             main_data,
         }))
-    }
-}
-
-impl WalIterator {
-    pub fn new(path: impl AsRef<Path>) -> io::Result<WalIterator> {
-        let path = path.as_ref();
-        let file = OpenOptions::new().read(true).open(path)?;
-        Ok(WalIterator {
-            reader: BufReader::new(file),
-        })
     }
 }
 
@@ -307,13 +302,14 @@ impl Wal {
                 let file_len = file.metadata().map_err(WalError::Io)?.len();
                 let mut iter = WalIterator {
                     reader: BufReader::new(file),
+                    scratch: Vec::with_capacity(4096),
                 };
 
                 loop {
                     use std::io::Seek;
                     let current_offset = iter.reader.stream_position().map_err(WalError::Io)?;
 
-                    match iter.next() {
+                    match iter.next_record() {
                         Some(Ok(record)) => {
                             if record.lsn >= next_lsn {
                                 next_lsn = record.lsn + 1;
@@ -386,8 +382,8 @@ impl Wal {
         nblocks: u8,
         txn_id: u64,
         main_len: u16,
-        blocks: Vec<Block>,
-        main_data: Option<Vec<u8>>,
+        blocks: &[Block<'_>],
+        main_data: Option<&[u8]>,
     ) -> Result<Lsn> {
         let lsn = self.next_lsn;
         self.next_lsn += 1;
@@ -401,7 +397,7 @@ impl Wal {
                 if block.fpi.is_some() {
                     size += PAGE_SIZE;
                 }
-                if let Some(ref data) = block.data {
+                if let Some(data) = block.data {
                     size += data.len();
                 }
                 size
@@ -429,11 +425,11 @@ impl Wal {
             if let Some(ref fpi) = block.fpi {
                 self.scratch_pad.extend_from_slice(fpi);
             }
-            if let Some(ref data) = block.data {
+            if let Some(data) = block.data {
                 self.scratch_pad.extend_from_slice(data);
             }
         }
-        if let Some(ref data) = main_data {
+        if let Some(data) = main_data {
             self.scratch_pad.extend_from_slice(data);
         }
 
@@ -483,10 +479,10 @@ mod tests {
             blk_flags: 2,
             data_len: 4,
             fpi: None,
-            data: Some(vec![1, 2, 3, 4]),
+            data: Some(&[1, 2, 3, 4]),
         };
 
-        wal.append(32, WalRecordType::Insert, 1, 42, 0, vec![block1], None)?;
+        wal.append(32, WalRecordType::Insert, 1, 42, 0, &[block1], None)?;
 
         let block2 = Block {
             page_id: 101,
@@ -502,35 +498,36 @@ mod tests {
             1,
             43,
             8,
-            vec![block2],
-            Some(vec![8, 7, 6, 5, 4, 3, 2, 1]),
+            &[block2],
+            Some(&[8, 7, 6, 5, 4, 3, 2, 1]),
         )?;
 
         wal.flush_up_to(2)?;
 
         let mut iter = WalIterator::new(&wal_path).map_err(|e| WalError::Io(e))?;
 
-        let entry1 = iter.next().unwrap()?;
-        assert_eq!(entry1.lsn, 0);
-        assert_eq!(entry1.entry_type, WalRecordType::Insert);
-        assert_eq!(entry1.txn_id, 42);
-        assert_eq!(entry1.blocks.len(), 1);
-        assert_eq!(entry1.blocks[0].page_id, 100);
-        assert_eq!(entry1.blocks[0].data.as_ref().unwrap(), &vec![1, 2, 3, 4]);
+        {
+            let entry1 = iter.next_record().unwrap()?;
+            assert_eq!(entry1.lsn, 0);
+            assert_eq!(entry1.entry_type, WalRecordType::Insert);
+            assert_eq!(entry1.txn_id, 42);
+            assert_eq!(entry1.blocks.len(), 1);
+            assert_eq!(entry1.blocks[0].page_id, 100);
+            assert_eq!(entry1.blocks[0].data.unwrap(), &[1, 2, 3, 4]);
+        }
 
-        let entry2 = iter.next().unwrap()?;
-        assert_eq!(entry2.lsn, 1);
-        assert_eq!(entry2.entry_type, WalRecordType::Commit);
-        assert_eq!(entry2.txn_id, 43);
-        assert_eq!(entry2.blocks.len(), 1);
-        assert_eq!(entry2.blocks[0].page_id, 101);
-        assert!(entry2.blocks[0].fpi.is_some());
-        assert_eq!(
-            entry2.main_data.as_ref().unwrap(),
-            &vec![8, 7, 6, 5, 4, 3, 2, 1]
-        );
+        {
+            let entry2 = iter.next_record().unwrap()?;
+            assert_eq!(entry2.lsn, 1);
+            assert_eq!(entry2.entry_type, WalRecordType::Commit);
+            assert_eq!(entry2.txn_id, 43);
+            assert_eq!(entry2.blocks.len(), 1);
+            assert_eq!(entry2.blocks[0].page_id, 101);
+            assert!(entry2.blocks[0].fpi.is_some());
+            assert_eq!(entry2.main_data.unwrap(), &[8, 7, 6, 5, 4, 3, 2, 1]);
+        }
 
-        assert!(iter.next().is_none());
+        assert!(iter.next_record().is_none());
 
         Ok(())
     }
@@ -547,9 +544,9 @@ mod tests {
                 blk_flags: 2,
                 data_len: 4,
                 fpi: None,
-                data: Some(vec![1, 2, 3, 4]),
+                data: Some(&[1, 2, 3, 4]),
             };
-            wal.append(32, WalRecordType::Insert, 1, 42, 0, vec![block1], None)?;
+            wal.append(32, WalRecordType::Insert, 1, 42, 0, &[block1], None)?;
             let block2 = Block {
                 page_id: 101,
                 blk_flags: 0,
@@ -557,7 +554,7 @@ mod tests {
                 fpi: None,
                 data: None,
             };
-            wal.append(32, WalRecordType::Commit, 1, 43, 0, vec![block2], None)?;
+            wal.append(32, WalRecordType::Commit, 1, 43, 0, &[block2], None)?;
             wal.flush_up_to(1)?;
         }
 
@@ -578,9 +575,9 @@ mod tests {
                 blk_flags: 2,
                 data_len: 4,
                 fpi: None,
-                data: Some(vec![1, 2, 3, 4]),
+                data: Some(&[1, 2, 3, 4]),
             };
-            wal.append(32, WalRecordType::Insert, 1, 42, 0, vec![block1], None)?;
+            wal.append(32, WalRecordType::Insert, 1, 42, 0, &[block1], None)?;
             let block2 = Block {
                 page_id: 101,
                 blk_flags: 0,
@@ -588,7 +585,7 @@ mod tests {
                 fpi: None,
                 data: None,
             };
-            wal.append(32, WalRecordType::Commit, 1, 43, 0, vec![block2], None)?;
+            wal.append(32, WalRecordType::Commit, 1, 43, 0, &[block2], None)?;
             wal.flush_up_to(1)?;
         }
 
@@ -620,9 +617,9 @@ mod tests {
                 blk_flags: 2,
                 data_len: 4,
                 fpi: None,
-                data: Some(vec![1, 2, 3, 4]),
+                data: Some(&[1, 2, 3, 4]),
             };
-            wal.append(32, WalRecordType::Insert, 1, 42, 0, vec![block1], None)?;
+            wal.append(32, WalRecordType::Insert, 1, 42, 0, &[block1], None)?;
             let block2 = Block {
                 page_id: 101,
                 blk_flags: 0,
@@ -630,7 +627,7 @@ mod tests {
                 fpi: None,
                 data: None,
             };
-            wal.append(32, WalRecordType::Commit, 1, 43, 0, vec![block2], None)?;
+            wal.append(32, WalRecordType::Commit, 1, 43, 0, &[block2], None)?;
             wal.flush_up_to(1)?;
         }
 
@@ -662,9 +659,9 @@ mod tests {
                 blk_flags: 2,
                 data_len: 4,
                 fpi: None,
-                data: Some(vec![1, 2, 3, 4]),
+                data: Some(&[1, 2, 3, 4]),
             };
-            wal.append(32, WalRecordType::Insert, 1, 42, 0, vec![block1], None)?;
+            wal.append(32, WalRecordType::Insert, 1, 42, 0, &[block1], None)?;
             wal.flush_up_to(0)?;
         }
 
