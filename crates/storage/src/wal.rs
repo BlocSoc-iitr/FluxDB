@@ -23,7 +23,7 @@
 
 use crc32fast::Hasher;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Write, BufRead};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::vec;
 
@@ -115,7 +115,7 @@ impl Iterator for WalIterator {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.reader.fill_buf() {
-            Ok(buf) if buf.is_empty() => return None,
+            Ok([]) => return None,
             Ok(_) => {}
             Err(e) => return Some(Err(e.into())),
         }
@@ -657,21 +657,34 @@ mod tests {
 
         {
             let mut wal = Wal::new(&wal_path)?;
-            let block1 = Block { page_id: 100, blk_flags: 2, data_len: 4, fpi: None, data: Some(vec![1, 2, 3, 4]) };
+            let block1 = Block {
+                page_id: 100,
+                blk_flags: 2,
+                data_len: 4,
+                fpi: None,
+                data: Some(vec![1, 2, 3, 4]),
+            };
             wal.append(32, WalRecordType::Insert, 1, 42, 0, vec![block1], None)?;
             wal.flush_up_to(0)?;
         }
 
-        let mut file = OpenOptions::new().write(true).append(true).open(&wal_path)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(&wal_path)?;
         let clean_len = file.metadata()?.len();
-        
+
         file.write_all(&[0xFF, 0xFF, 0xFF, 0xFF])?;
         file.sync_all()?;
 
         let _ = Wal::new(&wal_path)?;
-        
+
         let new_file_len = std::fs::metadata(&wal_path).map_err(WalError::Io)?.len();
-        assert_eq!(new_file_len, clean_len, "Garbage bytes were not truncated! Expected len {}, got {}", clean_len, new_file_len);
+        assert_eq!(
+            new_file_len, clean_len,
+            "Garbage bytes were not truncated! Expected len {}, got {}",
+            clean_len, new_file_len
+        );
 
         Ok(())
     }
