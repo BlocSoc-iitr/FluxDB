@@ -15,6 +15,4 @@ test:
 build:
 	cargo build --verbose
 
-# Reproduces the full CI gate locally: format check → clippy → tests.
-# Run before opening a PR to catch failures without waiting for GitHub Actions.
-pr: fmt-check lint test
+pr: fmt lint build test
