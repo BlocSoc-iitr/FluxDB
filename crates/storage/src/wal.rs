@@ -7,7 +7,7 @@
 //! -   **Checksumming**: Every record is protected by a CRC32 checksum to detect corruption.
 //! -   **Sequential I/O**: Optimized for append-only writes.
 //!
-//! ## Record Layout
+//! ## Record Layout (On-Disk Format)
 //!
 //! | Field         | Size (bytes) | Description                                  |
 //! |---------------|--------------|----------------------------------------------|
@@ -20,6 +20,19 @@
 //! | Blocks        | variable     | Array of block references and their payloads |
 //! | Main Data     | variable     | The main data payload bytes (optional)       |
 //! | Checksum      | 4            | CRC32 of all preceding fields                |
+//!
+//! ### Block Reference Layout
+//!
+//! Each block in the `Blocks` array is structured on-disk as follows:
+//!
+//! | Field         | Size (bytes) | Description                                  |
+//! |---------------|--------------|----------------------------------------------|
+//! | Page ID       | 8            | ID of the modified page                      |
+//! | Block Flags   | 1            | Bit flags (e.g., bit 0 indicates FPI presence)|
+//! | Data Len      | 2            | Length of the block-specific redo payload    |
+//! | FPI           | 4096 (opt)   | Full-Page Image, if indicated by Block Flags |
+//! | Data          | variable     | Block-specific redo payload bytes            |
+//!
 
 use crc32fast::Hasher;
 use std::fs::{File, OpenOptions};
@@ -76,7 +89,6 @@ impl TryFrom<u8> for WalRecordType {
 pub struct Block<'a> {
     pub page_id: PageId,
     pub blk_flags: u8,
-    pub data_len: u16,
     pub fpi: Option<[u8; PAGE_SIZE]>,
     pub data: Option<&'a [u8]>,
 }
@@ -87,9 +99,7 @@ pub struct WalRecord<'a> {
     pub lsn: Lsn,
     pub rec_len: u32,
     pub entry_type: WalRecordType,
-    pub nblocks: u8,
     pub txn_id: u64,
-    pub main_len: u16,
     pub blocks: Vec<Block<'a>>,
     pub main_data: Option<&'a [u8]>,
 }
@@ -224,7 +234,7 @@ impl WalIterator {
                 None
             };
 
-            temp_blocks.push((page_id, blk_flags, data_len, fpi, data_range));
+            temp_blocks.push((page_id, blk_flags, fpi, data_range));
         }
 
         let main_data_range = if main_len > 0 {
@@ -258,12 +268,11 @@ impl WalIterator {
 
         let blocks = temp_blocks
             .into_iter()
-            .map(|(page_id, blk_flags, data_len, fpi, data_range)| {
+            .map(|(page_id, blk_flags, fpi, data_range)| {
                 let data = data_range.map(|(s, e)| &self.scratch[s..e]);
                 Block {
                     page_id,
                     blk_flags,
-                    data_len,
                     fpi,
                     data,
                 }
@@ -276,9 +285,7 @@ impl WalIterator {
             lsn,
             rec_len,
             entry_type,
-            nblocks,
             txn_id,
-            main_len,
             blocks,
             main_data,
         }))
@@ -368,7 +375,6 @@ impl Wal {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     /// Appends a new physiological record to the WAL buffer.
     ///
     /// This method assigns the next available LSN, serializes the record according to the
@@ -377,11 +383,8 @@ impl Wal {
     /// `flush_up_to` is called.
     pub fn append(
         &mut self,
-        rec_len: u32,
         entry_type: WalRecordType,
-        nblocks: u8,
         txn_id: u64,
-        main_len: u16,
         blocks: &[Block<'_>],
         main_data: Option<&[u8]>,
     ) -> Result<Lsn> {
@@ -410,18 +413,23 @@ impl Wal {
         self.scratch_pad.reserve(record_size);
 
         self.scratch_pad.extend_from_slice(&lsn.to_le_bytes());
-        self.scratch_pad.extend_from_slice(&rec_len.to_le_bytes());
+        self.scratch_pad
+            .extend_from_slice(&(record_size as u32).to_le_bytes());
         self.scratch_pad.push(entry_type as u8);
-        self.scratch_pad.push(nblocks);
+        self.scratch_pad.push(blocks.len() as u8);
         self.scratch_pad.extend_from_slice(&txn_id.to_le_bytes());
+
+        let main_len = main_data.map_or(0, |data| data.len()) as u16;
         self.scratch_pad.extend_from_slice(&main_len.to_le_bytes());
 
         for block in blocks {
             self.scratch_pad
                 .extend_from_slice(&block.page_id.to_le_bytes());
             self.scratch_pad.push(block.blk_flags);
-            self.scratch_pad
-                .extend_from_slice(&block.data_len.to_le_bytes());
+
+            let data_len = block.data.map_or(0, |d| d.len()) as u16;
+            self.scratch_pad.extend_from_slice(&data_len.to_le_bytes());
+
             if let Some(ref fpi) = block.fpi {
                 self.scratch_pad.extend_from_slice(fpi);
             }
@@ -477,27 +485,22 @@ mod tests {
         let block1 = Block {
             page_id: 100,
             blk_flags: 2,
-            data_len: 4,
             fpi: None,
             data: Some(&[1, 2, 3, 4]),
         };
 
-        wal.append(32, WalRecordType::Insert, 1, 42, 0, &[block1], None)?;
+        wal.append(WalRecordType::Insert, 42, &[block1], None)?;
 
         let block2 = Block {
             page_id: 101,
             blk_flags: 1,
-            data_len: 0,
             fpi: Some([0u8; PAGE_SIZE]),
             data: None,
         };
 
         wal.append(
-            32 + PAGE_SIZE as u32,
             WalRecordType::Commit,
-            1,
             43,
-            8,
             &[block2],
             Some(&[8, 7, 6, 5, 4, 3, 2, 1]),
         )?;
@@ -542,19 +545,17 @@ mod tests {
             let block1 = Block {
                 page_id: 100,
                 blk_flags: 2,
-                data_len: 4,
                 fpi: None,
                 data: Some(&[1, 2, 3, 4]),
             };
-            wal.append(32, WalRecordType::Insert, 1, 42, 0, &[block1], None)?;
+            wal.append(WalRecordType::Insert, 42, &[block1], None)?;
             let block2 = Block {
                 page_id: 101,
                 blk_flags: 0,
-                data_len: 0,
                 fpi: None,
                 data: None,
             };
-            wal.append(32, WalRecordType::Commit, 1, 43, 0, &[block2], None)?;
+            wal.append(WalRecordType::Commit, 43, &[block2], None)?;
             wal.flush_up_to(1)?;
         }
 
@@ -573,19 +574,17 @@ mod tests {
             let block1 = Block {
                 page_id: 100,
                 blk_flags: 2,
-                data_len: 4,
                 fpi: None,
                 data: Some(&[1, 2, 3, 4]),
             };
-            wal.append(32, WalRecordType::Insert, 1, 42, 0, &[block1], None)?;
+            wal.append(WalRecordType::Insert, 42, &[block1], None)?;
             let block2 = Block {
                 page_id: 101,
                 blk_flags: 0,
-                data_len: 0,
                 fpi: None,
                 data: None,
             };
-            wal.append(32, WalRecordType::Commit, 1, 43, 0, &[block2], None)?;
+            wal.append(WalRecordType::Commit, 43, &[block2], None)?;
             wal.flush_up_to(1)?;
         }
 
@@ -615,19 +614,17 @@ mod tests {
             let block1 = Block {
                 page_id: 100,
                 blk_flags: 2,
-                data_len: 4,
                 fpi: None,
                 data: Some(&[1, 2, 3, 4]),
             };
-            wal.append(32, WalRecordType::Insert, 1, 42, 0, &[block1], None)?;
+            wal.append(WalRecordType::Insert, 42, &[block1], None)?;
             let block2 = Block {
                 page_id: 101,
                 blk_flags: 0,
-                data_len: 0,
                 fpi: None,
                 data: None,
             };
-            wal.append(32, WalRecordType::Commit, 1, 43, 0, &[block2], None)?;
+            wal.append(WalRecordType::Commit, 43, &[block2], None)?;
             wal.flush_up_to(1)?;
         }
 
@@ -657,11 +654,10 @@ mod tests {
             let block1 = Block {
                 page_id: 100,
                 blk_flags: 2,
-                data_len: 4,
                 fpi: None,
                 data: Some(&[1, 2, 3, 4]),
             };
-            wal.append(32, WalRecordType::Insert, 1, 42, 0, &[block1], None)?;
+            wal.append(WalRecordType::Insert, 42, &[block1], None)?;
             wal.flush_up_to(0)?;
         }
 
