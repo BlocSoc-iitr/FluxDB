@@ -7,122 +7,245 @@
 //! -   **Checksumming**: Every record is protected by a CRC32 checksum to detect corruption.
 //! -   **Sequential I/O**: Optimized for append-only writes.
 //!
-//! ## Record Layout
+//! ## Record Layout (On-Disk Format)
 //!
-//! | Field      | Size (bytes) | Description                          |
-//! |------------|--------------|--------------------------------------|
-//! | LSN        | 8            | Log Sequence Number (Little Endian) |
-//! | Type       | 1            | Entry type (0: Put, 1: Delete)        |
-//! | Key Len    | 8            | Length of the key                    |
-//! | Value Len  | 8            | Length of the value (0 if None)      |
-//! | Timestamp  | 8            | Microseconds since Unix Epoch        |
-//! | Key        | variable     | The actual key bytes                 |
-//! | Value      | variable     | The actual value bytes (optional)    |
-//! | Checksum   | 4            | CRC32 of all preceding fields        |
+//! | Field         | Size (bytes) | Description                                  |
+//! |---------------|--------------|----------------------------------------------|
+//! | LSN           | 8            | Log Sequence Number (Little Endian)          |
+//! | Record Len    | 4            | Total length of the record                   |
+//! | Type          | 1            | WalRecordType (e.g. Insert, Commit, etc.)    |
+//! | Num Blocks    | 1            | Number of block references                   |
+//! | Txn ID        | 8            | Transaction ID                               |
+//! | Main Data Len | 2            | Length of the main data payload              |
+//! | Blocks        | variable     | Array of block references and their payloads |
+//! | Main Data     | variable     | The main data payload bytes (optional)       |
+//! | Checksum      | 4            | CRC32 of all preceding fields                |
+//!
+//! ### Block Reference Layout
+//!
+//! Each block in the `Blocks` array is structured on-disk as follows:
+//!
+//! | Field         | Size (bytes) | Description                                  |
+//! |---------------|--------------|----------------------------------------------|
+//! | Page ID       | 8            | ID of the modified page                      |
+//! | Block Flags   | 1            | Bit flags (e.g., bit 0 indicates FPI presence)|
+//! | Data Len      | 2            | Length of the block-specific redo payload    |
+//! | FPI           | 4096 (opt)   | Full-Page Image, if indicated by Block Flags |
+//! | Data          | variable     | Block-specific redo payload bytes            |
+//!
 
 use crc32fast::Hasher;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::vec;
 
 use crate::disk::DiskManager;
-use crate::page::Lsn;
+use crate::page::{Lsn, PAGE_SIZE, PageId};
 use common::WalError;
 
 pub type Result<T> = std::result::Result<T, WalError>;
 
+/// Identifies the physiological operation that a WAL record represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WalEntryType {
-    Put = 0,
-    Delete = 1,
+pub enum WalRecordType {
+    Insert = 0,
+    SetXMax = 1,
+    Commit = 2,
+    Abort = 3,
+    LeafSplit = 4,
+    InternalSPlit = 5,
+    InsertDownLink = 6,
+    NewRoot = 7,
+    PageCompact = 8,
+    MarkHalfDead = 9,
+    UnlinkPage = 10,
+    Checkpoint = 11,
 }
 
-impl TryFrom<u8> for WalEntryType {
+impl TryFrom<u8> for WalRecordType {
     type Error = WalError;
     fn try_from(value: u8) -> Result<Self> {
         match value {
-            0 => Ok(WalEntryType::Put),
-            1 => Ok(WalEntryType::Delete),
+            0 => Ok(WalRecordType::Insert),
+            1 => Ok(WalRecordType::SetXMax),
+            2 => Ok(WalRecordType::Commit),
+            3 => Ok(WalRecordType::Abort),
+            4 => Ok(WalRecordType::LeafSplit),
+            5 => Ok(WalRecordType::InternalSPlit),
+            6 => Ok(WalRecordType::InsertDownLink),
+            7 => Ok(WalRecordType::NewRoot),
+            8 => Ok(WalRecordType::PageCompact),
+            9 => Ok(WalRecordType::MarkHalfDead),
+            10 => Ok(WalRecordType::UnlinkPage),
+            11 => Ok(WalRecordType::Checkpoint),
             _ => Err(WalError::InvalidEntryType(value)),
         }
     }
 }
 
+/// Represents a reference to a page modified by the transaction, potentially
+/// including a Full-Page Image (FPI) and specific redo data for that page.
 #[derive(Debug)]
-pub struct WalEntry {
-    pub lsn: Lsn,
-    pub entry_type: WalEntryType,
-    pub key: Vec<u8>,
-    pub value: Option<Vec<u8>>,
-    pub timestamp: u64,
+pub struct Block<'a> {
+    pub page_id: PageId,
+    pub blk_flags: u8,
+    pub fpi: Option<[u8; PAGE_SIZE]>,
+    pub data: Option<&'a [u8]>,
 }
 
-// Layout of a WAL record
-// | lsn (8) | entry_type (1) | key_len (8) | value_len (8) | timestamp (8) | key_bytes | value_bytes | checksum (4) |
+/// A fully parsed Write-Ahead Log record representing a single logged operation.
+#[derive(Debug)]
+pub struct WalRecord<'a> {
+    pub lsn: Lsn,
+    pub rec_len: u32,
+    pub entry_type: WalRecordType,
+    pub txn_id: u64,
+    pub blocks: Vec<Block<'a>>,
+    pub main_data: Option<&'a [u8]>,
+}
 
+/// An iterator that sequentially reads and validates records from a WAL file.
 pub struct WalIterator {
     reader: BufReader<File>,
+    scratch: Vec<u8>,
 }
 
+/// The main Write-Ahead Log manager responsible for appending records sequentially
+/// and maintaining the durability guarantees of the database.
 pub struct Wal {
     path: PathBuf,
     file: BufWriter<File>,
     scratch_pad: Vec<u8>,
+    pub next_lsn: u64,
+    pub flushed_lsn: Option<Lsn>,
 }
 
-impl Iterator for WalIterator {
-    type Item = Result<WalEntry>;
+impl WalIterator {
+    pub fn new(path: impl AsRef<Path>) -> io::Result<WalIterator> {
+        let path = path.as_ref();
+        let file = OpenOptions::new().read(true).open(path)?;
+        Ok(WalIterator {
+            reader: BufReader::new(file),
+            scratch: Vec::with_capacity(4096),
+        })
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
+    pub fn next_record(&mut self) -> Option<Result<WalRecord<'_>>> {
+        match self.reader.fill_buf() {
+            Ok([]) => return None,
+            Ok(_) => {}
+            Err(e) => return Some(Err(e.into())),
+        }
+
+        self.scratch.clear();
+
+        let mut hasher = Hasher::new();
+
         let mut lsn_buf = [0u8; 8];
         if let Err(e) = self.reader.read_exact(&mut lsn_buf) {
-            if e.kind() == io::ErrorKind::UnexpectedEof {
-                return None;
-            }
             return Some(Err(e.into()));
         }
         let lsn = Lsn::from_le_bytes(lsn_buf);
+        hasher.update(&lsn_buf);
+
+        let mut rec_len_buf = [0u8; 4];
+        if let Err(e) = self.reader.read_exact(&mut rec_len_buf) {
+            return Some(Err(e.into()));
+        }
+        let rec_len = u32::from_le_bytes(rec_len_buf);
+        hasher.update(&rec_len_buf);
 
         let mut type_buf = [0u8; 1];
         if let Err(e) = self.reader.read_exact(&mut type_buf) {
             return Some(Err(e.into()));
         }
-        let entry_type = match WalEntryType::try_from(type_buf[0]) {
+        let entry_type = match WalRecordType::try_from(type_buf[0]) {
             Ok(t) => t,
             Err(e) => return Some(Err(e)),
         };
+        hasher.update(&type_buf);
 
-        let mut key_len_buf = [0u8; 8];
-        if let Err(e) = self.reader.read_exact(&mut key_len_buf) {
+        let mut nblocks_buf = [0u8; 1];
+        if let Err(e) = self.reader.read_exact(&mut nblocks_buf) {
             return Some(Err(e.into()));
         }
-        let key_len = u64::from_le_bytes(key_len_buf);
+        let nblocks = nblocks_buf[0];
+        hasher.update(&nblocks_buf);
 
-        let mut value_len_buf = [0u8; 8];
-        if let Err(e) = self.reader.read_exact(&mut value_len_buf) {
+        let mut txn_id_buf = [0u8; 8];
+        if let Err(e) = self.reader.read_exact(&mut txn_id_buf) {
             return Some(Err(e.into()));
         }
-        let value_len = u64::from_le_bytes(value_len_buf);
+        let txn_id = u64::from_le_bytes(txn_id_buf);
+        hasher.update(&txn_id_buf);
 
-        let mut timestamp_buf = [0u8; 8];
-        if let Err(e) = self.reader.read_exact(&mut timestamp_buf) {
+        let mut main_len_buf = [0u8; 2];
+        if let Err(e) = self.reader.read_exact(&mut main_len_buf) {
             return Some(Err(e.into()));
         }
-        let timestamp = u64::from_le_bytes(timestamp_buf);
+        let main_len = u16::from_le_bytes(main_len_buf);
+        hasher.update(&main_len_buf);
 
-        let mut key = vec![0u8; key_len as usize];
-        if let Err(e) = self.reader.read_exact(&mut key) {
-            return Some(Err(e.into()));
-        }
+        let mut temp_blocks = Vec::with_capacity(nblocks as usize);
 
-        let value = if value_len > 0 {
-            let mut val_buf = vec![0u8; value_len as usize];
-            if let Err(e) = self.reader.read_exact(&mut val_buf) {
+        for _ in 0..nblocks {
+            let mut page_id_buf = [0u8; 8];
+            if let Err(e) = self.reader.read_exact(&mut page_id_buf) {
                 return Some(Err(e.into()));
             }
-            Some(val_buf)
+            let page_id = PageId::from_le_bytes(page_id_buf);
+            hasher.update(&page_id_buf);
+
+            let mut blk_flags_buf = [0u8; 1];
+            if let Err(e) = self.reader.read_exact(&mut blk_flags_buf) {
+                return Some(Err(e.into()));
+            }
+            let blk_flags = blk_flags_buf[0];
+            hasher.update(&blk_flags_buf);
+
+            let mut data_len_buf = [0u8; 2];
+            if let Err(e) = self.reader.read_exact(&mut data_len_buf) {
+                return Some(Err(e.into()));
+            }
+            let data_len = u16::from_le_bytes(data_len_buf);
+            hasher.update(&data_len_buf);
+
+            let fpi = if blk_flags & 1 == 1 {
+                let mut fpi_buf = [0u8; PAGE_SIZE];
+                if let Err(e) = self.reader.read_exact(&mut fpi_buf) {
+                    return Some(Err(e.into()));
+                }
+                hasher.update(&fpi_buf);
+                Some(fpi_buf)
+            } else {
+                None
+            };
+
+            let data_range = if data_len > 0 {
+                let start = self.scratch.len();
+                let end = start + data_len as usize;
+                self.scratch.resize(end, 0);
+                if let Err(e) = self.reader.read_exact(&mut self.scratch[start..end]) {
+                    return Some(Err(e.into()));
+                }
+                hasher.update(&self.scratch[start..end]);
+                Some((start, end))
+            } else {
+                None
+            };
+
+            temp_blocks.push((page_id, blk_flags, fpi, data_range));
+        }
+
+        let main_data_range = if main_len > 0 {
+            let start = self.scratch.len();
+            let end = start + main_len as usize;
+            self.scratch.resize(end, 0);
+            if let Err(e) = self.reader.read_exact(&mut self.scratch[start..end]) {
+                return Some(Err(e.into()));
+            }
+            hasher.update(&self.scratch[start..end]);
+            Some((start, end))
         } else {
             None
         };
@@ -133,16 +256,6 @@ impl Iterator for WalIterator {
         }
         let expected_checksum = u32::from_le_bytes(checksum_buf);
 
-        let mut hasher = Hasher::new();
-        hasher.update(&lsn_buf);
-        hasher.update(&type_buf);
-        hasher.update(&key_len_buf);
-        hasher.update(&value_len_buf);
-        hasher.update(&timestamp_buf);
-        hasher.update(&key);
-        if let Some(ref v) = value {
-            hasher.update(v);
-        }
         let actual_checksum = hasher.finalize();
 
         if actual_checksum != expected_checksum {
@@ -153,71 +266,180 @@ impl Iterator for WalIterator {
             }));
         }
 
-        Some(Ok(WalEntry {
+        let blocks = temp_blocks
+            .into_iter()
+            .map(|(page_id, blk_flags, fpi, data_range)| {
+                let data = data_range.map(|(s, e)| &self.scratch[s..e]);
+                Block {
+                    page_id,
+                    blk_flags,
+                    fpi,
+                    data,
+                }
+            })
+            .collect();
+
+        let main_data = main_data_range.map(|(s, e)| &self.scratch[s..e]);
+
+        Some(Ok(WalRecord {
             lsn,
+            rec_len,
             entry_type,
-            key,
-            value,
-            timestamp,
+            txn_id,
+            blocks,
+            main_data,
         }))
     }
 }
 
-impl WalIterator {
-    pub fn new(path: impl AsRef<Path>) -> io::Result<WalIterator> {
-        let path = path.as_ref();
-        let file = OpenOptions::new().read(true).open(path)?;
-        Ok(WalIterator {
-            reader: BufReader::new(file),
-        })
-    }
-}
-
 impl Wal {
+    /// Opens an existing WAL file for appending, or creates a new one if it does not exist.
+    ///
+    /// Upon opening an existing file, this method scans the entire log to find the maximum
+    /// LSN and handles any torn-tail corruption by truncating the file to the last valid
+    /// record boundary. If mid-log corruption is detected, an error is returned.
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+
+        let mut next_lsn = 0;
+        let mut flushed_lsn = None;
+
+        match OpenOptions::new().read(true).open(path) {
+            Ok(file) => {
+                let file_len = file.metadata().map_err(WalError::Io)?.len();
+                let mut iter = WalIterator {
+                    reader: BufReader::new(file),
+                    scratch: Vec::with_capacity(4096),
+                };
+
+                loop {
+                    use std::io::Seek;
+                    let current_offset = iter.reader.stream_position().map_err(WalError::Io)?;
+
+                    match iter.next_record() {
+                        Some(Ok(record)) => {
+                            if record.lsn >= next_lsn {
+                                next_lsn = record.lsn + 1;
+                            }
+                            flushed_lsn = Some(record.lsn);
+                        }
+                        Some(Err(e)) => {
+                            let err_pos = iter.reader.stream_position().map_err(WalError::Io)?;
+
+                            let is_eof = match &e {
+                                WalError::Io(io_err) => {
+                                    io_err.kind() == io::ErrorKind::UnexpectedEof
+                                }
+                                _ => false,
+                            };
+
+                            // If the file is corrupted at the end, truncate it
+                            if is_eof || err_pos == file_len {
+                                let f = OpenOptions::new()
+                                    .write(true)
+                                    .open(path)
+                                    .map_err(WalError::Io)?;
+                                // chops off the corrupted part
+                                f.set_len(current_offset).map_err(WalError::Io)?;
+                                f.sync_all().map_err(WalError::Io)?;
+                                break;
+                            } else {
+                                return Err(e);
+                            }
+                        }
+                        None => {
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if e.kind() != io::ErrorKind::NotFound {
+                    return Err(e.into());
+                }
+            }
+        };
+
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(WalError::Io)?;
+
         Ok(Wal {
             path: path.to_path_buf(),
             file: BufWriter::new(file),
             scratch_pad: Vec::with_capacity(4096),
+            next_lsn,
+            flushed_lsn,
         })
     }
 
+    /// Appends a new physiological record to the WAL buffer.
+    ///
+    /// This method assigns the next available LSN, serializes the record according to the
+    /// internal wire format, calculates its CRC32 checksum, and writes it to the internal
+    /// `BufWriter`. Note that the record is not guaranteed to be durable on disk until
+    /// `flush_up_to` is called.
     pub fn append(
         &mut self,
-        lsn: Lsn,
-        entry_type: WalEntryType,
-        key: &[u8],
-        value: Option<&[u8]>,
+        entry_type: WalRecordType,
+        txn_id: u64,
+        blocks: &[Block<'_>],
+        main_data: Option<&[u8]>,
     ) -> Result<Lsn> {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| WalError::CorruptedLog(e.to_string()))?
-            .as_micros() as u64;
-
-        let key_len = key.len() as u64;
-        let value_bytes = match entry_type {
-            WalEntryType::Put => {
-                value.ok_or_else(|| WalError::CorruptedLog("Put entry missing value".into()))?
-            }
-            WalEntryType::Delete => &[],
-        };
-        let value_len = value_bytes.len() as u64;
+        let lsn = self.next_lsn;
+        self.next_lsn += 1;
 
         self.scratch_pad.clear();
 
-        // Reserve space: 8 (LSN) + 1 (type) + 8 (key_len) + 8 (value_len) + 8 (timestamp) + key + value
-        let record_size = 8 + 1 + 8 + 8 + 8 + key.len() + value_bytes.len();
+        let blocks_size = blocks
+            .iter()
+            .map(|block| {
+                let mut size = 8 + 1 + 2;
+                if block.fpi.is_some() {
+                    size += PAGE_SIZE;
+                }
+                if let Some(data) = block.data {
+                    size += data.len();
+                }
+                size
+            })
+            .sum::<usize>();
+
+        let main_data_size = main_data.as_ref().map_or(0, |data| data.len());
+
+        let record_size = 8 + 4 + 1 + 1 + 8 + 2 + blocks_size + main_data_size + 4;
         self.scratch_pad.reserve(record_size);
 
         self.scratch_pad.extend_from_slice(&lsn.to_le_bytes());
+        self.scratch_pad
+            .extend_from_slice(&(record_size as u32).to_le_bytes());
         self.scratch_pad.push(entry_type as u8);
-        self.scratch_pad.extend_from_slice(&key_len.to_le_bytes());
-        self.scratch_pad.extend_from_slice(&value_len.to_le_bytes());
-        self.scratch_pad.extend_from_slice(&timestamp.to_le_bytes());
-        self.scratch_pad.extend_from_slice(key);
-        self.scratch_pad.extend_from_slice(value_bytes);
+        self.scratch_pad.push(blocks.len() as u8);
+        self.scratch_pad.extend_from_slice(&txn_id.to_le_bytes());
+
+        let main_len = main_data.map_or(0, |data| data.len()) as u16;
+        self.scratch_pad.extend_from_slice(&main_len.to_le_bytes());
+
+        for block in blocks {
+            self.scratch_pad
+                .extend_from_slice(&block.page_id.to_le_bytes());
+            self.scratch_pad.push(block.blk_flags);
+
+            let data_len = block.data.map_or(0, |d| d.len()) as u16;
+            self.scratch_pad.extend_from_slice(&data_len.to_le_bytes());
+
+            if let Some(ref fpi) = block.fpi {
+                self.scratch_pad.extend_from_slice(fpi);
+            }
+            if let Some(data) = block.data {
+                self.scratch_pad.extend_from_slice(data);
+            }
+        }
+        if let Some(data) = main_data {
+            self.scratch_pad.extend_from_slice(data);
+        }
 
         let mut hasher = Hasher::new();
         hasher.update(&self.scratch_pad);
@@ -226,12 +448,23 @@ impl Wal {
         self.file.write_all(&self.scratch_pad)?;
         self.file.write_all(&checksum.to_le_bytes())?;
 
-        Ok(lsn + 1)
+        Ok(lsn)
     }
 
-    pub fn flush(&mut self) -> Result<()> {
-        self.file.flush()?;
-        DiskManager::sync_file_and_dir(self.file.get_ref(), &self.path)?;
+    /// Flushes all pending records up to and including the specified LSN to the physical disk.
+    ///
+    /// This ensures durability for all transactions committed up to `lsn`.
+    pub fn flush_up_to(&mut self, lsn: Lsn) -> Result<()> {
+        let needs_flush = match self.flushed_lsn {
+            Some(flushed) => lsn > flushed,
+            None => true,
+        };
+
+        if needs_flush {
+            self.file.flush().map_err(WalError::Io)?;
+            DiskManager::sync_file_and_dir(self.file.get_ref(), &self.path)?;
+            self.flushed_lsn = Some(self.next_lsn.saturating_sub(1));
+        }
         Ok(())
     }
 }
@@ -249,58 +482,202 @@ mod tests {
 
         let mut wal = Wal::new(&wal_path)?;
 
-        wal.append(1, WalEntryType::Put, b"key1", Some(b"value1"))?;
-        wal.append(2, WalEntryType::Put, b"key2", Some(b"value2"))?;
-        wal.append(3, WalEntryType::Delete, b"key1", None)?;
-        wal.flush()?;
+        let block1 = Block {
+            page_id: 100,
+            blk_flags: 2,
+            fpi: None,
+            data: Some(&[1, 2, 3, 4]),
+        };
+
+        wal.append(WalRecordType::Insert, 42, &[block1], None)?;
+
+        let block2 = Block {
+            page_id: 101,
+            blk_flags: 1,
+            fpi: Some([0u8; PAGE_SIZE]),
+            data: None,
+        };
+
+        wal.append(
+            WalRecordType::Commit,
+            43,
+            &[block2],
+            Some(&[8, 7, 6, 5, 4, 3, 2, 1]),
+        )?;
+
+        wal.flush_up_to(2)?;
+
         let mut iter = WalIterator::new(&wal_path).map_err(|e| WalError::Io(e))?;
 
-        let entry1 = iter.next().unwrap()?;
-        assert_eq!(entry1.lsn, 1);
-        assert_eq!(entry1.entry_type, WalEntryType::Put);
-        assert_eq!(entry1.key, b"key1");
-        assert_eq!(entry1.value, Some(b"value1".to_vec()));
+        {
+            let entry1 = iter.next_record().unwrap()?;
+            assert_eq!(entry1.lsn, 0);
+            assert_eq!(entry1.entry_type, WalRecordType::Insert);
+            assert_eq!(entry1.txn_id, 42);
+            assert_eq!(entry1.blocks.len(), 1);
+            assert_eq!(entry1.blocks[0].page_id, 100);
+            assert_eq!(entry1.blocks[0].data.unwrap(), &[1, 2, 3, 4]);
+        }
 
-        let entry2 = iter.next().unwrap()?;
-        assert_eq!(entry2.lsn, 2);
-        assert_eq!(entry2.entry_type, WalEntryType::Put);
-        assert_eq!(entry2.key, b"key2");
-        assert_eq!(entry2.value, Some(b"value2".to_vec()));
+        {
+            let entry2 = iter.next_record().unwrap()?;
+            assert_eq!(entry2.lsn, 1);
+            assert_eq!(entry2.entry_type, WalRecordType::Commit);
+            assert_eq!(entry2.txn_id, 43);
+            assert_eq!(entry2.blocks.len(), 1);
+            assert_eq!(entry2.blocks[0].page_id, 101);
+            assert!(entry2.blocks[0].fpi.is_some());
+            assert_eq!(entry2.main_data.unwrap(), &[8, 7, 6, 5, 4, 3, 2, 1]);
+        }
 
-        let entry3 = iter.next().unwrap()?;
-        assert_eq!(entry3.lsn, 3);
-        assert_eq!(entry3.entry_type, WalEntryType::Delete);
-        assert_eq!(entry3.key, b"key1");
-        assert_eq!(entry3.value, None);
-
-        assert!(iter.next().is_none());
+        assert!(iter.next_record().is_none());
 
         Ok(())
     }
 
     #[test]
-    fn test_wal_corruption() -> Result<()> {
+    fn test_wal_recovery_clean() -> Result<()> {
         let dir = tempdir().map_err(|e| WalError::Io(e))?;
-        let wal_path = dir.path().join("corrupt.wal");
+        let wal_path = dir.path().join("clean.wal");
 
-        let mut wal = Wal::new(&wal_path)?;
-        wal.append(1, WalEntryType::Put, b"key1", Some(b"value1"))?;
-        wal.flush()?;
+        {
+            let mut wal = Wal::new(&wal_path)?;
+            let block1 = Block {
+                page_id: 100,
+                blk_flags: 2,
+                fpi: None,
+                data: Some(&[1, 2, 3, 4]),
+            };
+            wal.append(WalRecordType::Insert, 42, &[block1], None)?;
+            let block2 = Block {
+                page_id: 101,
+                blk_flags: 0,
+                fpi: None,
+                data: None,
+            };
+            wal.append(WalRecordType::Commit, 43, &[block2], None)?;
+            wal.flush_up_to(1)?;
+        }
 
-        // Intentionally corrupt the file
+        let wal = Wal::new(&wal_path)?;
+        assert_eq!(wal.next_lsn, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_wal_recovery_torn_tail() -> Result<()> {
+        let dir = tempdir().map_err(|e| WalError::Io(e))?;
+        let wal_path = dir.path().join("torntail.wal");
+
+        {
+            let mut wal = Wal::new(&wal_path)?;
+            let block1 = Block {
+                page_id: 100,
+                blk_flags: 2,
+                fpi: None,
+                data: Some(&[1, 2, 3, 4]),
+            };
+            wal.append(WalRecordType::Insert, 42, &[block1], None)?;
+            let block2 = Block {
+                page_id: 101,
+                blk_flags: 0,
+                fpi: None,
+                data: None,
+            };
+            wal.append(WalRecordType::Commit, 43, &[block2], None)?;
+            wal.flush_up_to(1)?;
+        }
+
         let mut file = OpenOptions::new().write(true).open(&wal_path)?;
-        // Corrupt the checksum (last 4 bytes of the first 47-byte record)
-        file.seek(SeekFrom::Start(46))?;
+        let file_len = file.metadata()?.len();
+
+        file.seek(SeekFrom::Start(file_len - 1))?;
         file.write_all(&[0xFF])?;
         file.sync_all()?;
 
-        let mut iter = WalIterator::new(&wal_path).map_err(|e| WalError::Io(e))?;
-        let result = iter.next().unwrap();
+        let wal = Wal::new(&wal_path)?;
+        assert_eq!(wal.next_lsn, 1);
 
-        match result {
-            Err(WalError::ChecksumMismatch { lsn, .. }) => assert_eq!(lsn, 1),
-            _ => panic!("Expected ChecksumMismatch error, got {:?}", result),
+        let new_file_len = file.metadata()?.len();
+        assert!(new_file_len < file_len);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_wal_mid_log_corruption() -> Result<()> {
+        let dir = tempdir().map_err(|e| WalError::Io(e))?;
+        let wal_path = dir.path().join("midlog.wal");
+
+        {
+            let mut wal = Wal::new(&wal_path)?;
+            let block1 = Block {
+                page_id: 100,
+                blk_flags: 2,
+                fpi: None,
+                data: Some(&[1, 2, 3, 4]),
+            };
+            wal.append(WalRecordType::Insert, 42, &[block1], None)?;
+            let block2 = Block {
+                page_id: 101,
+                blk_flags: 0,
+                fpi: None,
+                data: None,
+            };
+            wal.append(WalRecordType::Commit, 43, &[block2], None)?;
+            wal.flush_up_to(1)?;
         }
+
+        let mut file = OpenOptions::new().write(true).open(&wal_path)?;
+
+        file.seek(SeekFrom::Start(40))?;
+        file.write_all(&[0xFF])?;
+        file.sync_all()?;
+
+        let result = Wal::new(&wal_path);
+        match result {
+            Err(WalError::ChecksumMismatch { lsn, .. }) => assert_eq!(lsn, 0),
+            Err(e) => panic!("Expected ChecksumMismatch error, got error: {:?}", e),
+            Ok(_) => panic!("Expected ChecksumMismatch error, got Ok(_)"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_wal_torn_lsn() -> Result<()> {
+        let dir = tempdir().map_err(WalError::Io)?;
+        let wal_path = dir.path().join("torn_lsn.wal");
+
+        {
+            let mut wal = Wal::new(&wal_path)?;
+            let block1 = Block {
+                page_id: 100,
+                blk_flags: 2,
+                fpi: None,
+                data: Some(&[1, 2, 3, 4]),
+            };
+            wal.append(WalRecordType::Insert, 42, &[block1], None)?;
+            wal.flush_up_to(0)?;
+        }
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(&wal_path)?;
+        let clean_len = file.metadata()?.len();
+
+        file.write_all(&[0xFF, 0xFF, 0xFF, 0xFF])?;
+        file.sync_all()?;
+
+        let _ = Wal::new(&wal_path)?;
+
+        let new_file_len = std::fs::metadata(&wal_path).map_err(WalError::Io)?.len();
+        assert_eq!(
+            new_file_len, clean_len,
+            "Garbage bytes were not truncated! Expected len {}, got {}",
+            clean_len, new_file_len
+        );
 
         Ok(())
     }
