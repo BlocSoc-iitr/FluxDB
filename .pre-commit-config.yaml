@@ -1,18 +1,8 @@
 repos:
   - repo: local
     hooks:
-      - id: cargo-fmt
-        name: cargo fmt
+      - id: make-pr
+        name: make pr
         language: system
-        entry: cargo fmt --
-        args: ["--check"]
-        types: [rust]
-        pass_filenames: false
-
-      - id: cargo-clippy
-        name: cargo clippy
-        language: system
-        entry: cargo clippy
-        args: ["--", "-D", "warnings"]
-        types: [rust]
+        entry: make pr
         pass_filenames: false
