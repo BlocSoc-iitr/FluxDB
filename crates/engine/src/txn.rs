@@ -1,6 +1,7 @@
 use crate::engine::Engine;
 use common::{EngineError, Key, Value};
 use db_core::transaction::Transaction;
+use storage::wal::WalRecordType;
 
 // Used a reference instead of Arc as reference enforces that transaction does not outlive the engine.
 pub struct TxnHandle<'e, K: Key, V: Value> {
@@ -15,31 +16,36 @@ where
     V: Value,
 {
     // this function is called once inserts/get/update/delete finishes and returns from index.rs
-    pub(crate) fn commit(&self, txn: Transaction) {
+    pub(crate) fn commit(&self, txn: Transaction) ->Result<(), EngineError> {
         if !txn.wrote_anything() {
             self.transaction_manager.mark_committed(txn.txn_id);
-            return;
+            return Ok(());
         }
-        // take the shared lock to prevent checkpoint from running
-        // append commit log to wal
-        // fsync upto this commit_lsn
-        // call tm.mark_committed()
-        self.transaction_manager.mark_committed(txn.txn_id);
-        // release the lock
+        {
+            let mut guard = self.wal.lock().unwrap();
+            let lsn = guard.append(WalRecordType::Commit, txn.txn_id, &[], None)?; // append commit record to wal
+            guard.flush_up_to(lsn)?; // flush wal to disk
+            self.transaction_manager.mark_committed(txn.txn_id);
+        }
+        Ok(())
     }
 
     // this function is called once inserts/get/update/delete finishes and returns from index.rs
-    pub(crate) fn abort(&self, txn: Transaction) {
+    pub(crate) fn abort(&self, txn: Transaction) -> Result<(), EngineError> {
         if !txn.wrote_anything() {
             self.transaction_manager.mark_aborted(txn.txn_id);
-            return;
+            return Ok(());
         }
-        // take the shared lock to prevent checkpoint from running
-        // append abort log to wal
-        // no need to fsync aborts
-        // call tm.mark_aborted()
+        {
+        let _ =
+            self.wal
+                .lock()
+                .unwrap()
+                .append(WalRecordType::Abort, txn.txn_id, &[], None)?;
+
         self.transaction_manager.mark_aborted(txn.txn_id);
-        // release the lock
+        }
+        Ok(())
     }
 }
 
