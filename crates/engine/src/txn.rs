@@ -16,7 +16,7 @@ where
     V: Value,
 {
     // this function is called once inserts/get/update/delete finishes and returns from index.rs
-    pub(crate) fn commit(&self, txn: Transaction) ->Result<(), EngineError> {
+    pub(crate) fn commit(&self, txn: Transaction) -> Result<(), EngineError> {
         if !txn.wrote_anything() {
             self.transaction_manager.mark_committed(txn.txn_id);
             return Ok(());
@@ -37,13 +37,13 @@ where
             return Ok(());
         }
         {
-        let _ =
-            self.wal
+            let _ = self
+                .wal
                 .lock()
                 .unwrap()
                 .append(WalRecordType::Abort, txn.txn_id, &[], None)?;
 
-        self.transaction_manager.mark_aborted(txn.txn_id);
+            self.transaction_manager.mark_aborted(txn.txn_id);
         }
         Ok(())
     }
@@ -59,7 +59,7 @@ where
             return Err(EngineError::TransactionConflict); // no need to call abort here as self will get dropped and abort is called inside drop impl itself. 
         };
         if let Some(txn) = self.txn.take() {
-            self.engine.commit(txn);
+            self.engine.commit(txn)?;
         }
         Ok(())
     }
@@ -135,7 +135,7 @@ impl<K: Key, V: Value> Drop for TxnHandle<'_, K, V> {
     fn drop(&mut self) {
         if let Some(txn) = self.txn.take() {
             // only way to reach this path is if no one commits so txn still has a value.
-            self.engine.abort(txn); // abort the transaction is no one commits 
+            let _ = self.engine.abort(txn); // abort the transaction is no one commits 
         }
     }
 }

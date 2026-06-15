@@ -463,7 +463,7 @@ impl Wal {
         if needs_flush {
             self.file.flush().map_err(WalError::Io)?;
             DiskManager::sync_file_and_dir(self.file.get_ref(), &self.path)?;
-            self.flushed_lsn = Some(self.next_lsn.saturating_sub(1));
+            self.flushed_lsn = Some(lsn);
         }
         Ok(())
     }
@@ -561,6 +561,31 @@ mod tests {
 
         let wal = Wal::new(&wal_path)?;
         assert_eq!(wal.next_lsn, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_flush_tracks_requested_lsn_and_noops_when_durable() -> Result<()> {
+        let dir = tempdir().map_err(WalError::Io)?;
+        let wal_path = dir.path().join("flush_lsn.wal");
+
+        let mut wal = Wal::new(&wal_path)?;
+        let first = wal.append(WalRecordType::Insert, 42, &[], None)?;
+        let second = wal.append(WalRecordType::Commit, 42, &[], None)?;
+
+        assert_eq!(first, 0);
+        assert_eq!(second, 1);
+        assert_eq!(wal.flushed_lsn, None);
+
+        wal.flush_up_to(first)?;
+        assert_eq!(wal.flushed_lsn, Some(first));
+
+        wal.flush_up_to(first)?;
+        assert_eq!(wal.flushed_lsn, Some(first));
+
+        wal.flush_up_to(second)?;
+        assert_eq!(wal.flushed_lsn, Some(second));
+
         Ok(())
     }
 

@@ -97,11 +97,11 @@ where
         let mut txn = self.transaction_manager.begin();
         match self.insert_in(&mut txn, key, value) {
             Ok(()) => {
-                self.commit(txn);
+                self.commit(txn)?;
                 Ok(())
             }
             Err(e) => {
-                self.abort(txn);
+                let _ = self.abort(txn);
                 Err(e)
             }
         }
@@ -113,11 +113,11 @@ where
         let txn = self.transaction_manager.begin();
         match self.get_in(&txn, key) {
             Ok(v) => {
-                self.commit(txn);
+                self.commit(txn)?;
                 Ok(v)
             }
             Err(e) => {
-                self.abort(txn);
+                let _ = self.abort(txn);
                 Err(e)
             }
         }
@@ -131,11 +131,11 @@ where
         let mut txn = self.transaction_manager.begin();
         match self.update_in(&mut txn, key, value) {
             Ok(()) => {
-                self.commit(txn);
+                self.commit(txn)?;
                 Ok(())
             }
             Err(e) => {
-                self.abort(txn);
+                let _ = self.abort(txn);
                 Err(e)
             }
         }
@@ -145,11 +145,11 @@ where
         let mut txn = self.transaction_manager.begin();
         match self.delete_in(&mut txn, key) {
             Ok(()) => {
-                self.commit(txn);
+                self.commit(txn)?;
                 Ok(())
             }
             Err(e) => {
-                self.abort(txn);
+                let _ = self.abort(txn);
                 Err(e)
             }
         }
