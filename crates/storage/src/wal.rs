@@ -3,7 +3,10 @@
 //! The WAL is a crucial component for ensuring Database durability and atomicity.
 //! It records all changes to the database before they are applied to the data files.
 //! This implementation provides:
-//! -   **Durability**: Changes are flushed to disk before completion.
+//! -   **Logical LSNs**: Each append receives a monotonically increasing
+//!     logical counter, not a byte offset.
+//! -   **Durability tracking**: `flushed_lsn` records the highest LSN known to
+//!     be durable; `flush_up_to(lsn)` fsyncs only when needed.
 //! -   **Checksumming**: Every record is protected by a CRC32 checksum to detect corruption.
 //! -   **Sequential I/O**: Optimized for append-only writes.
 //!
@@ -451,9 +454,11 @@ impl Wal {
         Ok(lsn)
     }
 
-    /// Flushes all pending records up to and including the specified LSN to the physical disk.
+    /// Flushes pending WAL bytes so records up to and including `lsn` are durable.
     ///
-    /// This ensures durability for all transactions committed up to `lsn`.
+    /// This is a no-op when `flushed_lsn >= lsn`. Otherwise it drains the `BufWriter`,
+    /// fsyncs the WAL file and parent directory, then advances `flushed_lsn` to `lsn`.
+    /// Commit code relies on this before publishing a transaction as committed.
     pub fn flush_up_to(&mut self, lsn: Lsn) -> Result<()> {
         let needs_flush = match self.flushed_lsn {
             Some(flushed) => lsn > flushed,
@@ -463,7 +468,7 @@ impl Wal {
         if needs_flush {
             self.file.flush().map_err(WalError::Io)?;
             DiskManager::sync_file_and_dir(self.file.get_ref(), &self.path)?;
-            self.flushed_lsn = Some(self.next_lsn.saturating_sub(1));
+            self.flushed_lsn = Some(lsn);
         }
         Ok(())
     }
@@ -561,6 +566,31 @@ mod tests {
 
         let wal = Wal::new(&wal_path)?;
         assert_eq!(wal.next_lsn, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_flush_tracks_requested_lsn_and_noops_when_durable() -> Result<()> {
+        let dir = tempdir().map_err(WalError::Io)?;
+        let wal_path = dir.path().join("flush_lsn.wal");
+
+        let mut wal = Wal::new(&wal_path)?;
+        let first = wal.append(WalRecordType::Insert, 42, &[], None)?;
+        let second = wal.append(WalRecordType::Commit, 42, &[], None)?;
+
+        assert_eq!(first, 0);
+        assert_eq!(second, 1);
+        assert_eq!(wal.flushed_lsn, None);
+
+        wal.flush_up_to(first)?;
+        assert_eq!(wal.flushed_lsn, Some(first));
+
+        wal.flush_up_to(first)?;
+        assert_eq!(wal.flushed_lsn, Some(first));
+
+        wal.flush_up_to(second)?;
+        assert_eq!(wal.flushed_lsn, Some(second));
+
         Ok(())
     }
 

@@ -1,3 +1,10 @@
+//! Top-level database engine facade.
+//!
+//! `Engine` owns the WAL and transaction manager, so it is responsible for the
+//! commit-observability rule: a write transaction is marked committed only
+//! after its commit WAL record has been appended and flushed. Public autocommit
+//! methods propagate that durability error instead of acknowledging success.
+
 use common::{EngineError, Key, Value};
 use db_core::transaction_manager::TransactionManager;
 use std::path::Path;
@@ -29,7 +36,7 @@ where
     K: Key,
     V: Value,
 {
-    // creates a new database
+    /// Creates a new database directory with an initialized data file and WAL.
     pub fn create(dir_path: impl AsRef<Path>) -> Result<Engine<K, V>, EngineError> {
         let path = dir_path.as_ref();
         std::fs::create_dir_all(path)?;
@@ -57,7 +64,11 @@ where
             transaction_manager,
         })
     }
-    // opens an existing database
+    /// Opens an existing database.
+    ///
+    /// `Wal::new` scans the existing log before returning, so the in-memory WAL
+    /// resumes with `next_lsn = max_lsn + 1` and `flushed_lsn` set to the last
+    /// valid durable record.
     pub fn open(dir_path: impl AsRef<Path>) -> Result<Engine<K, V>, EngineError> {
         let path = dir_path.as_ref();
         // the data file is the marker that a database lives here
@@ -97,11 +108,11 @@ where
         let mut txn = self.transaction_manager.begin();
         match self.insert_in(&mut txn, key, value) {
             Ok(()) => {
-                self.commit(txn);
+                self.commit(txn)?;
                 Ok(())
             }
             Err(e) => {
-                self.abort(txn);
+                let _ = self.abort(txn);
                 Err(e)
             }
         }
@@ -113,11 +124,11 @@ where
         let txn = self.transaction_manager.begin();
         match self.get_in(&txn, key) {
             Ok(v) => {
-                self.commit(txn);
+                self.commit(txn)?;
                 Ok(v)
             }
             Err(e) => {
-                self.abort(txn);
+                let _ = self.abort(txn);
                 Err(e)
             }
         }
@@ -131,11 +142,11 @@ where
         let mut txn = self.transaction_manager.begin();
         match self.update_in(&mut txn, key, value) {
             Ok(()) => {
-                self.commit(txn);
+                self.commit(txn)?;
                 Ok(())
             }
             Err(e) => {
-                self.abort(txn);
+                let _ = self.abort(txn);
                 Err(e)
             }
         }
@@ -145,11 +156,11 @@ where
         let mut txn = self.transaction_manager.begin();
         match self.delete_in(&mut txn, key) {
             Ok(()) => {
-                self.commit(txn);
+                self.commit(txn)?;
                 Ok(())
             }
             Err(e) => {
-                self.abort(txn);
+                let _ = self.abort(txn);
                 Err(e)
             }
         }
