@@ -257,7 +257,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                     LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmin(slot, txn.txn_id);
                     Ok(())
                 }
-                Err(_) => self.split_and_insert(leaf_guard, key, value, txn.txn_id, &mut stack),
+                Err(_) => self.split_and_insert(leaf_guard, key, value, txn, &mut stack),
             };
         }
     }
@@ -445,7 +445,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                     LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmin(slot, txn.txn_id);
                     Ok(())
                 }
-                Err(_) => self.split_and_insert(leaf_guard, key, value, txn.txn_id, &mut stack),
+                Err(_) => self.split_and_insert(leaf_guard, key, value, txn, &mut stack),
             };
         }
     }
@@ -725,11 +725,43 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         mut leaf_guard: PageWriteGuard<'_>,
         key: &K::SelfType<'_>,
         value: &V::SelfType<'_>,
-        txn_id: u64,
+        txn: &Transaction,
         stack: &mut BTStack,
     ) -> Result<()> {
-        let key_bytes = K::as_bytes(key);
         let leaf_pid_actual = leaf_guard.page_id;
+
+        // ── Try compaction first (design doc 25: bottom-up deletion) ──
+        let global_xmin = txn.tm.global_xmin();
+        let dead_count = LeafPageMutator::<K, V>::compact(
+            leaf_pid_actual,
+            &mut leaf_guard[..],
+            global_xmin,
+            &txn.tm,
+        );
+
+        // TODO(WAL): Log PageCompact FPI record and stamp new LSN here (design doc 32 step 3)
+        //   let lsn = self.wal.append(PageCompact { leaf_pid, fpi })?;
+        //   LeafPageMutator::new(&mut leaf_guard[..]).set_lsn(lsn);
+
+        if dead_count > 0 {
+            let key_bytes = K::as_bytes(key);
+            let val_bytes = V::as_bytes(value);
+            let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
+
+            if acc.can_fit_direct(key_bytes.as_ref().len(), val_bytes.as_ref().len()) {
+                let (slot, _) = acc.position(key);
+
+                // Single mutator for insert + set_xmin
+                let mut mutator = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]);
+                mutator.insert(slot, key, value)?;
+                mutator.set_xmin(slot, txn.txn_id);
+
+                // Compact avoided the split - done
+                return Ok(());
+            }
+        }
+
+        let key_bytes = K::as_bytes(key);
         let split = self.split_leaf_ly(&mut leaf_guard)?;
 
         let target_pid =
@@ -739,16 +771,19 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 leaf_pid_actual
             };
 
+        // Optimize existing split path (reuse mutator)
         if target_pid == leaf_pid_actual {
             let (s, _) = LeafPageAccessor::<K, V>::new(&leaf_guard[..]).position(key);
-            LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).insert(s, key, value)?;
-            LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmin(s, txn_id);
+            let mut mutator = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]);
+            mutator.insert(s, key, value)?;
+            mutator.set_xmin(s, txn.txn_id);
         } else {
             drop(leaf_guard);
             let mut right = self.pool.fetch_page_mut(target_pid)?;
             let (s, _) = LeafPageAccessor::<K, V>::new(&right[..]).position(key);
-            LeafPageMutator::<K, V>::new(&mut right[..]).insert(s, key, value)?;
-            LeafPageMutator::<K, V>::new(&mut right[..]).set_xmin(s, txn_id);
+            let mut mutator = LeafPageMutator::<K, V>::new(&mut right[..]);
+            mutator.insert(s, key, value)?;
+            mutator.set_xmin(s, txn.txn_id);
         }
 
         self.insert_separator_via_stack(stack, split.separator_key, split.new_page_id)
@@ -1453,5 +1488,43 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(results.len(), 50);
+    }
+
+    #[test]
+    fn compact_prevents_split() {
+        let tm = std::sync::Arc::new(db_core::transaction_manager::TransactionManager::new());
+        let idx = make_index();
+
+        for i in 0u32..80 {
+            let k = i.to_be_bytes();
+            let v = vec![0xAA; 40]; // padding to fill page
+            let txn = tm.begin();
+            idx.insert(&(k.as_ref()), &(v.as_ref()), &txn).unwrap();
+            tm.mark_committed(txn.txn_id);
+        }
+
+        let root_before = idx.root_page_id();
+
+        for i in 0u32..40 {
+            let k = i.to_be_bytes();
+            let txn = tm.begin();
+            idx.delete(&(k.as_ref()), &txn).unwrap();
+            tm.mark_committed(txn.txn_id);
+        }
+
+        let txn = tm.begin();
+        let k = 999u32.to_be_bytes();
+        let v = vec![0xBB; 40];
+        idx.insert(&(k.as_ref()), &(v.as_ref()), &txn).unwrap();
+        tm.mark_committed(txn.txn_id);
+
+        let root_after = idx.root_page_id();
+        assert_eq!(
+            root_before, root_after,
+            "Split should have been avoided via compaction"
+        );
+
+        let result = idx.get(&(k.as_ref()), &tm.begin()).unwrap();
+        assert!(result.is_some(), "Inserted record should be readable");
     }
 }
