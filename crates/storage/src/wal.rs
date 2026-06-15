@@ -3,7 +3,10 @@
 //! The WAL is a crucial component for ensuring Database durability and atomicity.
 //! It records all changes to the database before they are applied to the data files.
 //! This implementation provides:
-//! -   **Durability**: Changes are flushed to disk before completion.
+//! -   **Logical LSNs**: Each append receives a monotonically increasing
+//!     logical counter, not a byte offset.
+//! -   **Durability tracking**: `flushed_lsn` records the highest LSN known to
+//!     be durable; `flush_up_to(lsn)` fsyncs only when needed.
 //! -   **Checksumming**: Every record is protected by a CRC32 checksum to detect corruption.
 //! -   **Sequential I/O**: Optimized for append-only writes.
 //!
@@ -451,9 +454,11 @@ impl Wal {
         Ok(lsn)
     }
 
-    /// Flushes all pending records up to and including the specified LSN to the physical disk.
+    /// Flushes pending WAL bytes so records up to and including `lsn` are durable.
     ///
-    /// This ensures durability for all transactions committed up to `lsn`.
+    /// This is a no-op when `flushed_lsn >= lsn`. Otherwise it drains the `BufWriter`,
+    /// fsyncs the WAL file and parent directory, then advances `flushed_lsn` to `lsn`.
+    /// Commit code relies on this before publishing a transaction as committed.
     pub fn flush_up_to(&mut self, lsn: Lsn) -> Result<()> {
         let needs_flush = match self.flushed_lsn {
             Some(flushed) => lsn > flushed,

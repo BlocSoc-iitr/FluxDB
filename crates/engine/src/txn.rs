@@ -1,9 +1,18 @@
+//! Transaction lifecycle glue between the engine, WAL, and MVCC state.
+//!
+//! Write commits append a `Commit` WAL record, flush through that record's LSN,
+//! and only then publish the commit to the transaction manager. Aborts append
+//! an `Abort` record for recovery diagnostics, but deliberately do not fsync.
+
 use crate::engine::Engine;
 use common::{EngineError, Key, Value};
 use db_core::transaction::Transaction;
 use storage::wal::WalRecordType;
 
-// Used a reference instead of Arc as reference enforces that transaction does not outlive the engine.
+/// A user-facing transaction handle tied to the lifetime of its engine.
+///
+/// The handle stores a borrowed engine reference rather than an `Arc`, which
+/// prevents a transaction from outliving the engine that owns its WAL.
 pub struct TxnHandle<'e, K: Key, V: Value> {
     pub(crate) engine: &'e Engine<K, V>,
     pub(crate) txn: Option<Transaction>,
@@ -15,7 +24,11 @@ where
     K: Key,
     V: Value,
 {
-    // this function is called once inserts/get/update/delete finishes and returns from index.rs
+    /// Commits a transaction.
+    ///
+    /// Read-only transactions take the fast path and update CLOG directly.
+    /// Write transactions are not observable as committed until the commit
+    /// record is durable through `flush_up_to(lsn)`.
     pub(crate) fn commit(&self, txn: Transaction) -> Result<(), EngineError> {
         if !txn.wrote_anything() {
             self.transaction_manager.mark_committed(txn.txn_id);
@@ -23,14 +36,18 @@ where
         }
         {
             let mut guard = self.wal.lock().unwrap();
-            let lsn = guard.append(WalRecordType::Commit, txn.txn_id, &[], None)?; // append commit record to wal
-            guard.flush_up_to(lsn)?; // flush wal to disk
+            let lsn = guard.append(WalRecordType::Commit, txn.txn_id, &[], None)?;
+            guard.flush_up_to(lsn)?;
             self.transaction_manager.mark_committed(txn.txn_id);
         }
         Ok(())
     }
 
-    // this function is called once inserts/get/update/delete finishes and returns from index.rs
+    /// Aborts a transaction.
+    ///
+    /// Abort records are appended for WAL replay, but are never explicitly
+    /// fsynced. Losing an abort record is safe because recovery treats an
+    /// in-flight transaction without a commit record as aborted.
     pub(crate) fn abort(&self, txn: Transaction) -> Result<(), EngineError> {
         if !txn.wrote_anything() {
             self.transaction_manager.mark_aborted(txn.txn_id);
@@ -128,7 +145,10 @@ where
         self.engine.get_in(txn, key)
     }
 
-    pub fn abort(self) {} // drop does the work here as well.
+    /// Explicitly aborts the transaction by consuming the handle.
+    ///
+    /// The `Drop` implementation performs the actual abort path.
+    pub fn abort(self) {}
 }
 
 impl<K: Key, V: Value> Drop for TxnHandle<'_, K, V> {
