@@ -377,14 +377,20 @@ impl Wal {
             flushed_lsn,
         })
     }
+    pub fn log_commit(&mut self, txn_id: u64) -> Result<Lsn> {
+        self.append(WalRecordType::Commit, txn_id, &[], None)
+    }
 
+    pub fn log_abort(&mut self, txn_id: u64) -> Result<Lsn> {
+        self.append(WalRecordType::Abort, txn_id, &[], None)
+    }
     /// Appends a new physiological record to the WAL buffer.
     ///
     /// This method assigns the next available LSN, serializes the record according to the
     /// internal wire format, calculates its CRC32 checksum, and writes it to the internal
     /// `BufWriter`. Note that the record is not guaranteed to be durable on disk until
     /// `flush_up_to` is called.
-    pub fn append(
+    fn append(
         &mut self,
         entry_type: WalRecordType,
         txn_id: u64,

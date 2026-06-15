@@ -7,7 +7,6 @@
 use crate::engine::Engine;
 use common::{EngineError, Key, Value};
 use db_core::transaction::Transaction;
-use storage::wal::WalRecordType;
 
 /// A user-facing transaction handle tied to the lifetime of its engine.
 ///
@@ -36,7 +35,7 @@ where
         }
         {
             let mut guard = self.wal.lock().unwrap();
-            let lsn = guard.append(WalRecordType::Commit, txn.txn_id, &[], None)?;
+            let lsn = guard.log_commit(txn.txn_id)?;
             guard.flush_up_to(lsn)?;
             self.transaction_manager.mark_committed(txn.txn_id);
         }
@@ -54,11 +53,7 @@ where
             return Ok(());
         }
         {
-            let _ = self
-                .wal
-                .lock()
-                .unwrap()
-                .append(WalRecordType::Abort, txn.txn_id, &[], None)?;
+            let _ = self.wal.lock().unwrap().log_abort(txn.txn_id)?;
 
             self.transaction_manager.mark_aborted(txn.txn_id);
         }
