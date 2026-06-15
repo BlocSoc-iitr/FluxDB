@@ -750,7 +750,6 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
 
             if acc.can_fit_direct(key_bytes.as_ref().len(), val_bytes.as_ref().len()) {
                 let (slot, _) = acc.position(key);
-                drop(acc);
 
                 // Single mutator for insert + set_xmin
                 let mut mutator = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]);
