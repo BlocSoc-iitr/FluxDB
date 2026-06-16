@@ -390,7 +390,6 @@ impl Wal {
         self.append(WalRecordType::Abort, txn_id, &[], None)
     }
 
-    
     /// Appends only — durability is deferred to the buffer pool's flush seam
     /// (WAL-before-page) or to the transaction's commit, never an fsync here.
     pub fn log_insert(
