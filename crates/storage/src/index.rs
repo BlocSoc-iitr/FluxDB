@@ -44,6 +44,7 @@ type BTStack = Vec<BTStackEntry>;
 
 pub struct BTreeIndex<K: Key, V: Value> {
     pool: Arc<BufferPoolManager>,
+    wal: Arc<Mutex<crate::wal::Wal>>,
     root: Mutex<PageId>,
     _key: PhantomData<K>,
     _val: PhantomData<V>,
@@ -52,7 +53,7 @@ pub struct BTreeIndex<K: Key, V: Value> {
 impl<K: Key, V: Value> BTreeIndex<K, V> {
     // ── Constructors ──────────────────────────────────────────────────────────
 
-    pub fn open(pool: Arc<BufferPoolManager>) -> Result<Self> {
+    pub fn open(pool: Arc<BufferPoolManager>, wal: Arc<Mutex<crate::wal::Wal>>) -> Result<Self> {
         // Page 0 is the superblock. fetch_page verifies its checksum, so a torn
         // write surfaces here as BufferPoolError::PageCorruption.
         let meta = pool.fetch_page(0)?;
@@ -60,7 +61,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             IndexError::CorruptMetadata("page 0 is not a FluxDB superblock".into())
         })?;
         drop(meta);
-        Ok(Self::from_root(pool, root))
+        Ok(Self::from_root(pool, wal, root))
     }
 
     /// Reclaims storage space by physically removing dead record versions.
@@ -96,7 +97,10 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         Ok(total_dead)
     }
 
-    pub fn create(pool: Arc<BufferPoolManager>) -> Result<(Self, PageId)> {
+    pub fn create(
+        pool: Arc<BufferPoolManager>,
+        wal: Arc<Mutex<crate::wal::Wal>>,
+    ) -> Result<(Self, PageId)> {
         let mut meta_guard = pool.new_page()?;
         let meta_pid = meta_guard.page_id;
         // create root page first
@@ -111,16 +115,21 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         drop(meta_guard);
         pool.flush_page(meta_pid)?;
 
-        Ok((Self::from_root(pool, root_pid), root_pid))
+        Ok((Self::from_root(pool, wal, root_pid), root_pid))
     }
 
     pub fn root_page_id(&self) -> PageId {
         *self.root.lock().unwrap()
     }
 
-    fn from_root(pool: Arc<BufferPoolManager>, root: PageId) -> Self {
+    fn from_root(
+        pool: Arc<BufferPoolManager>,
+        wal: Arc<Mutex<crate::wal::Wal>>,
+        root: PageId,
+    ) -> Self {
         Self {
             pool,
+            wal,
             root: Mutex::new(root),
             _val: PhantomData,
             _key: PhantomData,
@@ -254,9 +263,26 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             let result = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).insert(slot, key, value);
             return match result {
                 Ok(()) => {
+                    let page_id = leaf_guard.page_id;
                     LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmin(slot, txn.txn_id);
+                    // WAL: physiological Insert (DESIGN §4.2). Append-only here — durability
+                    // is enforced lazily by the buffer pool's WAL-before-page gate or at
+                    // commit, never fsynced at insert time. Stamp the record's LSN as the
+                    // page LSN so the gate flushes the WAL through it before the page lands.
+                    let val_bytes = V::as_bytes(value);
+                    let lsn = self.wal.lock().unwrap().log_insert(
+                        txn.txn_id,
+                        page_id,
+                        slot as u16,
+                        key_bytes.as_ref(),
+                        val_bytes.as_ref(),
+                        txn.txn_id,
+                    )?;
+                    LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
                     Ok(())
                 }
+                // TODO(WAL): the split path is not logged yet — it needs LeafSplit (FPI)
+                // records before an insert that triggers a split is recoverable.
                 Err(_) => self.split_and_insert(leaf_guard, key, value, txn, &mut stack),
             };
         }
@@ -1109,19 +1135,33 @@ mod tests {
     use super::*;
     use crate::buffer_pool::manager::BufferPoolManager;
     use crate::disk::DiskManager;
+    use crate::wal::Wal;
     use common::MAX_PAGE_SIZE;
     use std::mem::forget;
+    use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-    use std::sync::{Arc, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
     use tempfile::tempdir;
+
+    /// Open a throwaway WAL under `dir`. The index and pool must share one WAL,
+    /// so callers build it once here and clone the `Arc` to both.
+    fn make_wal(dir: &Path) -> Arc<Mutex<Wal>> {
+        Arc::new(Mutex::new(Wal::new(dir.join("wal.log")).unwrap()))
+    }
+
+    /// Wrap `disk` in a pool backed by `wal` (required for WAL-before-page).
+    fn make_pool(disk: Arc<DiskManager>, wal: Arc<Mutex<Wal>>) -> Arc<BufferPoolManager> {
+        Arc::new(BufferPoolManager::new(disk, wal))
+    }
 
     fn make_index() -> BTreeIndex<&'static [u8], &'static [u8]> {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
+        let wal = make_wal(dir.path());
         forget(dir);
         let disk = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
-        let pool = Arc::new(BufferPoolManager::new(disk));
-        let (index, _) = BTreeIndex::create(pool).unwrap();
+        let pool = make_pool(disk, wal.clone());
+        let (index, _) = BTreeIndex::create(pool, wal).unwrap();
         index
     }
 
@@ -1233,9 +1273,10 @@ mod tests {
         // Create, insert enough to force splits (incl. a root split), flush, close.
         {
             let disk = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
-            let pool = Arc::new(BufferPoolManager::new(disk));
+            let wal = make_wal(dir.path());
+            let pool = make_pool(disk, wal.clone());
             let (index, _root) =
-                BTreeIndex::<&'static [u8], &'static [u8]>::create(pool.clone()).unwrap();
+                BTreeIndex::<&'static [u8], &'static [u8]>::create(pool.clone(), wal).unwrap();
             for k in 0u32..300 {
                 let key = leak_bytes(&k.to_be_bytes());
                 let val = leak_bytes(&(k * 7).to_be_bytes());
@@ -1246,8 +1287,9 @@ mod tests {
 
         // Reopen with NO root id — it must be recovered from the page-0 superblock.
         let disk = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
-        let pool = Arc::new(BufferPoolManager::new(disk));
-        let index = BTreeIndex::<&'static [u8], &'static [u8]>::open(pool).unwrap();
+        let wal = make_wal(dir.path());
+        let pool = make_pool(disk, wal.clone());
+        let index = BTreeIndex::<&'static [u8], &'static [u8]>::open(pool, wal).unwrap();
         for k in 0u32..300 {
             let key = leak_bytes(&k.to_be_bytes());
             let expected = (k * 7).to_be_bytes();
@@ -1268,12 +1310,14 @@ mod tests {
         let path = dir.path().join("fresh.db");
         {
             let disk = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
-            let pool = Arc::new(BufferPoolManager::new(disk));
-            let _ = BTreeIndex::<&'static [u8], &'static [u8]>::create(pool).unwrap();
+            let wal = make_wal(dir.path());
+            let pool = make_pool(disk, wal.clone());
+            let _ = BTreeIndex::<&'static [u8], &'static [u8]>::create(pool, wal).unwrap();
         }
         let disk = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
-        let pool = Arc::new(BufferPoolManager::new(disk));
-        let index = BTreeIndex::<&'static [u8], &'static [u8]>::open(pool).unwrap();
+        let wal = make_wal(dir.path());
+        let pool = make_pool(disk, wal.clone());
+        let index = BTreeIndex::<&'static [u8], &'static [u8]>::open(pool, wal).unwrap();
         assert!(index.get(&(&b"anything"[..]), &auto()).unwrap().is_none());
     }
 
@@ -1526,5 +1570,44 @@ mod tests {
 
         let result = idx.get(&(k.as_ref()), &tm.begin()).unwrap();
         assert!(result.is_some(), "Inserted record should be readable");
+    }
+
+    // ── WAL: physiological Insert logging brings the flush gate to life ───────
+
+    #[test]
+    fn insert_logs_record_stamps_page_lsn_and_gate_flushes() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("wal_insert.db");
+        let wal = make_wal(dir.path());
+        let disk = Arc::new(DiskManager::new(&db, MAX_PAGE_SIZE).unwrap());
+        let pool = make_pool(disk, wal.clone());
+        let (index, root) =
+            BTreeIndex::<&'static [u8], &'static [u8]>::create(pool.clone(), wal.clone()).unwrap();
+
+        // `create` logs nothing, so the LSN counter starts at 0.
+        assert_eq!(wal.lock().unwrap().next_lsn, 0);
+
+        // Two in-place inserts on the same leaf → two Insert records (LSN 0, 1).
+        index.insert(&(&b"a"[..]), &(&b"1"[..]), &auto()).unwrap();
+        index.insert(&(&b"b"[..]), &(&b"2"[..]), &auto()).unwrap();
+        assert_eq!(
+            wal.lock().unwrap().next_lsn,
+            2,
+            "each insert appends a record"
+        );
+
+        // The leaf page must carry the latest insert's LSN (set_lsn under the latch).
+        let leaf = pool.fetch_page(root).unwrap();
+        assert_eq!(crate::page::page_lsn(&leaf[..]), 1, "page LSN stamped");
+        drop(leaf);
+
+        // Flushing the dirty leaf must drive the WAL durable through that page LSN
+        // (the WAL-before-page gate firing on a real, non-zero LSN).
+        pool.flush_all_pages().unwrap();
+        assert_eq!(
+            wal.lock().unwrap().flushed_lsn,
+            Some(1),
+            "gate flushed WAL to page LSN"
+        );
     }
 }

@@ -79,6 +79,10 @@ pub enum BufferPoolError {
     #[error("Disk error: {0}")]
     Disk(#[from] DiskError),
 
+    /// A WAL error propagated while enforcing WAL-before-page during a flush.
+    #[error("WAL error: {0}")]
+    Wal(#[from] WalError),
+
     #[error("Internal error: {0}")]
     InternalError(String),
 }
@@ -111,6 +115,10 @@ pub enum IndexError {
 
     #[error("Page error: {0}")]
     Page(#[from] PageError),
+
+    /// A WAL error propagated while logging a mutation (e.g. `log_insert`).
+    #[error("WAL error: {0}")]
+    Wal(#[from] WalError),
 
     /// An in-progress transaction is blocking this insert. The caller should
     /// drop its page latch, wait for `txn_id` to settle, then retry.
