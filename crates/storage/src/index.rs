@@ -715,6 +715,45 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         }
     }
 
+    fn find_rightmost_leaf(&self, start_pid: PageId) -> Result<PageId> {
+        let mut pid = start_pid;
+        loop {
+            let page = self.pool.fetch_page(pid)?;
+            match page[0] {
+                INTERNAL => {
+                    let acc = InternalPageAccessor::<K>::new(&page[..]);
+                    let n = acc.num_keys() as usize;
+                    let child = acc.child_page_at(n);
+                    drop(page);
+                    pid = child;
+                }
+                LEAF => {
+                    // Sweep rightlinks to correct for any in-flight splits.
+                    loop {
+                        let page = self.pool.fetch_page(pid)?;
+                        let acc = LeafPageAccessor::<K, V>::new(&page[..]);
+                        match acc.rightlink() {
+                            Some(right) => {
+                                drop(page);
+                                pid = right;
+                            }
+                            None => {
+                                drop(page);
+                                return Ok(pid);
+                            }
+                        }
+                    }
+                }
+                found => {
+                    return Err(IndexError::UnexpectedPageType {
+                        expected: LEAF,
+                        found,
+                    });
+                }
+            }
+        }
+    }               
+
     // ── Split ─────────────────────────────────────────────────────────────────
 
     /// Split a full leaf then insert `(key, value)` into the correct half.
