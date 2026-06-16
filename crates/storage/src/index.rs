@@ -497,6 +497,66 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         }
     }
 
+    pub fn range_backward<R>(&self, range: R, txn: &Transaction) -> BackwardRangeScan<'_, K, V>
+    where
+        K: 'static,
+        R: RangeBounds<K::SelfType<'static>>,
+    {
+        let root_pid = *self.root.lock().unwrap();
+
+        let (current_leaf, start_slot) = match range.end_bound() {         
+            Bound::Included(k) => {
+                let leaf_pid = self.find_leaf(root_pid, k).expect("find_leaf failed");
+                let page = self.pool.fetch_page(leaf_pid).expect("fetch_page failed");
+                let (slot, exact) = LeafPageAccessor::<K, V>::new(&page[..]).position(k);
+                let s = if exact {
+                    slot as i64                                              
+                } else if slot > 0 {
+                    (slot - 1) as i64                                       
+                } else {
+                    -1                                                       
+                };
+                (Some(leaf_pid), s)
+            }
+            Bound::Excluded(k) => {
+                let leaf_pid = self.find_leaf(root_pid, k).expect("find_leaf failed");
+                let page = self.pool.fetch_page(leaf_pid).expect("fetch_page failed");
+                let (slot, exact) = LeafPageAccessor::<K, V>::new(&page[..]).position(k);
+                let s = if exact {
+                    (slot as i64) - 1                                       
+                } else if slot > 0 {
+                    (slot - 1) as i64
+                } else {
+                    -1
+                };
+                (Some(leaf_pid), s)
+            }
+            Bound::Unbounded => {
+                let leaf_pid = self
+                    .find_rightmost_leaf(root_pid)                          
+                    .expect("find_rightmost_leaf failed");
+                (Some(leaf_pid), -1)                                        
+            }
+        };
+
+        let (start_key, start_inclusive) = match range.start_bound() {      
+            Bound::Included(k) => (Some(K::as_bytes(k).as_ref().to_vec()), true),
+            Bound::Excluded(k) => (Some(K::as_bytes(k).as_ref().to_vec()), false),
+            Bound::Unbounded => (None, false),
+        };
+
+        BackwardRangeScan {
+            pool: &self.pool,
+            current_leaf,
+            slot: start_slot,
+            start_key,                                                       
+            start_inclusive,                                       
+            txn: txn.clone(),
+            _key: PhantomData,
+            _val: PhantomData,
+        }
+    }
+
     // ── MVCC helpers ──────────────────────────────────────────────────────────
 
     /// Scan among duplicate keys to find the version visible under `snap`.
