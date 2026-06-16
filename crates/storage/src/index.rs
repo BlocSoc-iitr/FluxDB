@@ -508,28 +508,26 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             Bound::Included(k) => {
                 let leaf_pid = self.find_leaf(root_pid, k).expect("find_leaf failed");
                 let page = self.pool.fetch_page(leaf_pid).expect("fetch_page failed");
-                let (slot, exact) = LeafPageAccessor::<K, V>::new(&page[..]).position(k);
-                let s = if exact {
-                    slot as i64                                              
+                let acc = LeafPageAccessor::<K, V>::new(&page[..]);
+                let (slot, exact) = acc.position(k);
+                if exact {
+                    (Some(leaf_pid), slot as i64)
                 } else if slot > 0 {
-                    (slot - 1) as i64                                       
+                    (Some(leaf_pid), (slot - 1) as i64)
                 } else {
-                    -1                                                       
-                };
-                (Some(leaf_pid), s)
+                    (acc.prev_page(), -1)
+                }
             }
             Bound::Excluded(k) => {
                 let leaf_pid = self.find_leaf(root_pid, k).expect("find_leaf failed");
                 let page = self.pool.fetch_page(leaf_pid).expect("fetch_page failed");
-                let (slot, exact) = LeafPageAccessor::<K, V>::new(&page[..]).position(k);
-                let s = if exact {
-                    (slot as i64) - 1                                       
-                } else if slot > 0 {
-                    (slot - 1) as i64
+                let acc = LeafPageAccessor::<K, V>::new(&page[..]);
+                let (slot, _exact) = acc.position(k);
+                if slot > 0 {
+                    (Some(leaf_pid), (slot - 1) as i64)
                 } else {
-                    -1
-                };
-                (Some(leaf_pid), s)
+                    (acc.prev_page(), -1)
+                }
             }
             Bound::Unbounded => {
                 let leaf_pid = self
@@ -789,6 +787,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 }
                 LEAF => {
                     // Sweep rightlinks to correct for any in-flight splits.
+                    drop(page); 
                     loop {
                         let page = self.pool.fetch_page(pid)?;
                         let acc = LeafPageAccessor::<K, V>::new(&page[..]);
@@ -805,6 +804,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                     }
                 }
                 found => {
+                    drop(page); 
                     return Err(IndexError::UnexpectedPageType {
                         expected: LEAF,
                         found,
@@ -1234,6 +1234,9 @@ impl<'a, K: Key, V: Value> Iterator for BackwardRangeScan<'a, K, V> {
                 }
 
                 self.slot -= 1;
+                if self.slot < 0 {
+                    self.current_leaf = acc.prev_page();
+                }
                 return Some(Ok((k, v)));
             }
 
