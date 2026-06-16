@@ -143,6 +143,15 @@ impl Default for PageBuffer {
 // These are plain functions (not methods) so both sub-modules can use them
 // with a simple `use super::{read_u8, ...}` import.
 
+/// Read a page's LSN (the `pageLSN`) straight from its raw bytes.
+///
+/// Used by the buffer pool's flush seam to enforce WAL-before-page without
+/// having to know the page type. Returns 0 for a never-logged page.
+#[inline]
+pub fn page_lsn(data: &[u8]) -> Lsn {
+    read_u64(data, OFF_LSN)
+}
+
 #[inline]
 pub(super) fn read_u8(data: &[u8], off: usize) -> u8 {
     data[off]

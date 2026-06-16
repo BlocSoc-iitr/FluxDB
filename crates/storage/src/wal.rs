@@ -86,6 +86,11 @@ impl TryFrom<u8> for WalRecordType {
     }
 }
 
+/// Block flag bits (`blk_flags`). Bit 0 marks a full-page image; bit 1 marks a
+/// physiological redo payload. Reader keys FPI off bit 0 and data off `data_len`.
+pub const BLK_HAS_FPI: u8 = 0b01;
+pub const BLK_HAS_DATA: u8 = 0b10;
+
 /// Represents a reference to a page modified by the transaction, potentially
 /// including a Full-Page Image (FPI) and specific redo data for that page.
 #[derive(Debug)]
@@ -384,6 +389,36 @@ impl Wal {
     pub fn log_abort(&mut self, txn_id: u64) -> Result<Lsn> {
         self.append(WalRecordType::Abort, txn_id, &[], None)
     }
+
+    
+    /// Appends only — durability is deferred to the buffer pool's flush seam
+    /// (WAL-before-page) or to the transaction's commit, never an fsync here.
+    pub fn log_insert(
+        &mut self,
+        txn_id: u64,
+        page_id: PageId,
+        slot: u16,
+        key: &[u8],
+        value: &[u8],
+        xmin: u64,
+    ) -> Result<Lsn> {
+        let mut payload = Vec::with_capacity(2 + 2 + 2 + 8 + key.len() + value.len());
+        payload.extend_from_slice(&slot.to_le_bytes());
+        payload.extend_from_slice(&(key.len() as u16).to_le_bytes());
+        payload.extend_from_slice(&(value.len() as u16).to_le_bytes());
+        payload.extend_from_slice(&xmin.to_le_bytes());
+        payload.extend_from_slice(key);
+        payload.extend_from_slice(value);
+
+        let block = Block {
+            page_id,
+            blk_flags: BLK_HAS_DATA,
+            fpi: None,
+            data: Some(&payload),
+        };
+        self.append(WalRecordType::Insert, txn_id, &[block], None)
+    }
+
     /// Appends a new physiological record to the WAL buffer.
     ///
     /// This method assigns the next available LSN, serializes the record according to the

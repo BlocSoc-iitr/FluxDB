@@ -1,9 +1,17 @@
 use crate::buffer_pool::manager::BufferPoolManager;
 use crate::buffer_pool::replacer::ClockReplacer;
 use crate::disk::DiskManager;
+use crate::wal::Wal;
 use common::{MAX_FRAMES, MAX_PAGE_SIZE};
-use std::sync::Arc;
-use tempfile::tempdir;
+use std::sync::{Arc, Mutex};
+use tempfile::{TempDir, tempdir};
+
+/// Build a `BufferPoolManager` backed by a throwaway WAL in `dir`. The WAL is
+/// required since the pool enforces WAL-before-page at its flush seam.
+fn make_bpm(disk_manager: Arc<DiskManager>, dir: &TempDir) -> BufferPoolManager {
+    let wal = Arc::new(Mutex::new(Wal::new(dir.path().join("test.wal")).unwrap()));
+    BufferPoolManager::new(disk_manager, wal)
+}
 
 #[test]
 fn test_clock_replacer_eviction_order() {
@@ -28,7 +36,7 @@ fn test_buffer_pool_manager_basic() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.db");
     let disk_manager = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
-    let bpm = BufferPoolManager::new(disk_manager);
+    let bpm = make_bpm(disk_manager, &dir);
     let page_id;
     {
         let mut page = bpm.new_page().unwrap();
@@ -56,7 +64,7 @@ fn test_buffer_pool_manager_eviction_persistence() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.db");
     let disk_manager = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
-    let bpm = BufferPoolManager::new(disk_manager);
+    let bpm = make_bpm(disk_manager, &dir);
     let mut page_ids = Vec::new();
     for i in 0..MAX_FRAMES + 1 {
         let mut page = bpm.new_page().unwrap();
@@ -74,7 +82,7 @@ fn test_buffer_pool_manager_full_lifecycle() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.db");
     let disk_manager = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
-    let bpm = BufferPoolManager::new(disk_manager);
+    let bpm = make_bpm(disk_manager, &dir);
     let mut page_ids = Vec::new();
     for i in 0..10 {
         let mut page = bpm.new_page().unwrap();
@@ -105,7 +113,7 @@ fn test_buffer_pool_manager_concurrency() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.db");
     let disk_manager = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
-    let bpm = Arc::new(BufferPoolManager::new(disk_manager));
+    let bpm = Arc::new(make_bpm(disk_manager, &dir));
     let mut handles = Vec::new();
     for i in 0..10 {
         let bpm_clone = bpm.clone();
@@ -133,7 +141,7 @@ fn test_checksum_survives_reopen() {
 
     let pid;
     {
-        let bpm = BufferPoolManager::new(disk_manager.clone());
+        let bpm = make_bpm(disk_manager.clone(), &dir);
         let mut page = bpm.new_page().unwrap();
         pid = page.page_id;
         page[0] = crate::page::LEAF; // valid page type → checksum applies
@@ -142,7 +150,7 @@ fn test_checksum_survives_reopen() {
         bpm.flush_page(pid).unwrap();
     }
 
-    let bpm = BufferPoolManager::new(disk_manager);
+    let bpm = make_bpm(disk_manager, &dir);
     let page = bpm.fetch_page(pid).unwrap();
     assert_eq!(page[0], crate::page::LEAF);
     assert_eq!(page[100], 42);
@@ -157,7 +165,7 @@ fn test_checksum_detects_corruption() {
 
     let pid;
     {
-        let bpm = BufferPoolManager::new(disk_manager.clone());
+        let bpm = make_bpm(disk_manager.clone(), &dir);
         let mut page = bpm.new_page().unwrap();
         pid = page.page_id;
         page[0] = crate::page::LEAF;
@@ -176,7 +184,7 @@ fn test_checksum_detects_corruption() {
     // A fresh pool must load from disk and reject the corrupted page. A failed
     // verify also discards the frame, so the bad bytes are never cached — both
     // fetch paths on the same pool keep reloading from disk and keep rejecting.
-    let bpm = BufferPoolManager::new(disk_manager);
+    let bpm = make_bpm(disk_manager, &dir);
     assert!(matches!(
         bpm.fetch_page(pid),
         Err(BufferPoolError::PageCorruption { .. })
@@ -201,7 +209,7 @@ fn test_concurrent_fetch_valid_page() {
 
     let pid;
     {
-        let bpm = BufferPoolManager::new(disk_manager.clone());
+        let bpm = make_bpm(disk_manager.clone(), &dir);
         let mut page = bpm.new_page().unwrap();
         pid = page.page_id;
         page[0] = crate::page::LEAF;
@@ -211,7 +219,7 @@ fn test_concurrent_fetch_valid_page() {
     }
 
     // Fresh pool → the page must be loaded from disk; N threads race that load.
-    let bpm = Arc::new(BufferPoolManager::new(disk_manager));
+    let bpm = Arc::new(make_bpm(disk_manager, &dir));
     let mut handles = Vec::new();
     for _ in 0..N {
         let bpm = bpm.clone();
@@ -242,7 +250,7 @@ fn test_concurrent_fetch_corrupt_page() {
 
     let pid;
     {
-        let bpm = BufferPoolManager::new(disk_manager.clone());
+        let bpm = make_bpm(disk_manager.clone(), &dir);
         let mut page = bpm.new_page().unwrap();
         pid = page.page_id;
         page[0] = crate::page::LEAF;
@@ -258,7 +266,7 @@ fn test_concurrent_fetch_corrupt_page() {
     disk_manager.write_page(pid, &raw).unwrap();
     disk_manager.sync_data().unwrap();
 
-    let bpm = Arc::new(BufferPoolManager::new(disk_manager));
+    let bpm = Arc::new(make_bpm(disk_manager, &dir));
     let mut handles = Vec::new();
     for _ in 0..N {
         let bpm = bpm.clone();
@@ -283,7 +291,7 @@ fn test_buffer_pool_manager_pin_count() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.db");
     let disk_manager = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
-    let bpm = BufferPoolManager::new(disk_manager);
+    let bpm = make_bpm(disk_manager, &dir);
     let mut pages = Vec::new();
     for _ in 0..MAX_FRAMES {
         pages.push(bpm.new_page().unwrap());

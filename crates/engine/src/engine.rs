@@ -49,9 +49,12 @@ where
         // initialize wal;
         // Arc is needed on WAL as both index and buffer_pool will later have a wal instance.
         let wal = Arc::new(Mutex::new(Wal::new(path.join("wal.log"))?));
-        let buffer_pool = Arc::new(BufferPoolManager::new(Arc::clone(&disk_manager)));
+        let buffer_pool = Arc::new(BufferPoolManager::new(
+            Arc::clone(&disk_manager),
+            Arc::clone(&wal),
+        ));
         let transaction_manager = Arc::new(TransactionManager::new());
-        let (index, _root) = BTreeIndex::create(Arc::clone(&buffer_pool))?;
+        let (index, _root) = BTreeIndex::create(Arc::clone(&buffer_pool), Arc::clone(&wal))?;
         // index needs Arc as it will be later cloned by vaccum to call index.vaccum()
         let index = Arc::new(index);
         // TODO! spawn checkpoint thread once checkpoint is there
@@ -79,14 +82,20 @@ where
         // Wal::new opens the existing log (and creates it if a pre-WAL database
         // never had one) — the tail scan / LSN resume lands with the log manager work
         let wal = Arc::new(Mutex::new(Wal::new(path.join("wal.log"))?));
-        let buffer_pool = Arc::new(BufferPoolManager::new(Arc::clone(&disk_manager)));
+        let buffer_pool = Arc::new(BufferPoolManager::new(
+            Arc::clone(&disk_manager),
+            Arc::clone(&wal),
+        ));
         let transaction_manager = Arc::new(TransactionManager::new());
         // recovery runs HERE — after the pool exists, before the index opens:
         // read checkpoint from superblock → seed CLOG from pinned_aborted[] →
         // replay WAL from redo_point → mark crash victims Aborted →
         // inject next_txn_id / next_page_id watermarks (from_recovered)
         // index reads the root page id from the page-0 superblock
-        let index = Arc::new(BTreeIndex::open(Arc::clone(&buffer_pool))?);
+        let index = Arc::new(BTreeIndex::open(
+            Arc::clone(&buffer_pool),
+            Arc::clone(&wal),
+        )?);
         // TODO! spawn checkpoint + vacuum threads
         Ok(Engine {
             index,
