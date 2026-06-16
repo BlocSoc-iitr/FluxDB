@@ -1106,6 +1106,83 @@ impl<'a, K: Key, V: Value> Iterator for RangeScan<'a, K, V> {
     }
 }
 
+pub struct BackwardRangeScan<'a, K: Key, V: Value> {
+    pool: &'a BufferPoolManager,
+    current_leaf: Option<PageId>,
+    slot: i64, // signed! counts DOWN, -1 is the "uninitialized" sentinel
+    start_key: Option<Vec<u8>>,
+    start_inclusive: bool,
+    txn: Transaction,
+    _key: PhantomData<K>,
+    _val: PhantomData<V>,
+}
+
+impl<'a, K: Key, V: Value> Iterator for BackwardRangeScan<'a, K, V> {
+    type Item = Result<(Vec<u8>, Vec<u8>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let leaf_pid = self.current_leaf?;
+            let page = match self.pool.fetch_page(leaf_pid) {
+                Ok(p) => p,
+                Err(e) => return Some(Err(e.into())),
+            };
+            let acc = LeafPageAccessor::<K, V>::new(&page[..]);
+
+            // If slot was not yet initialized for this page (== -1 sentinel),
+            // set it to the last slot on the page.
+            if self.slot < 0 {
+                let n = acc.num_pairs() as usize;
+                if n == 0 {
+                    // Empty page — follow leftlink.
+                    self.current_leaf = acc.prev_page();
+                    self.slot = -1;
+                    continue;
+                }
+                self.slot = (n - 1) as i64;
+            }
+
+            while self.slot >= 0 {
+                let s = self.slot as usize;
+                let xmin = acc.get_xmin(s);
+                let xmax = acc.get_xmax(s);
+
+                // Skip records not visible to our snapshot.
+                if !self.txn.is_visible(xmin, xmax) {
+                    self.slot -= 1;
+                    continue;
+                }
+
+                let k = K::as_bytes(&acc.get_key(s)).as_ref().to_vec();
+                let v = V::as_bytes(&acc.get_value(s)).as_ref().to_vec();
+
+                let in_range = match &self.start_key {
+                    None => true,
+                    Some(start) => {
+                        let cmp = K::compare(&k, start);
+                        if self.start_inclusive {
+                            cmp != Ordering::Less   
+                        } else {
+                            cmp == Ordering::Greater 
+                        }
+                    }
+                };
+
+                if !in_range {
+                    self.current_leaf = None;
+                    return None;
+                }
+
+                self.slot -= 1;
+                return Some(Ok((k, v)));
+            }
+
+            self.current_leaf = acc.prev_page();
+            self.slot = -1; // sentinel: will be set to last slot on next iteration
+        }
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
