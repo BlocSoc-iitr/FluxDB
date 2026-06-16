@@ -504,7 +504,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
     {
         let root_pid = *self.root.lock().unwrap();
 
-        let (current_leaf, start_slot) = match range.end_bound() {         
+        let (current_leaf, start_slot) = match range.end_bound() {
             Bound::Included(k) => {
                 let leaf_pid = self.find_leaf(root_pid, k).expect("find_leaf failed");
                 let page = self.pool.fetch_page(leaf_pid).expect("fetch_page failed");
@@ -531,13 +531,13 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             }
             Bound::Unbounded => {
                 let leaf_pid = self
-                    .find_rightmost_leaf(root_pid)                          
+                    .find_rightmost_leaf(root_pid)
                     .expect("find_rightmost_leaf failed");
-                (Some(leaf_pid), -1)                                        
+                (Some(leaf_pid), -1)
             }
         };
 
-        let (start_key, start_inclusive) = match range.start_bound() {      
+        let (start_key, start_inclusive) = match range.start_bound() {
             Bound::Included(k) => (Some(K::as_bytes(k).as_ref().to_vec()), true),
             Bound::Excluded(k) => (Some(K::as_bytes(k).as_ref().to_vec()), false),
             Bound::Unbounded => (None, false),
@@ -547,8 +547,8 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             pool: &self.pool,
             current_leaf,
             slot: start_slot,
-            start_key,                                                       
-            start_inclusive,                                       
+            start_key,
+            start_inclusive,
             txn: txn.clone(),
             _key: PhantomData,
             _val: PhantomData,
@@ -787,7 +787,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 }
                 LEAF => {
                     // Sweep rightlinks to correct for any in-flight splits.
-                    drop(page); 
+                    drop(page);
                     loop {
                         let page = self.pool.fetch_page(pid)?;
                         let acc = LeafPageAccessor::<K, V>::new(&page[..]);
@@ -804,7 +804,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                     }
                 }
                 found => {
-                    drop(page); 
+                    drop(page);
                     return Err(IndexError::UnexpectedPageType {
                         expected: LEAF,
                         found,
@@ -812,7 +812,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 }
             }
         }
-    }               
+    }
 
     // ── Split ─────────────────────────────────────────────────────────────────
 
@@ -1221,9 +1221,9 @@ impl<'a, K: Key, V: Value> Iterator for BackwardRangeScan<'a, K, V> {
                     Some(start) => {
                         let cmp = K::compare(&k, start);
                         if self.start_inclusive {
-                            cmp != Ordering::Less   
+                            cmp != Ordering::Less
                         } else {
-                            cmp == Ordering::Greater 
+                            cmp == Ordering::Greater
                         }
                     }
                 };
@@ -1584,7 +1584,9 @@ mod tests {
             idx.insert(&(k.as_ref()), &(k.as_ref()), &auto()).unwrap();
         }
         let results: Vec<_> = idx
-        .range_backward::<std::ops::RangeFull>(.., &auto()).map(|r| r.unwrap()).collect();
+            .range_backward::<std::ops::RangeFull>(.., &auto())
+            .map(|r| r.unwrap())
+            .collect();
 
         assert_eq!(results.len(), 100);
 
@@ -1611,7 +1613,9 @@ mod tests {
             idx.delete(&(k.as_ref()), &auto()).unwrap();
         }
         let results: Vec<_> = idx
-            .range_backward::<std::ops::RangeFull>(.., &auto()).map(|r| r.unwrap()).collect();
+            .range_backward::<std::ops::RangeFull>(.., &auto())
+            .map(|r| r.unwrap())
+            .collect();
 
         assert_eq!(results.len(), 7);
 
@@ -1639,14 +1643,16 @@ mod tests {
         let start: &'static [u8] = leak_bytes(&10u32.to_be_bytes());
         let end: &'static [u8] = leak_bytes(&20u32.to_be_bytes());
         let results: Vec<_> = idx
-            .range_backward(start..end, &auto()).map(|r| r.unwrap()).collect();
+            .range_backward(start..end, &auto())
+            .map(|r| r.unwrap())
+            .collect();
 
         assert_eq!(results.len(), 10);
 
         let first = u32::from_be_bytes(results.first().unwrap().0[..4].try_into().unwrap());
-        let last  = u32::from_be_bytes(results.last().unwrap().0[..4].try_into().unwrap());
+        let last = u32::from_be_bytes(results.last().unwrap().0[..4].try_into().unwrap());
         assert_eq!(first, 19);
-        assert_eq!(last,  10);
+        assert_eq!(last, 10);
     }
 
     // ── Write conflict ───────────────────────────────────────────────────
