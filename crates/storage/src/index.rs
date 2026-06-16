@@ -1576,6 +1576,79 @@ mod tests {
         assert_eq!(results.len(), 10);
     }
 
+    #[test]
+    fn backward_range_scan_full() {
+        let idx = make_index();
+        for i in 0u32..100 {
+            let k = i.to_be_bytes();
+            idx.insert(&(k.as_ref()), &(k.as_ref()), &auto()).unwrap();
+        }
+        let results: Vec<_> = idx
+        .range_backward::<std::ops::RangeFull>(.., &auto()).map(|r| r.unwrap()).collect();
+
+        assert_eq!(results.len(), 100);
+
+        // Keys must come out in strictly descending order.
+        for w in results.windows(2) {
+            assert!(
+                w[0].0 > w[1].0,
+                "expected descending order, got {:?} then {:?}",
+                w[0].0,
+                w[1].0
+            );
+        }
+    }
+
+    #[test]
+    fn backward_range_scan_skips_deleted() {
+        let idx = make_index();
+        for i in 0u32..10 {
+            let k = i.to_be_bytes();
+            idx.insert(&(k.as_ref()), &(k.as_ref()), &auto()).unwrap();
+        }
+        for &i in &[3u32, 5, 7] {
+            let k = i.to_be_bytes();
+            idx.delete(&(k.as_ref()), &auto()).unwrap();
+        }
+        let results: Vec<_> = idx
+            .range_backward::<std::ops::RangeFull>(.., &auto()).map(|r| r.unwrap()).collect();
+
+        assert_eq!(results.len(), 7);
+
+        // Deleted keys must be absent.
+        let keys: Vec<u32> = results
+            .iter()
+            .map(|(k, _)| u32::from_be_bytes(k[..4].try_into().unwrap()))
+            .collect();
+        assert!(!keys.contains(&3));
+        assert!(!keys.contains(&5));
+        assert!(!keys.contains(&7));
+
+        for w in results.windows(2) {
+            assert!(w[0].0 > w[1].0);
+        }
+    }
+
+    #[test]
+    fn backward_range_scan_bounded() {
+        let idx = make_index();
+        for i in 0u32..100 {
+            let k = i.to_be_bytes();
+            idx.insert(&(k.as_ref()), &(k.as_ref()), &auto()).unwrap();
+        }
+        let start: &'static [u8] = leak_bytes(&10u32.to_be_bytes());
+        let end: &'static [u8] = leak_bytes(&20u32.to_be_bytes());
+        let results: Vec<_> = idx
+            .range_backward(start..end, &auto()).map(|r| r.unwrap()).collect();
+
+        assert_eq!(results.len(), 10);
+
+        let first = u32::from_be_bytes(results.first().unwrap().0[..4].try_into().unwrap());
+        let last  = u32::from_be_bytes(results.last().unwrap().0[..4].try_into().unwrap());
+        assert_eq!(first, 19);
+        assert_eq!(last,  10);
+    }
+
     // ── Write conflict ───────────────────────────────────────────────────
 
     #[test]
