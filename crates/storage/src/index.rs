@@ -364,6 +364,14 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
 
             // Set xmax to mark this version as deleted by our transaction.
             LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmax(visible_slot, txn.txn_id);
+            let page_id = leaf_guard.page_id;
+            let lsn = self.wal.lock().unwrap().log_set_xmax(
+                txn.txn_id,
+                page_id,
+                visible_slot as u16,
+                txn.txn_id,
+            )?;
+            LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
             return Ok(());
         }
     }
