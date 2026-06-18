@@ -418,6 +418,26 @@ impl Wal {
         self.append(WalRecordType::Insert, txn_id, &[block], None)
     }
 
+    pub fn log_set_xmax(
+        &mut self,
+        txn_id: u64,
+        page_id: PageId,
+        slot: u16,
+        xmax: u64,
+    ) -> Result<Lsn> {
+        let mut payload = Vec::with_capacity(2 + 8);
+        payload.extend_from_slice(&slot.to_le_bytes());
+        payload.extend_from_slice(&xmax.to_le_bytes());
+
+        let block = Block {
+            page_id,
+            blk_flags: BLK_HAS_DATA,
+            fpi: None,
+            data: Some(&payload),
+        };
+        self.append(WalRecordType::Insert, txn_id, &[block], None)
+    }
+
     /// Appends a new physiological record to the WAL buffer.
     ///
     /// This method assigns the next available LSN, serializes the record according to the
