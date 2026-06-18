@@ -435,7 +435,7 @@ impl Wal {
             fpi: None,
             data: Some(&payload),
         };
-        self.append(WalRecordType::Insert, txn_id, &[block], None)
+        self.append(WalRecordType::SetXMax, txn_id, &[block], None)
     }
 
     /// Appends a new physiological record to the WAL buffer.
