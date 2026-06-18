@@ -363,7 +363,15 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             }
 
             // Set xmax to mark this version as deleted by our transaction.
+            let page_id = leaf_guard.page_id;
+            let lsn = self.wal.lock().unwrap().log_set_xmax(
+                txn.txn_id,
+                page_id,
+                visible_slot as u16,
+                txn.txn_id,
+            )?;
             LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmax(visible_slot, txn.txn_id);
+            LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
             return Ok(());
         }
     }
@@ -460,19 +468,42 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             }
 
             // ── ATOMIC: set xmax on old + insert new (same latch) ────────────
+            let page_id = leaf_guard.page_id;
+            let _lsn_xmax = self.wal.lock().unwrap().log_set_xmax(
+                txn.txn_id,
+                page_id,
+                visible_slot as u16,
+                txn.txn_id,
+            )?;
             LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmax(visible_slot, txn.txn_id);
-
             // Find insert position for the new version.
-            let (slot, _) = LeafPageAccessor::<K, V>::new(&leaf_guard[..]).position(key);
-            let result = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).insert(slot, key, value);
+            let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
+            let (slot, _) = acc.position(key);
+            let val_bytes = V::as_bytes(value);
 
-            return match result {
-                Ok(()) => {
-                    LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmin(slot, txn.txn_id);
-                    Ok(())
-                }
-                Err(_) => self.split_and_insert(leaf_guard, key, value, txn, &mut stack),
-            };
+            // If the new version fits in place, insert() cannot fail — so we can
+            // log to the WAL *before* dirtying the page (WAL-before-page).
+            if acc.can_fit_direct(key_len, val_bytes.as_ref().len()) {
+                let lsn = self.wal.lock().unwrap().log_insert(
+                    txn.txn_id,
+                    page_id,
+                    slot as u16,
+                    key_bytes.as_ref(),
+                    val_bytes.as_ref(),
+                    txn.txn_id,
+                )?;
+                let mut m = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]);
+                m.insert(slot, key, value)
+                    .expect("insert must succeed: can_fit_direct checked above");
+                m.set_xmin(slot, txn.txn_id);
+                m.set_lsn(lsn);
+                return Ok(());
+            }
+
+            // Doesn't fit → split.
+            // TODO(WAL): the split path is not logged yet — it needs LeafSplit (FPI)
+            // records before an insert that triggers a split is recoverable.
+            return self.split_and_insert(leaf_guard, key, value, txn, &mut stack);
         }
     }
 
@@ -1136,6 +1167,7 @@ mod tests {
     use crate::buffer_pool::manager::BufferPoolManager;
     use crate::disk::DiskManager;
     use crate::wal::Wal;
+    use crate::wal::{WalIterator, WalRecordType};
     use common::MAX_PAGE_SIZE;
     use std::mem::forget;
     use std::path::Path;
@@ -1608,6 +1640,98 @@ mod tests {
             wal.lock().unwrap().flushed_lsn,
             Some(1),
             "gate flushed WAL to page LSN"
+        );
+    }
+
+    #[test]
+    fn delete_emits_one_setxmax() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("wal_insert.db");
+        let wal = make_wal(dir.path());
+        let disk = Arc::new(DiskManager::new(&db, MAX_PAGE_SIZE).unwrap());
+        let pool = make_pool(disk, wal.clone());
+        let (index, root) =
+            BTreeIndex::<&'static [u8], &'static [u8]>::create(pool.clone(), wal.clone()).unwrap();
+
+        let txn = auto();
+        let key: &[u8] = b"a";
+        let val: &[u8] = b"1";
+        index.insert(&key, &val, &auto()).unwrap();
+
+        let n = wal.lock().unwrap().next_lsn;
+        assert_eq!(n, 1);
+        index.delete(&key, &txn).unwrap();
+        assert!(
+            wal.lock().unwrap().next_lsn == n + 1,
+            "delete appends one record"
+        );
+
+        // The leaf page must carry the latest delete's LSN (set_lsn under the latch).
+        let leaf = pool.fetch_page(root).unwrap();
+        assert_eq!(crate::page::page_lsn(&leaf[..]), 1, "page LSN stamped");
+        drop(leaf);
+
+        // Flushing the dirty leaf must drive the WAL durable through that page LSN
+        // (the WAL-before-page gate firing on a real, non-zero LSN).
+        pool.flush_all_pages().unwrap();
+        let mut it = WalIterator::new(dir.path().join("wal.log")).unwrap();
+        it.next_record();
+        let rec = it.next_record().unwrap().unwrap();
+        assert!(rec.entry_type == WalRecordType::SetXMax);
+        assert!(rec.txn_id == txn.txn_id);
+        assert!(rec.blocks.len() == 1);
+        assert!(rec.blocks[0].page_id == root);
+        let data = rec.blocks[0].data.unwrap();
+        assert!(u16::from_le_bytes(data[0..2].try_into().unwrap()) == 0);
+        assert!(u64::from_le_bytes(data[2..10].try_into().unwrap()) == txn.txn_id);
+    }
+
+    #[test]
+    fn update_emits_setxmax_then_insert_in_lsn_order() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("wal_insert.db");
+        let wal = make_wal(dir.path());
+        let disk = Arc::new(DiskManager::new(&db, MAX_PAGE_SIZE).unwrap());
+        let pool = make_pool(disk, wal.clone());
+        let (index, root) =
+            BTreeIndex::<&'static [u8], &'static [u8]>::create(pool.clone(), wal.clone()).unwrap();
+
+        let txn = auto();
+        let key: &[u8] = b"a";
+        let val: &[u8] = b"1";
+        let new_val: &[u8] = b"2";
+        index.insert(&key, &val, &auto()).unwrap();
+
+        let n = wal.lock().unwrap().next_lsn;
+        assert_eq!(n, 1);
+
+        index.update(&key, &new_val, &txn).unwrap();
+        assert!(
+            wal.lock().unwrap().next_lsn == n + 2,
+            "update appends two records"
+        );
+
+        // The leaf page must carry the latest delete's LSN (set_lsn under the latch).
+        let leaf = pool.fetch_page(root).unwrap();
+        assert_eq!(crate::page::page_lsn(&leaf[..]), n + 1, "page LSN stamped");
+        drop(leaf);
+
+        pool.flush_all_pages().unwrap();
+        let mut it = WalIterator::new(dir.path().join("wal.log")).unwrap();
+        it.next_record();
+
+        let rec = it.next_record().unwrap().unwrap(); // SetXmax (LSN 1)
+        assert_eq!(rec.entry_type, WalRecordType::SetXMax);
+        assert_eq!(rec.txn_id, txn.txn_id);
+        let xmax_lsn = rec.lsn;
+
+        let rec = it.next_record().unwrap().unwrap(); // Insert (LSN 2)
+        assert_eq!(rec.entry_type, WalRecordType::Insert);
+        let ins_lsn = rec.lsn;
+
+        assert!(
+            xmax_lsn < ins_lsn,
+            "SetXmax must be logged before the new Insert"
         );
     }
 }
