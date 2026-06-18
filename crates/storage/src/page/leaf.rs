@@ -125,6 +125,8 @@ fn rec_total_size(key_len: usize, val_len: usize) -> usize {
 /// accessor itself.
 pub struct LeafPageAccessor<'a, K: Key, V: Value> {
     data: &'a [u8],
+    slot_base: usize,
+    num_pairs: u16,
     _key: PhantomData<K>,
     _val: PhantomData<V>,
 }
@@ -140,8 +142,12 @@ impl<'a, K: Key, V: Value> LeafPageAccessor<'a, K, V> {
             LEAF,
             "LeafPageAccessor: page type byte is not LEAF"
         );
+        let high_key_len = read_u16(data, OFF_LEAF_HIGH_KEY_LEN) as usize;
+        let num_pairs = read_u16(data, OFF_LEAF_SLOT_COUNT);
         Self {
             data,
+            slot_base: slot_base(high_key_len),
+            num_pairs,
             _key: PhantomData,
             _val: PhantomData,
         }
@@ -158,7 +164,7 @@ impl<'a, K: Key, V: Value> LeafPageAccessor<'a, K, V> {
     }
 
     pub fn num_pairs(&self) -> u16 {
-        read_u16(self.data, OFF_LEAF_SLOT_COUNT)
+        self.num_pairs
     }
 
     /// Previous leaf in the doubly-linked leaf chain, or `None` if this is the
@@ -229,14 +235,13 @@ impl<'a, K: Key, V: Value> LeafPageAccessor<'a, K, V> {
         if n == 0 {
             return true;
         }
-        let hkl = self.high_key_len() as usize;
         let mut live = 0usize;
         for i in 0..n {
             if !self.is_deleted(i) {
                 live += self.slot_rec_size(i) + SLOT_SIZE;
             }
         }
-        live * 2 < (PAGE_SIZE - slot_base(hkl))
+        live * 2 < (PAGE_SIZE - self.slot_base)
     }
 
     // ── Binary search ─────────────────────────────────────────────────────────
@@ -309,13 +314,11 @@ impl<'a, K: Key, V: Value> LeafPageAccessor<'a, K, V> {
     // ── Private helpers ───────────────────────────────────────────────────────
 
     fn slot_rec_base(&self, i: usize) -> usize {
-        let hkl = self.high_key_len() as usize;
-        read_u16(self.data, slot_offset_at(hkl, i)) as usize
+        read_u16(self.data, self.slot_base + i * SLOT_SIZE) as usize
     }
 
     pub(crate) fn slot_rec_size(&self, i: usize) -> usize {
-        let hkl = self.high_key_len() as usize;
-        read_u16(self.data, slot_offset_at(hkl, i) + 2) as usize
+        read_u16(self.data, self.slot_base + i * SLOT_SIZE + 2) as usize
     }
 
     fn key_bytes_at(&self, i: usize) -> &'a [u8] {
