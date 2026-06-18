@@ -95,6 +95,8 @@ fn int_key_data_base(num_keys: usize) -> usize {
 /// the accessor itself.
 pub struct InternalPageAccessor<'a, K: Key> {
     data: &'a [u8],
+    num_keys: u16,
+    key_data_base: usize,
     _key: PhantomData<K>,
 }
 
@@ -109,8 +111,11 @@ impl<'a, K: Key> InternalPageAccessor<'a, K> {
             INTERNAL,
             "InternalPageAccessor: page type byte is not INTERNAL"
         );
+        let num_keys = read_u16(data, OFF_INT_NUM_KEYS);
         Self {
             data,
+            num_keys,
+            key_data_base: int_key_data_base(num_keys as usize),
             _key: PhantomData,
         }
     }
@@ -124,7 +129,7 @@ impl<'a, K: Key> InternalPageAccessor<'a, K> {
     }
 
     pub fn num_keys(&self) -> u16 {
-        read_u16(self.data, OFF_INT_NUM_KEYS)
+        self.num_keys
     }
 
     /// Returns the right sibling page ID, or `None` if this is the rightmost
@@ -171,7 +176,7 @@ impl<'a, K: Key> InternalPageAccessor<'a, K> {
     /// separator key that is strictly greater than `search_key`, which is the
     /// correct subtree to follow.
     pub fn find_child(&self, search_key: &K::SelfType<'_>) -> (usize, PageId) {
-        let n = self.num_keys() as usize;
+        let n = self.num_keys as usize;
         let mut low = 0usize;
         let mut high = n;
         let search_bytes = K::as_bytes(search_key);
@@ -212,19 +217,18 @@ impl<'a, K: Key> InternalPageAccessor<'a, K> {
     /// Raw bytes for `key[i]`. Lifetime `'a` lets `key_at` pass the slice
     /// directly to `K::from_bytes` without a copy.
     fn key_bytes_at(&self, i: usize) -> &'a [u8] {
-        let n = self.num_keys() as usize;
-        let base = int_key_data_base(n);
+        let n = self.num_keys as usize;
         let start = if i == 0 {
             0
         } else {
             read_u32(self.data, int_key_end_offset(n, i - 1)) as usize
         };
         let end = read_u32(self.data, int_key_end_offset(n, i)) as usize;
-        &self.data[base + start..base + end]
+        &self.data[self.key_data_base + start..self.key_data_base + end]
     }
 
     fn used_bytes(&self) -> usize {
-        let n = self.num_keys() as usize;
+        let n = self.num_keys as usize;
         let key_data_size = if n == 0 {
             0
         } else {
