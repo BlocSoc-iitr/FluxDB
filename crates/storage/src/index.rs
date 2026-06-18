@@ -363,7 +363,6 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             }
 
             // Set xmax to mark this version as deleted by our transaction.
-            LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmax(visible_slot, txn.txn_id);
             let page_id = leaf_guard.page_id;
             let lsn = self.wal.lock().unwrap().log_set_xmax(
                 txn.txn_id,
@@ -371,6 +370,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 visible_slot as u16,
                 txn.txn_id,
             )?;
+            LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmax(visible_slot, txn.txn_id);
             LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
             return Ok(());
         }
@@ -468,7 +468,6 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             }
 
             // ── ATOMIC: set xmax on old + insert new (same latch) ────────────
-            LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmax(visible_slot, txn.txn_id);
             let page_id = leaf_guard.page_id;
             let _lsn_xmax = self.wal.lock().unwrap().log_set_xmax(
                 txn.txn_id,
@@ -476,30 +475,35 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 visible_slot as u16,
                 txn.txn_id,
             )?;
+            LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmax(visible_slot, txn.txn_id);
             // Find insert position for the new version.
-            let (slot, _) = LeafPageAccessor::<K, V>::new(&leaf_guard[..]).position(key);
-            let result = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).insert(slot, key, value);
+            let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
+            let (slot, _) = acc.position(key);
+            let val_bytes = V::as_bytes(value);
 
-            return match result {
-                Ok(()) => {
-                    LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmin(slot, txn.txn_id);
-                    let val_bytes = V::as_bytes(value);
-                    let lsn = self.wal.lock().unwrap().log_insert(
-                        txn.txn_id,
-                        page_id,
-                        slot as u16,
-                        key_bytes.as_ref(),
-                        val_bytes.as_ref(),
-                        txn.txn_id,
-                    )?;
-                    LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
-                    Ok(())
-                }
+            // If the new version fits in place, insert() cannot fail — so we can
+            // log to the WAL *before* dirtying the page (WAL-before-page).
+            if acc.can_fit_direct(key_len, val_bytes.as_ref().len()) {
+                let lsn = self.wal.lock().unwrap().log_insert(
+                    txn.txn_id,
+                    page_id,
+                    slot as u16,
+                    key_bytes.as_ref(),
+                    val_bytes.as_ref(),
+                    txn.txn_id,
+                )?;
+                let mut m = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]);
+                m.insert(slot, key, value)
+                    .expect("insert must succeed: can_fit_direct checked above");
+                m.set_xmin(slot, txn.txn_id);
+                m.set_lsn(lsn);
+                return Ok(());
+            }
 
-                // TODO(WAL): the split path is not logged yet — it needs LeafSplit (FPI)
-                // records before an insert that triggers a split is recoverable.
-                Err(_) => self.split_and_insert(leaf_guard, key, value, txn, &mut stack),
-            };
+            // Doesn't fit → split.
+            // TODO(WAL): the split path is not logged yet — it needs LeafSplit (FPI)
+            // records before an insert that triggers a split is recoverable.
+            return self.split_and_insert(leaf_guard, key, value, txn, &mut stack);
         }
     }
 
