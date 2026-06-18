@@ -469,7 +469,13 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
 
             // ── ATOMIC: set xmax on old + insert new (same latch) ────────────
             LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmax(visible_slot, txn.txn_id);
-
+            let page_id = leaf_guard.page_id;
+            let _ = self.wal.lock().unwrap().log_set_xmax(
+                txn.txn_id,
+                page_id,
+                visible_slot as u16,
+                txn.txn_id,
+            )?;
             // Find insert position for the new version.
             let (slot, _) = LeafPageAccessor::<K, V>::new(&leaf_guard[..]).position(key);
             let result = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).insert(slot, key, value);
@@ -477,8 +483,21 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             return match result {
                 Ok(()) => {
                     LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmin(slot, txn.txn_id);
+                    let val_bytes = V::as_bytes(value);
+                    let lsn = self.wal.lock().unwrap().log_insert(
+                        txn.txn_id,
+                        page_id,
+                        slot as u16,
+                        key_bytes.as_ref(),
+                        val_bytes.as_ref(),
+                        txn.txn_id,
+                    )?;
+                    LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
                     Ok(())
                 }
+
+                // TODO(WAL): the split path is not logged yet — it needs LeafSplit (FPI)
+                // records before an insert that triggers a split is recoverable.
                 Err(_) => self.split_and_insert(leaf_guard, key, value, txn, &mut stack),
             };
         }
