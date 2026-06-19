@@ -519,14 +519,26 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             Bound::Included(k) => {
                 let leaf_pid = self.find_leaf(root_pid, k).expect("find_leaf failed");
                 let page = self.pool.fetch_page(leaf_pid).expect("fetch_page failed");
-                let (slot, _) = LeafPageAccessor::<K, V>::new(&page[..]).position(k);
+                let acc = LeafPageAccessor::<K, V>::new(&page[..]);
+                let (slot, exact) = acc.position(k);
+                let slot = if exact {
+                    Self::duplicate_slot_bounds(&acc, k, slot).0
+                } else {
+                    slot
+                };
                 (Some(leaf_pid), slot)
             }
             Bound::Excluded(k) => {
                 let leaf_pid = self.find_leaf(root_pid, k).expect("find_leaf failed");
                 let page = self.pool.fetch_page(leaf_pid).expect("fetch_page failed");
-                let (slot, exact) = LeafPageAccessor::<K, V>::new(&page[..]).position(k);
-                (Some(leaf_pid), if exact { slot + 1 } else { slot })
+                let acc = LeafPageAccessor::<K, V>::new(&page[..]);
+                let (slot, exact) = acc.position(k);
+                let slot = if exact {
+                    Self::duplicate_slot_bounds(&acc, k, slot).1
+                } else {
+                    slot
+                };
+                (Some(leaf_pid), slot)
             }
             Bound::Unbounded => {
                 let leaf_pid = self
@@ -556,6 +568,44 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
 
     // ── MVCC helpers ──────────────────────────────────────────────────────────
 
+    /// Returns the `[first, past_end)` slot range for the duplicate run
+    /// containing `known_duplicate_slot`.
+    ///
+    /// `position()` is a binary search and can return any physical duplicate.
+    /// Callers that need key-level semantics should use this helper to normalize
+    /// that arbitrary exact match into the full duplicate run.
+    fn duplicate_slot_bounds(
+        acc: &LeafPageAccessor<'_, K, V>,
+        key: &K::SelfType<'_>,
+        known_duplicate_slot: usize,
+    ) -> (usize, usize) {
+        let key_bytes = K::as_bytes(key);
+        let key_ref = key_bytes.as_ref();
+
+        let mut first = known_duplicate_slot;
+        while first > 0 {
+            let prev_key_val = acc.get_key(first - 1);
+            let prev_key = K::as_bytes(&prev_key_val);
+            if K::compare(prev_key.as_ref(), key_ref) != Ordering::Equal {
+                break;
+            }
+            first -= 1;
+        }
+
+        let n = acc.num_pairs() as usize;
+        let mut past_end = known_duplicate_slot + 1;
+        while past_end < n {
+            let next_key_val = acc.get_key(past_end);
+            let next_key = K::as_bytes(&next_key_val);
+            if K::compare(next_key.as_ref(), key_ref) != Ordering::Equal {
+                break;
+            }
+            past_end += 1;
+        }
+
+        (first, past_end)
+    }
+
     /// Scan among duplicate keys to find the version visible under `snap`.
     ///
     /// `position()` may return any slot among duplicates (binary search
@@ -567,33 +617,14 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         key: &K::SelfType<'_>,
         txn: &Transaction,
     ) -> Option<usize> {
-        let key_bytes = K::as_bytes(key);
-        let key_ref = key_bytes.as_ref();
         let (start, found) = acc.position(key);
         if !found {
             return None;
         }
 
-        // Scan backward to find the first duplicate.
-        let mut first = start;
-        while first > 0 {
-            let prev_key_val = acc.get_key(first - 1);
-            let prev_key = K::as_bytes(&prev_key_val);
-            if K::compare(prev_key.as_ref(), key_ref) != Ordering::Equal {
-                break;
-            }
-            first -= 1;
-        }
-
-        // Scan forward from the first duplicate.
-        let n = acc.num_pairs() as usize;
+        let (first, past_end) = Self::duplicate_slot_bounds(acc, key, start);
         let mut i = first;
-        while i < n {
-            let rec_key_val = acc.get_key(i);
-            let rec_key = K::as_bytes(&rec_key_val);
-            if K::compare(rec_key.as_ref(), key_ref) != Ordering::Equal {
-                break;
-            }
+        while i < past_end {
             if txn.is_visible(acc.get_xmin(i), acc.get_xmax(i)) {
                 return Some(i);
             }
@@ -614,28 +645,9 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         key: &K::SelfType<'_>,
         txn: &Transaction,
     ) -> Result<()> {
-        let key_bytes = K::as_bytes(key);
-        let key_ref = key_bytes.as_ref();
-        let n = acc.num_pairs() as usize;
-
-        // Scan backward to first duplicate (position may land anywhere).
-        let mut i = start_slot;
-        while i > 0 {
-            let prev_key_val = acc.get_key(i - 1);
-            let prev_key = K::as_bytes(&prev_key_val);
-            if K::compare(prev_key.as_ref(), key_ref) != Ordering::Equal {
-                break;
-            }
-            i -= 1;
-        }
-
-        while i < n {
-            let rec_key_val = acc.get_key(i);
-            let rec_key = K::as_bytes(&rec_key_val);
-            if K::compare(rec_key.as_ref(), key_ref) != Ordering::Equal {
-                break;
-            }
-
+        let (first, past_end) = Self::duplicate_slot_bounds(acc, key, start_slot);
+        let mut i = first;
+        while i < past_end {
             let xmin = acc.get_xmin(i);
             let xmax = acc.get_xmax(i);
 
@@ -1506,6 +1518,71 @@ mod tests {
         let end: &'static [u8] = leak_bytes(&20u32.to_be_bytes());
         let results: Vec<_> = idx.range(start..end, &auto()).map(|r| r.unwrap()).collect();
         assert_eq!(results.len(), 10);
+    }
+
+    #[test]
+    fn range_scan_included_start_can_miss_only_visible_duplicate_before_position_result() {
+        let tm = std::sync::Arc::new(db_core::transaction_manager::TransactionManager::new());
+        let idx = make_index();
+
+        let duplicate_key: &'static [u8] = leak_bytes(&40u32.to_be_bytes());
+        let after_duplicate_key: &'static [u8] = leak_bytes(&50u32.to_be_bytes());
+        let after_duplicate_value: &'static [u8] = leak_bytes(&50u32.to_be_bytes());
+        let value_1: &'static [u8] = leak_bytes(&1u32.to_be_bytes());
+        let value_2: &'static [u8] = leak_bytes(&2u32.to_be_bytes());
+        let value_3: &'static [u8] = leak_bytes(&3u32.to_be_bytes());
+
+        let seed_txn = tm.begin();
+        idx.insert(&after_duplicate_key, &after_duplicate_value, &seed_txn)
+            .unwrap();
+        tm.mark_committed(seed_txn.txn_id);
+
+        let txn1 = tm.begin();
+        idx.insert(&duplicate_key, &value_1, &txn1).unwrap();
+        tm.mark_committed(txn1.txn_id);
+
+        let txn2 = tm.begin();
+        idx.update(&duplicate_key, &value_2, &txn2).unwrap();
+        tm.mark_committed(txn2.txn_id);
+
+        let reader = tm.begin();
+
+        let txn3 = tm.begin();
+        idx.update(&duplicate_key, &value_3, &txn3).unwrap();
+
+        {
+            let root = idx.root_page_id();
+            let leaf = idx.pool.fetch_page(root).unwrap();
+            let acc = LeafPageAccessor::<&'static [u8], &'static [u8]>::new(&leaf[..]);
+
+            assert_eq!(acc.num_pairs(), 4);
+            assert_eq!(acc.get_value(0), value_2);
+            assert_eq!(acc.get_value(1), value_3);
+            assert_eq!(acc.get_value(2), value_1);
+            assert_eq!(acc.get_value(3), after_duplicate_value);
+
+            assert!(reader.is_visible(acc.get_xmin(0), acc.get_xmax(0)));
+            assert!(!reader.is_visible(acc.get_xmin(1), acc.get_xmax(1)));
+            assert!(!reader.is_visible(acc.get_xmin(2), acc.get_xmax(2)));
+
+            let acc = LeafPageAccessor::<&'static [u8], &'static [u8]>::new(&leaf[..]);
+            assert_eq!(
+                acc.position(&duplicate_key).0,
+                2,
+                "test setup expects position(40) to land after the visible duplicate"
+            );
+        }
+
+        let results: Vec<_> = idx
+            .range(duplicate_key..=duplicate_key, &reader)
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(
+            results,
+            vec![(duplicate_key.to_vec(), value_2.to_vec())],
+            "range scan should return the only visible physical record for key 40"
+        );
     }
 
     // ── Write conflict ───────────────────────────────────────────────────
