@@ -44,6 +44,7 @@ type BTStack = Vec<BTStackEntry>;
 
 pub struct BTreeIndex<K: Key, V: Value> {
     pool: Arc<BufferPoolManager>,
+    wal: Arc<Mutex<crate::wal::Wal>>,
     root: Mutex<PageId>,
     _key: PhantomData<K>,
     _val: PhantomData<V>,
@@ -52,7 +53,7 @@ pub struct BTreeIndex<K: Key, V: Value> {
 impl<K: Key, V: Value> BTreeIndex<K, V> {
     // ── Constructors ──────────────────────────────────────────────────────────
 
-    pub fn open(pool: Arc<BufferPoolManager>) -> Result<Self> {
+    pub fn open(pool: Arc<BufferPoolManager>, wal: Arc<Mutex<crate::wal::Wal>>) -> Result<Self> {
         // Page 0 is the superblock. fetch_page verifies its checksum, so a torn
         // write surfaces here as BufferPoolError::PageCorruption.
         let meta = pool.fetch_page(0)?;
@@ -60,7 +61,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             IndexError::CorruptMetadata("page 0 is not a FluxDB superblock".into())
         })?;
         drop(meta);
-        Ok(Self::from_root(pool, root))
+        Ok(Self::from_root(pool, wal, root))
     }
 
     /// Reclaims storage space by physically removing dead record versions.
@@ -96,7 +97,10 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         Ok(total_dead)
     }
 
-    pub fn create(pool: Arc<BufferPoolManager>) -> Result<(Self, PageId)> {
+    pub fn create(
+        pool: Arc<BufferPoolManager>,
+        wal: Arc<Mutex<crate::wal::Wal>>,
+    ) -> Result<(Self, PageId)> {
         let mut meta_guard = pool.new_page()?;
         let meta_pid = meta_guard.page_id;
         // create root page first
@@ -111,16 +115,21 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         drop(meta_guard);
         pool.flush_page(meta_pid)?;
 
-        Ok((Self::from_root(pool, root_pid), root_pid))
+        Ok((Self::from_root(pool, wal, root_pid), root_pid))
     }
 
     pub fn root_page_id(&self) -> PageId {
         *self.root.lock().unwrap()
     }
 
-    fn from_root(pool: Arc<BufferPoolManager>, root: PageId) -> Self {
+    fn from_root(
+        pool: Arc<BufferPoolManager>,
+        wal: Arc<Mutex<crate::wal::Wal>>,
+        root: PageId,
+    ) -> Self {
         Self {
             pool,
+            wal,
             root: Mutex::new(root),
             _val: PhantomData,
             _key: PhantomData,
@@ -254,10 +263,27 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             let result = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).insert(slot, key, value);
             return match result {
                 Ok(()) => {
+                    let page_id = leaf_guard.page_id;
                     LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmin(slot, txn.txn_id);
+                    // WAL: physiological Insert (DESIGN §4.2). Append-only here — durability
+                    // is enforced lazily by the buffer pool's WAL-before-page gate or at
+                    // commit, never fsynced at insert time. Stamp the record's LSN as the
+                    // page LSN so the gate flushes the WAL through it before the page lands.
+                    let val_bytes = V::as_bytes(value);
+                    let lsn = self.wal.lock().unwrap().log_insert(
+                        txn.txn_id,
+                        page_id,
+                        slot as u16,
+                        key_bytes.as_ref(),
+                        val_bytes.as_ref(),
+                        txn.txn_id,
+                    )?;
+                    LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
                     Ok(())
                 }
-                Err(_) => self.split_and_insert(leaf_guard, key, value, txn.txn_id, &mut stack),
+                // TODO(WAL): the split path is not logged yet — it needs LeafSplit (FPI)
+                // records before an insert that triggers a split is recoverable.
+                Err(_) => self.split_and_insert(leaf_guard, key, value, txn, &mut stack),
             };
         }
     }
@@ -337,7 +363,15 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             }
 
             // Set xmax to mark this version as deleted by our transaction.
+            let page_id = leaf_guard.page_id;
+            let lsn = self.wal.lock().unwrap().log_set_xmax(
+                txn.txn_id,
+                page_id,
+                visible_slot as u16,
+                txn.txn_id,
+            )?;
             LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmax(visible_slot, txn.txn_id);
+            LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
             return Ok(());
         }
     }
@@ -434,19 +468,42 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             }
 
             // ── ATOMIC: set xmax on old + insert new (same latch) ────────────
+            let page_id = leaf_guard.page_id;
+            let _lsn_xmax = self.wal.lock().unwrap().log_set_xmax(
+                txn.txn_id,
+                page_id,
+                visible_slot as u16,
+                txn.txn_id,
+            )?;
             LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmax(visible_slot, txn.txn_id);
-
             // Find insert position for the new version.
-            let (slot, _) = LeafPageAccessor::<K, V>::new(&leaf_guard[..]).position(key);
-            let result = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).insert(slot, key, value);
+            let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
+            let (slot, _) = acc.position(key);
+            let val_bytes = V::as_bytes(value);
 
-            return match result {
-                Ok(()) => {
-                    LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmin(slot, txn.txn_id);
-                    Ok(())
-                }
-                Err(_) => self.split_and_insert(leaf_guard, key, value, txn.txn_id, &mut stack),
-            };
+            // If the new version fits in place, insert() cannot fail — so we can
+            // log to the WAL *before* dirtying the page (WAL-before-page).
+            if acc.can_fit_direct(key_len, val_bytes.as_ref().len()) {
+                let lsn = self.wal.lock().unwrap().log_insert(
+                    txn.txn_id,
+                    page_id,
+                    slot as u16,
+                    key_bytes.as_ref(),
+                    val_bytes.as_ref(),
+                    txn.txn_id,
+                )?;
+                let mut m = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]);
+                m.insert(slot, key, value)
+                    .expect("insert must succeed: can_fit_direct checked above");
+                m.set_xmin(slot, txn.txn_id);
+                m.set_lsn(lsn);
+                return Ok(());
+            }
+
+            // Doesn't fit → split.
+            // TODO(WAL): the split path is not logged yet — it needs LeafSplit (FPI)
+            // records before an insert that triggers a split is recoverable.
+            return self.split_and_insert(leaf_guard, key, value, txn, &mut stack);
         }
     }
 
@@ -462,14 +519,26 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             Bound::Included(k) => {
                 let leaf_pid = self.find_leaf(root_pid, k).expect("find_leaf failed");
                 let page = self.pool.fetch_page(leaf_pid).expect("fetch_page failed");
-                let (slot, _) = LeafPageAccessor::<K, V>::new(&page[..]).position(k);
+                let acc = LeafPageAccessor::<K, V>::new(&page[..]);
+                let (slot, exact) = acc.position(k);
+                let slot = if exact {
+                    Self::duplicate_slot_bounds(&acc, k, slot).0
+                } else {
+                    slot
+                };
                 (Some(leaf_pid), slot)
             }
             Bound::Excluded(k) => {
                 let leaf_pid = self.find_leaf(root_pid, k).expect("find_leaf failed");
                 let page = self.pool.fetch_page(leaf_pid).expect("fetch_page failed");
-                let (slot, exact) = LeafPageAccessor::<K, V>::new(&page[..]).position(k);
-                (Some(leaf_pid), if exact { slot + 1 } else { slot })
+                let acc = LeafPageAccessor::<K, V>::new(&page[..]);
+                let (slot, exact) = acc.position(k);
+                let slot = if exact {
+                    Self::duplicate_slot_bounds(&acc, k, slot).1
+                } else {
+                    slot
+                };
+                (Some(leaf_pid), slot)
             }
             Bound::Unbounded => {
                 let leaf_pid = self
@@ -557,6 +626,44 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
 
     // ── MVCC helpers ──────────────────────────────────────────────────────────
 
+    /// Returns the `[first, past_end)` slot range for the duplicate run
+    /// containing `known_duplicate_slot`.
+    ///
+    /// `position()` is a binary search and can return any physical duplicate.
+    /// Callers that need key-level semantics should use this helper to normalize
+    /// that arbitrary exact match into the full duplicate run.
+    fn duplicate_slot_bounds(
+        acc: &LeafPageAccessor<'_, K, V>,
+        key: &K::SelfType<'_>,
+        known_duplicate_slot: usize,
+    ) -> (usize, usize) {
+        let key_bytes = K::as_bytes(key);
+        let key_ref = key_bytes.as_ref();
+
+        let mut first = known_duplicate_slot;
+        while first > 0 {
+            let prev_key_val = acc.get_key(first - 1);
+            let prev_key = K::as_bytes(&prev_key_val);
+            if K::compare(prev_key.as_ref(), key_ref) != Ordering::Equal {
+                break;
+            }
+            first -= 1;
+        }
+
+        let n = acc.num_pairs() as usize;
+        let mut past_end = known_duplicate_slot + 1;
+        while past_end < n {
+            let next_key_val = acc.get_key(past_end);
+            let next_key = K::as_bytes(&next_key_val);
+            if K::compare(next_key.as_ref(), key_ref) != Ordering::Equal {
+                break;
+            }
+            past_end += 1;
+        }
+
+        (first, past_end)
+    }
+
     /// Scan among duplicate keys to find the version visible under `snap`.
     ///
     /// `position()` may return any slot among duplicates (binary search
@@ -568,33 +675,14 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         key: &K::SelfType<'_>,
         txn: &Transaction,
     ) -> Option<usize> {
-        let key_bytes = K::as_bytes(key);
-        let key_ref = key_bytes.as_ref();
         let (start, found) = acc.position(key);
         if !found {
             return None;
         }
 
-        // Scan backward to find the first duplicate.
-        let mut first = start;
-        while first > 0 {
-            let prev_key_val = acc.get_key(first - 1);
-            let prev_key = K::as_bytes(&prev_key_val);
-            if K::compare(prev_key.as_ref(), key_ref) != Ordering::Equal {
-                break;
-            }
-            first -= 1;
-        }
-
-        // Scan forward from the first duplicate.
-        let n = acc.num_pairs() as usize;
+        let (first, past_end) = Self::duplicate_slot_bounds(acc, key, start);
         let mut i = first;
-        while i < n {
-            let rec_key_val = acc.get_key(i);
-            let rec_key = K::as_bytes(&rec_key_val);
-            if K::compare(rec_key.as_ref(), key_ref) != Ordering::Equal {
-                break;
-            }
+        while i < past_end {
             if txn.is_visible(acc.get_xmin(i), acc.get_xmax(i)) {
                 return Some(i);
             }
@@ -615,28 +703,9 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         key: &K::SelfType<'_>,
         txn: &Transaction,
     ) -> Result<()> {
-        let key_bytes = K::as_bytes(key);
-        let key_ref = key_bytes.as_ref();
-        let n = acc.num_pairs() as usize;
-
-        // Scan backward to first duplicate (position may land anywhere).
-        let mut i = start_slot;
-        while i > 0 {
-            let prev_key_val = acc.get_key(i - 1);
-            let prev_key = K::as_bytes(&prev_key_val);
-            if K::compare(prev_key.as_ref(), key_ref) != Ordering::Equal {
-                break;
-            }
-            i -= 1;
-        }
-
-        while i < n {
-            let rec_key_val = acc.get_key(i);
-            let rec_key = K::as_bytes(&rec_key_val);
-            if K::compare(rec_key.as_ref(), key_ref) != Ordering::Equal {
-                break;
-            }
-
+        let (first, past_end) = Self::duplicate_slot_bounds(acc, key, start_slot);
+        let mut i = first;
+        while i < past_end {
             let xmin = acc.get_xmin(i);
             let xmax = acc.get_xmax(i);
 
@@ -824,11 +893,43 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         mut leaf_guard: PageWriteGuard<'_>,
         key: &K::SelfType<'_>,
         value: &V::SelfType<'_>,
-        txn_id: u64,
+        txn: &Transaction,
         stack: &mut BTStack,
     ) -> Result<()> {
-        let key_bytes = K::as_bytes(key);
         let leaf_pid_actual = leaf_guard.page_id;
+
+        // ── Try compaction first (design doc 25: bottom-up deletion) ──
+        let global_xmin = txn.tm.global_xmin();
+        let dead_count = LeafPageMutator::<K, V>::compact(
+            leaf_pid_actual,
+            &mut leaf_guard[..],
+            global_xmin,
+            &txn.tm,
+        );
+
+        // TODO(WAL): Log PageCompact FPI record and stamp new LSN here (design doc 32 step 3)
+        //   let lsn = self.wal.append(PageCompact { leaf_pid, fpi })?;
+        //   LeafPageMutator::new(&mut leaf_guard[..]).set_lsn(lsn);
+
+        if dead_count > 0 {
+            let key_bytes = K::as_bytes(key);
+            let val_bytes = V::as_bytes(value);
+            let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
+
+            if acc.can_fit_direct(key_bytes.as_ref().len(), val_bytes.as_ref().len()) {
+                let (slot, _) = acc.position(key);
+
+                // Single mutator for insert + set_xmin
+                let mut mutator = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]);
+                mutator.insert(slot, key, value)?;
+                mutator.set_xmin(slot, txn.txn_id);
+
+                // Compact avoided the split - done
+                return Ok(());
+            }
+        }
+
+        let key_bytes = K::as_bytes(key);
         let split = self.split_leaf_ly(&mut leaf_guard)?;
 
         let target_pid =
@@ -838,16 +939,19 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 leaf_pid_actual
             };
 
+        // Optimize existing split path (reuse mutator)
         if target_pid == leaf_pid_actual {
             let (s, _) = LeafPageAccessor::<K, V>::new(&leaf_guard[..]).position(key);
-            LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).insert(s, key, value)?;
-            LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmin(s, txn_id);
+            let mut mutator = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]);
+            mutator.insert(s, key, value)?;
+            mutator.set_xmin(s, txn.txn_id);
         } else {
             drop(leaf_guard);
             let mut right = self.pool.fetch_page_mut(target_pid)?;
             let (s, _) = LeafPageAccessor::<K, V>::new(&right[..]).position(key);
-            LeafPageMutator::<K, V>::new(&mut right[..]).insert(s, key, value)?;
-            LeafPageMutator::<K, V>::new(&mut right[..]).set_xmin(s, txn_id);
+            let mut mutator = LeafPageMutator::<K, V>::new(&mut right[..]);
+            mutator.insert(s, key, value)?;
+            mutator.set_xmin(s, txn.txn_id);
         }
 
         self.insert_separator_via_stack(stack, split.separator_key, split.new_page_id)
@@ -1253,19 +1357,34 @@ mod tests {
     use super::*;
     use crate::buffer_pool::manager::BufferPoolManager;
     use crate::disk::DiskManager;
+    use crate::wal::Wal;
+    use crate::wal::{WalIterator, WalRecordType};
     use common::MAX_PAGE_SIZE;
     use std::mem::forget;
+    use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-    use std::sync::{Arc, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
     use tempfile::tempdir;
+
+    /// Open a throwaway WAL under `dir`. The index and pool must share one WAL,
+    /// so callers build it once here and clone the `Arc` to both.
+    fn make_wal(dir: &Path) -> Arc<Mutex<Wal>> {
+        Arc::new(Mutex::new(Wal::new(dir.join("wal.log")).unwrap()))
+    }
+
+    /// Wrap `disk` in a pool backed by `wal` (required for WAL-before-page).
+    fn make_pool(disk: Arc<DiskManager>, wal: Arc<Mutex<Wal>>) -> Arc<BufferPoolManager> {
+        Arc::new(BufferPoolManager::new(disk, wal))
+    }
 
     fn make_index() -> BTreeIndex<&'static [u8], &'static [u8]> {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
+        let wal = make_wal(dir.path());
         forget(dir);
         let disk = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
-        let pool = Arc::new(BufferPoolManager::new(disk));
-        let (index, _) = BTreeIndex::create(pool).unwrap();
+        let pool = make_pool(disk, wal.clone());
+        let (index, _) = BTreeIndex::create(pool, wal).unwrap();
         index
     }
 
@@ -1377,9 +1496,10 @@ mod tests {
         // Create, insert enough to force splits (incl. a root split), flush, close.
         {
             let disk = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
-            let pool = Arc::new(BufferPoolManager::new(disk));
+            let wal = make_wal(dir.path());
+            let pool = make_pool(disk, wal.clone());
             let (index, _root) =
-                BTreeIndex::<&'static [u8], &'static [u8]>::create(pool.clone()).unwrap();
+                BTreeIndex::<&'static [u8], &'static [u8]>::create(pool.clone(), wal).unwrap();
             for k in 0u32..300 {
                 let key = leak_bytes(&k.to_be_bytes());
                 let val = leak_bytes(&(k * 7).to_be_bytes());
@@ -1390,8 +1510,9 @@ mod tests {
 
         // Reopen with NO root id — it must be recovered from the page-0 superblock.
         let disk = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
-        let pool = Arc::new(BufferPoolManager::new(disk));
-        let index = BTreeIndex::<&'static [u8], &'static [u8]>::open(pool).unwrap();
+        let wal = make_wal(dir.path());
+        let pool = make_pool(disk, wal.clone());
+        let index = BTreeIndex::<&'static [u8], &'static [u8]>::open(pool, wal).unwrap();
         for k in 0u32..300 {
             let key = leak_bytes(&k.to_be_bytes());
             let expected = (k * 7).to_be_bytes();
@@ -1412,12 +1533,14 @@ mod tests {
         let path = dir.path().join("fresh.db");
         {
             let disk = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
-            let pool = Arc::new(BufferPoolManager::new(disk));
-            let _ = BTreeIndex::<&'static [u8], &'static [u8]>::create(pool).unwrap();
+            let wal = make_wal(dir.path());
+            let pool = make_pool(disk, wal.clone());
+            let _ = BTreeIndex::<&'static [u8], &'static [u8]>::create(pool, wal).unwrap();
         }
         let disk = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
-        let pool = Arc::new(BufferPoolManager::new(disk));
-        let index = BTreeIndex::<&'static [u8], &'static [u8]>::open(pool).unwrap();
+        let wal = make_wal(dir.path());
+        let pool = make_pool(disk, wal.clone());
+        let index = BTreeIndex::<&'static [u8], &'static [u8]>::open(pool, wal).unwrap();
         assert!(index.get(&(&b"anything"[..]), &auto()).unwrap().is_none());
     }
 
@@ -1653,6 +1776,68 @@ mod tests {
         let last = u32::from_be_bytes(results.last().unwrap().0[..4].try_into().unwrap());
         assert_eq!(first, 19);
         assert_eq!(last, 10);
+    fn range_scan_included_start_can_miss_only_visible_duplicate_before_position_result() {
+        let tm = std::sync::Arc::new(db_core::transaction_manager::TransactionManager::new());
+        let idx = make_index();
+
+        let duplicate_key: &'static [u8] = leak_bytes(&40u32.to_be_bytes());
+        let after_duplicate_key: &'static [u8] = leak_bytes(&50u32.to_be_bytes());
+        let after_duplicate_value: &'static [u8] = leak_bytes(&50u32.to_be_bytes());
+        let value_1: &'static [u8] = leak_bytes(&1u32.to_be_bytes());
+        let value_2: &'static [u8] = leak_bytes(&2u32.to_be_bytes());
+        let value_3: &'static [u8] = leak_bytes(&3u32.to_be_bytes());
+
+        let seed_txn = tm.begin();
+        idx.insert(&after_duplicate_key, &after_duplicate_value, &seed_txn)
+            .unwrap();
+        tm.mark_committed(seed_txn.txn_id);
+
+        let txn1 = tm.begin();
+        idx.insert(&duplicate_key, &value_1, &txn1).unwrap();
+        tm.mark_committed(txn1.txn_id);
+
+        let txn2 = tm.begin();
+        idx.update(&duplicate_key, &value_2, &txn2).unwrap();
+        tm.mark_committed(txn2.txn_id);
+
+        let reader = tm.begin();
+
+        let txn3 = tm.begin();
+        idx.update(&duplicate_key, &value_3, &txn3).unwrap();
+
+        {
+            let root = idx.root_page_id();
+            let leaf = idx.pool.fetch_page(root).unwrap();
+            let acc = LeafPageAccessor::<&'static [u8], &'static [u8]>::new(&leaf[..]);
+
+            assert_eq!(acc.num_pairs(), 4);
+            assert_eq!(acc.get_value(0), value_2);
+            assert_eq!(acc.get_value(1), value_3);
+            assert_eq!(acc.get_value(2), value_1);
+            assert_eq!(acc.get_value(3), after_duplicate_value);
+
+            assert!(reader.is_visible(acc.get_xmin(0), acc.get_xmax(0)));
+            assert!(!reader.is_visible(acc.get_xmin(1), acc.get_xmax(1)));
+            assert!(!reader.is_visible(acc.get_xmin(2), acc.get_xmax(2)));
+
+            let acc = LeafPageAccessor::<&'static [u8], &'static [u8]>::new(&leaf[..]);
+            assert_eq!(
+                acc.position(&duplicate_key).0,
+                2,
+                "test setup expects position(40) to land after the visible duplicate"
+            );
+        }
+
+        let results: Vec<_> = idx
+            .range(duplicate_key..=duplicate_key, &reader)
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(
+            results,
+            vec![(duplicate_key.to_vec(), value_2.to_vec())],
+            "range scan should return the only visible physical record for key 40"
+        );
     }
 
     // ── Write conflict ───────────────────────────────────────────────────
@@ -1711,5 +1896,174 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(results.len(), 50);
+    }
+
+    #[test]
+    fn compact_prevents_split() {
+        let tm = std::sync::Arc::new(db_core::transaction_manager::TransactionManager::new());
+        let idx = make_index();
+
+        for i in 0u32..80 {
+            let k = i.to_be_bytes();
+            let v = vec![0xAA; 40]; // padding to fill page
+            let txn = tm.begin();
+            idx.insert(&(k.as_ref()), &(v.as_ref()), &txn).unwrap();
+            tm.mark_committed(txn.txn_id);
+        }
+
+        let root_before = idx.root_page_id();
+
+        for i in 0u32..40 {
+            let k = i.to_be_bytes();
+            let txn = tm.begin();
+            idx.delete(&(k.as_ref()), &txn).unwrap();
+            tm.mark_committed(txn.txn_id);
+        }
+
+        let txn = tm.begin();
+        let k = 999u32.to_be_bytes();
+        let v = vec![0xBB; 40];
+        idx.insert(&(k.as_ref()), &(v.as_ref()), &txn).unwrap();
+        tm.mark_committed(txn.txn_id);
+
+        let root_after = idx.root_page_id();
+        assert_eq!(
+            root_before, root_after,
+            "Split should have been avoided via compaction"
+        );
+
+        let result = idx.get(&(k.as_ref()), &tm.begin()).unwrap();
+        assert!(result.is_some(), "Inserted record should be readable");
+    }
+
+    // ── WAL: physiological Insert logging brings the flush gate to life ───────
+
+    #[test]
+    fn insert_logs_record_stamps_page_lsn_and_gate_flushes() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("wal_insert.db");
+        let wal = make_wal(dir.path());
+        let disk = Arc::new(DiskManager::new(&db, MAX_PAGE_SIZE).unwrap());
+        let pool = make_pool(disk, wal.clone());
+        let (index, root) =
+            BTreeIndex::<&'static [u8], &'static [u8]>::create(pool.clone(), wal.clone()).unwrap();
+
+        // `create` logs nothing, so the LSN counter starts at 0.
+        assert_eq!(wal.lock().unwrap().next_lsn, 0);
+
+        // Two in-place inserts on the same leaf → two Insert records (LSN 0, 1).
+        index.insert(&(&b"a"[..]), &(&b"1"[..]), &auto()).unwrap();
+        index.insert(&(&b"b"[..]), &(&b"2"[..]), &auto()).unwrap();
+        assert_eq!(
+            wal.lock().unwrap().next_lsn,
+            2,
+            "each insert appends a record"
+        );
+
+        // The leaf page must carry the latest insert's LSN (set_lsn under the latch).
+        let leaf = pool.fetch_page(root).unwrap();
+        assert_eq!(crate::page::page_lsn(&leaf[..]), 1, "page LSN stamped");
+        drop(leaf);
+
+        // Flushing the dirty leaf must drive the WAL durable through that page LSN
+        // (the WAL-before-page gate firing on a real, non-zero LSN).
+        pool.flush_all_pages().unwrap();
+        assert_eq!(
+            wal.lock().unwrap().flushed_lsn,
+            Some(1),
+            "gate flushed WAL to page LSN"
+        );
+    }
+
+    #[test]
+    fn delete_emits_one_setxmax() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("wal_insert.db");
+        let wal = make_wal(dir.path());
+        let disk = Arc::new(DiskManager::new(&db, MAX_PAGE_SIZE).unwrap());
+        let pool = make_pool(disk, wal.clone());
+        let (index, root) =
+            BTreeIndex::<&'static [u8], &'static [u8]>::create(pool.clone(), wal.clone()).unwrap();
+
+        let txn = auto();
+        let key: &[u8] = b"a";
+        let val: &[u8] = b"1";
+        index.insert(&key, &val, &auto()).unwrap();
+
+        let n = wal.lock().unwrap().next_lsn;
+        assert_eq!(n, 1);
+        index.delete(&key, &txn).unwrap();
+        assert!(
+            wal.lock().unwrap().next_lsn == n + 1,
+            "delete appends one record"
+        );
+
+        // The leaf page must carry the latest delete's LSN (set_lsn under the latch).
+        let leaf = pool.fetch_page(root).unwrap();
+        assert_eq!(crate::page::page_lsn(&leaf[..]), 1, "page LSN stamped");
+        drop(leaf);
+
+        // Flushing the dirty leaf must drive the WAL durable through that page LSN
+        // (the WAL-before-page gate firing on a real, non-zero LSN).
+        pool.flush_all_pages().unwrap();
+        let mut it = WalIterator::new(dir.path().join("wal.log")).unwrap();
+        it.next_record();
+        let rec = it.next_record().unwrap().unwrap();
+        assert!(rec.entry_type == WalRecordType::SetXMax);
+        assert!(rec.txn_id == txn.txn_id);
+        assert!(rec.blocks.len() == 1);
+        assert!(rec.blocks[0].page_id == root);
+        let data = rec.blocks[0].data.unwrap();
+        assert!(u16::from_le_bytes(data[0..2].try_into().unwrap()) == 0);
+        assert!(u64::from_le_bytes(data[2..10].try_into().unwrap()) == txn.txn_id);
+    }
+
+    #[test]
+    fn update_emits_setxmax_then_insert_in_lsn_order() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("wal_insert.db");
+        let wal = make_wal(dir.path());
+        let disk = Arc::new(DiskManager::new(&db, MAX_PAGE_SIZE).unwrap());
+        let pool = make_pool(disk, wal.clone());
+        let (index, root) =
+            BTreeIndex::<&'static [u8], &'static [u8]>::create(pool.clone(), wal.clone()).unwrap();
+
+        let txn = auto();
+        let key: &[u8] = b"a";
+        let val: &[u8] = b"1";
+        let new_val: &[u8] = b"2";
+        index.insert(&key, &val, &auto()).unwrap();
+
+        let n = wal.lock().unwrap().next_lsn;
+        assert_eq!(n, 1);
+
+        index.update(&key, &new_val, &txn).unwrap();
+        assert!(
+            wal.lock().unwrap().next_lsn == n + 2,
+            "update appends two records"
+        );
+
+        // The leaf page must carry the latest delete's LSN (set_lsn under the latch).
+        let leaf = pool.fetch_page(root).unwrap();
+        assert_eq!(crate::page::page_lsn(&leaf[..]), n + 1, "page LSN stamped");
+        drop(leaf);
+
+        pool.flush_all_pages().unwrap();
+        let mut it = WalIterator::new(dir.path().join("wal.log")).unwrap();
+        it.next_record();
+
+        let rec = it.next_record().unwrap().unwrap(); // SetXmax (LSN 1)
+        assert_eq!(rec.entry_type, WalRecordType::SetXMax);
+        assert_eq!(rec.txn_id, txn.txn_id);
+        let xmax_lsn = rec.lsn;
+
+        let rec = it.next_record().unwrap().unwrap(); // Insert (LSN 2)
+        assert_eq!(rec.entry_type, WalRecordType::Insert);
+        let ins_lsn = rec.lsn;
+
+        assert!(
+            xmax_lsn < ins_lsn,
+            "SetXmax must be logged before the new Insert"
+        );
     }
 }

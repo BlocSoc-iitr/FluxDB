@@ -1,3 +1,10 @@
+//! Top-level database engine facade.
+//!
+//! `Engine` owns the WAL and transaction manager, so it is responsible for the
+//! commit-observability rule: a write transaction is marked committed only
+//! after its commit WAL record has been appended and flushed. Public autocommit
+//! methods propagate that durability error instead of acknowledging success.
+
 use common::{EngineError, Key, Value};
 use db_core::transaction_manager::TransactionManager;
 use std::path::Path;
@@ -29,7 +36,7 @@ where
     K: Key,
     V: Value,
 {
-    // creates a new database
+    /// Creates a new database directory with an initialized data file and WAL.
     pub fn create(dir_path: impl AsRef<Path>) -> Result<Engine<K, V>, EngineError> {
         let path = dir_path.as_ref();
         std::fs::create_dir_all(path)?;
@@ -42,9 +49,12 @@ where
         // initialize wal;
         // Arc is needed on WAL as both index and buffer_pool will later have a wal instance.
         let wal = Arc::new(Mutex::new(Wal::new(path.join("wal.log"))?));
-        let buffer_pool = Arc::new(BufferPoolManager::new(Arc::clone(&disk_manager)));
+        let buffer_pool = Arc::new(BufferPoolManager::new(
+            Arc::clone(&disk_manager),
+            Arc::clone(&wal),
+        ));
         let transaction_manager = Arc::new(TransactionManager::new());
-        let (index, _root) = BTreeIndex::create(Arc::clone(&buffer_pool))?;
+        let (index, _root) = BTreeIndex::create(Arc::clone(&buffer_pool), Arc::clone(&wal))?;
         // index needs Arc as it will be later cloned by vaccum to call index.vaccum()
         let index = Arc::new(index);
         // TODO! spawn checkpoint thread once checkpoint is there
@@ -57,7 +67,11 @@ where
             transaction_manager,
         })
     }
-    // opens an existing database
+    /// Opens an existing database.
+    ///
+    /// `Wal::new` scans the existing log before returning, so the in-memory WAL
+    /// resumes with `next_lsn = max_lsn + 1` and `flushed_lsn` set to the last
+    /// valid durable record.
     pub fn open(dir_path: impl AsRef<Path>) -> Result<Engine<K, V>, EngineError> {
         let path = dir_path.as_ref();
         // the data file is the marker that a database lives here
@@ -68,14 +82,20 @@ where
         // Wal::new opens the existing log (and creates it if a pre-WAL database
         // never had one) — the tail scan / LSN resume lands with the log manager work
         let wal = Arc::new(Mutex::new(Wal::new(path.join("wal.log"))?));
-        let buffer_pool = Arc::new(BufferPoolManager::new(Arc::clone(&disk_manager)));
+        let buffer_pool = Arc::new(BufferPoolManager::new(
+            Arc::clone(&disk_manager),
+            Arc::clone(&wal),
+        ));
         let transaction_manager = Arc::new(TransactionManager::new());
         // recovery runs HERE — after the pool exists, before the index opens:
         // read checkpoint from superblock → seed CLOG from pinned_aborted[] →
         // replay WAL from redo_point → mark crash victims Aborted →
         // inject next_txn_id / next_page_id watermarks (from_recovered)
         // index reads the root page id from the page-0 superblock
-        let index = Arc::new(BTreeIndex::open(Arc::clone(&buffer_pool))?);
+        let index = Arc::new(BTreeIndex::open(
+            Arc::clone(&buffer_pool),
+            Arc::clone(&wal),
+        )?);
         // TODO! spawn checkpoint + vacuum threads
         Ok(Engine {
             index,
@@ -97,11 +117,11 @@ where
         let mut txn = self.transaction_manager.begin();
         match self.insert_in(&mut txn, key, value) {
             Ok(()) => {
-                self.commit(txn);
+                self.commit(txn)?;
                 Ok(())
             }
             Err(e) => {
-                self.abort(txn);
+                let _ = self.abort(txn);
                 Err(e)
             }
         }
@@ -113,11 +133,11 @@ where
         let txn = self.transaction_manager.begin();
         match self.get_in(&txn, key) {
             Ok(v) => {
-                self.commit(txn);
+                self.commit(txn)?;
                 Ok(v)
             }
             Err(e) => {
-                self.abort(txn);
+                let _ = self.abort(txn);
                 Err(e)
             }
         }
@@ -131,11 +151,11 @@ where
         let mut txn = self.transaction_manager.begin();
         match self.update_in(&mut txn, key, value) {
             Ok(()) => {
-                self.commit(txn);
+                self.commit(txn)?;
                 Ok(())
             }
             Err(e) => {
-                self.abort(txn);
+                let _ = self.abort(txn);
                 Err(e)
             }
         }
@@ -145,11 +165,11 @@ where
         let mut txn = self.transaction_manager.begin();
         match self.delete_in(&mut txn, key) {
             Ok(()) => {
-                self.commit(txn);
+                self.commit(txn)?;
                 Ok(())
             }
             Err(e) => {
-                self.abort(txn);
+                let _ = self.abort(txn);
                 Err(e)
             }
         }

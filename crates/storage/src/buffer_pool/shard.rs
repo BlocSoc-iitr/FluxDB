@@ -6,6 +6,7 @@
 
 use crate::buffer_pool::replacer::ClockReplacer;
 use crate::disk::DiskManager;
+use crate::wal::Wal;
 use common::BufferPoolError;
 use common::{INVALID_FRAME_ID, MAX_PAGE_SIZE};
 use std::collections::HashMap;
@@ -133,11 +134,12 @@ pub struct BufferPoolShard {
     pub pages: Vec<RwLock<PageData>>,
     pub inner: Mutex<ShardInner>,
     pub load_done: Condvar, // singalled when any load finishes(success or fail)
+    pub wal: Arc<Mutex<Wal>>,
 }
 
 impl BufferPoolShard {
     /// Creates a new `BufferPoolShard` with the specified number of frames.
-    pub fn new(disk_manager: Arc<DiskManager>, size: usize) -> Self {
+    pub fn new(disk_manager: Arc<DiskManager>, size: usize, wal: Arc<Mutex<Wal>>) -> Self {
         let mut metadata = Vec::with_capacity(size);
         let mut free_list = Vec::with_capacity(size);
         for frame_id in 0..size {
@@ -160,6 +162,7 @@ impl BufferPoolShard {
                 replacer: ClockReplacer::new(size),
             }),
             load_done: Condvar::new(),
+            wal,
         }
     }
 
@@ -313,10 +316,20 @@ impl BufferPoolShard {
 
     pub fn write_frame_to_disk(&self, frame_id: usize, page_id: u64) -> Result<()> {
         let mut buf = vec![0u8; MAX_PAGE_SIZE];
+        let page_lsn;
         {
+            // Snapshot the page LSN and the page bytes under the SAME read guard
+            // so the LSN we flush the WAL to matches exactly the bytes we write.
+            // A concurrent writer cannot interleave between the two reads
             let data = self.pages[frame_id].read().unwrap();
+            page_lsn = crate::page::page_lsn(&data[..]);
             buf.copy_from_slice(&data[..]);
         }
+
+        // WAL-before-page: a page image carrying `page_lsn` must not reach disk
+        // until the WAL is durable through `page_lsn`. No-op when already durable.
+        // (`?` converts WalError → BufferPoolError via `#[from]`.)
+        self.wal.lock().unwrap().flush_up_to(page_lsn)?;
 
         // Stamp the CRC32 on the outgoing copy so corruption is detectable on the next load
         crate::page::stamp_checksum(&mut buf);
