@@ -11,7 +11,7 @@ use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 use std::sync::{Arc, Mutex};
 
-use common::{Key, MAX_KEY_SIZE, Value};
+use common::{Key, MAX_KEY_SIZE, MAX_VALUE_SIZE, Value};
 use db_core::transaction_manager::TransactionManager;
 
 use crate::buffer_pool::{BufferPoolManager, PageReadGuard, PageWriteGuard};
@@ -184,6 +184,15 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             return Err(IndexError::KeyTooLarge {
                 size: key_len,
                 max: MAX_KEY_SIZE,
+            });
+        }
+
+        let val_bytes_check = V::as_bytes(value);
+        let val_len = val_bytes_check.as_ref().len();
+        if val_len > MAX_VALUE_SIZE {
+            return Err(IndexError::ValueTooLarge {
+                size: val_len,
+                max: MAX_VALUE_SIZE,
             });
         }
 
@@ -391,6 +400,15 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             return Err(IndexError::KeyTooLarge {
                 size: key_len,
                 max: MAX_KEY_SIZE,
+            });
+        }
+
+        let val_bytes_check = V::as_bytes(value);
+        let val_len = val_bytes_check.as_ref().len();
+        if val_len > MAX_VALUE_SIZE {
+            return Err(IndexError::ValueTooLarge {
+                size: val_len,
+                max: MAX_VALUE_SIZE,
             });
         }
 
@@ -1602,6 +1620,28 @@ mod tests {
 
         let result = idx.get(&(k.as_ref()), &tm.begin()).unwrap();
         assert!(result.is_some(), "Inserted record should be readable");
+    }
+    // ── ValueTooLarge guard ──────────────────────────────────────────────
+
+    #[test]
+    fn insert_and_update_reject_oversized_value() {
+        let idx = make_index();
+        let k: &[u8] = b"key";
+        let oversized = vec![0xFFu8; MAX_VALUE_SIZE + 1];
+
+        // insert should reject
+        let err = idx.insert(&k, &oversized.as_slice(), &auto()).unwrap_err();
+        assert!(matches!(err, IndexError::ValueTooLarge { size, max }
+            if size == MAX_VALUE_SIZE + 1 && max == MAX_VALUE_SIZE));
+
+        // insert a small value so we have something to update
+        let v: &[u8] = b"small";
+        idx.insert(&k, &v, &auto()).unwrap();
+
+        // update should also reject
+        let err = idx.update(&k, &oversized.as_slice(), &auto()).unwrap_err();
+        assert!(matches!(err, IndexError::ValueTooLarge { size, max }
+            if size == MAX_VALUE_SIZE + 1 && max == MAX_VALUE_SIZE));
     }
 
     // ── WAL: physiological Insert logging brings the flush gate to life ───────
