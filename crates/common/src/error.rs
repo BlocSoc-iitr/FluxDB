@@ -98,6 +98,9 @@ pub enum IndexError {
     #[error("Key too large: {size} bytes (max {max})")]
     KeyTooLarge { size: usize, max: usize },
 
+    #[error("Value too large: {size} bytes (max {max})")]
+    ValueTooLarge { size: usize, max: usize },
+
     /// Insert attempted on a key that already has a visible version.
     #[error("Duplicate key")]
     DuplicateKey,
