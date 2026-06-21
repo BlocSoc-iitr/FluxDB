@@ -837,11 +837,11 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         // PageCompact FPI — only when compaction actually repacked the page.
         if dead_count > 0 {
             let fpi = <&[u8; PAGE_SIZE]>::try_from(&leaf_guard[..]).unwrap();
-            let lsn = self
-                .wal
-                .lock()
-                .unwrap()
-                .log_page_compact(SYSTEM_TXN_ID, leaf_pid_actual, fpi)?;
+            let lsn =
+                self.wal
+                    .lock()
+                    .unwrap()
+                    .log_page_compact(SYSTEM_TXN_ID, leaf_pid_actual, fpi)?;
             LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
 
             let key_bytes = K::as_bytes(key);
@@ -916,7 +916,12 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             LeafPageMutator::<K, V>::new(&mut right[..]).set_lsn(lsn);
         }
 
-        self.insert_separator_via_stack(stack, split.separator_key, split.new_page_id, leaf_pid_actual)
+        self.insert_separator_via_stack(
+            stack,
+            split.separator_key,
+            split.new_page_id,
+            leaf_pid_actual,
+        )
     }
 
     fn split_leaf_ly(
@@ -1133,9 +1138,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             };
             if already {
                 drop(parent_guard);
-                crate::page::clear_incomplete_split(
-                    &mut self.pool.fetch_page_mut(left_child)?[..],
-                );
+                crate::page::clear_incomplete_split(&mut self.pool.fetch_page_mut(left_child)?[..]);
                 return Ok(());
             }
 
@@ -1651,7 +1654,10 @@ mod tests {
         );
 
         // No duplicate downlink, no lost data.
-        assert_eq!(idx.get(&(k1.as_ref()), &auto()).unwrap().unwrap(), k1.as_ref());
+        assert_eq!(
+            idx.get(&(k1.as_ref()), &auto()).unwrap().unwrap(),
+            k1.as_ref()
+        );
         for i in (0u32..2000).step_by(2) {
             let k = i.to_be_bytes();
             assert!(
