@@ -38,8 +38,9 @@
 //!
 
 use crc32fast::Hasher;
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::disk::DiskManager;
@@ -47,6 +48,9 @@ use crate::page::{Lsn, PAGE_SIZE, PageId};
 use common::WalError;
 
 pub type Result<T> = std::result::Result<T, WalError>;
+
+/// Default bytes reserved for WAL records before they are flushed to disk.
+const WAL_BUFFER_CAPACITY: usize = 16 * 1024 * 1024;
 
 /// Identifies the physiological operation that a WAL record represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,14 +122,150 @@ pub struct WalIterator {
     scratch: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct BufferedRecord {
+    lsn: Lsn,
+    len: usize,
+}
+
+/// Bounded circular byte buffer for serialized WAL records.
+///
+/// Appenders copy complete records into this buffer. `flush_up_to` drains only
+/// complete records from the head, preserving WAL record order on disk.
+struct WalBuffer {
+    bytes: Vec<u8>,
+    read_pos: usize,
+    write_pos: usize,
+    records: VecDeque<BufferedRecord>,
+}
+
 /// The main Write-Ahead Log manager responsible for appending records sequentially
 /// and maintaining the durability guarantees of the database.
 pub struct Wal {
     path: PathBuf,
-    file: BufWriter<File>,
+    file: File,
+    buffer: WalBuffer,
     scratch_pad: Vec<u8>,
     pub next_lsn: u64,
     pub flushed_lsn: Option<Lsn>,
+}
+
+impl WalBuffer {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            bytes: vec![0; capacity],
+            read_pos: 0,
+            write_pos: 0,
+            records: VecDeque::new(),
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    fn used_space(&self) -> usize {
+        if self.is_empty() {
+            0
+        } else if self.write_pos == self.read_pos {
+            self.capacity()
+        } else if self.write_pos > self.read_pos {
+            self.write_pos - self.read_pos
+        } else {
+            self.capacity() - self.read_pos + self.write_pos
+        }
+    }
+
+    fn free_space(&self) -> usize {
+        self.capacity() - self.used_space()
+    }
+
+    fn push_record(&mut self, lsn: Lsn, record: &[u8]) -> Result<()> {
+        if record.len() > self.capacity() {
+            return Err(WalError::RecordTooLarge {
+                lsn,
+                record_len: record.len(),
+                capacity: self.capacity(),
+            });
+        }
+
+        if record.len() > self.free_space() {
+            return Err(WalError::BufferFull {
+                needed: record.len(),
+                available: self.free_space(),
+            });
+        }
+
+        self.copy_into_ring(record);
+
+        self.records.push_back(BufferedRecord {
+            lsn,
+            len: record.len(),
+        });
+        Ok(())
+    }
+
+    fn copy_into_ring(&mut self, record: &[u8]) {
+        let first = record.len().min(self.capacity() - self.write_pos);
+        self.bytes[self.write_pos..self.write_pos + first].copy_from_slice(&record[..first]);
+
+        let second = record.len() - first;
+        if second > 0 {
+            self.bytes[..second].copy_from_slice(&record[first..]);
+        }
+
+        self.write_pos = (self.write_pos + record.len()) % self.capacity();
+    }
+
+    fn durable_prefix_len(&self, target_lsn: Lsn) -> Option<(usize, Lsn)> {
+        let mut bytes = 0;
+        let mut last_lsn = None;
+
+        for record in &self.records {
+            if record.lsn > target_lsn {
+                break;
+            }
+            bytes += record.len;
+            last_lsn = Some(record.lsn);
+        }
+
+        last_lsn.map(|lsn| (bytes, lsn))
+    }
+
+    fn write_prefix_to(&self, mut bytes_to_write: usize, writer: &mut impl Write) -> Result<()> {
+        let mut cursor = self.read_pos;
+
+        while bytes_to_write > 0 {
+            let chunk = bytes_to_write.min(self.capacity() - cursor);
+            writer.write_all(&self.bytes[cursor..cursor + chunk])?;
+            bytes_to_write -= chunk;
+            cursor = (cursor + chunk) % self.capacity();
+        }
+
+        Ok(())
+    }
+
+    fn consume_prefix(&mut self, bytes_to_consume: usize) {
+        let mut remaining = bytes_to_consume;
+        while remaining > 0 {
+            let record = self
+                .records
+                .pop_front()
+                .expect("WAL buffer prefix should contain complete records");
+            remaining -= record.len;
+        }
+
+        self.read_pos = (self.read_pos + bytes_to_consume) % self.capacity();
+
+        if self.is_empty() {
+            self.read_pos = 0;
+            self.write_pos = 0;
+        }
+    }
 }
 
 impl WalIterator {
@@ -307,6 +447,10 @@ impl Wal {
     /// LSN and handles any torn-tail corruption by truncating the file to the last valid
     /// record boundary. If mid-log corruption is detected, an error is returned.
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
+        Self::new_with_buffer_capacity(path, WAL_BUFFER_CAPACITY)
+    }
+
+    fn new_with_buffer_capacity(path: impl AsRef<Path>, buffer_capacity: usize) -> Result<Self> {
         let path = path.as_ref();
 
         let mut next_lsn = 0;
@@ -376,7 +520,8 @@ impl Wal {
 
         Ok(Wal {
             path: path.to_path_buf(),
-            file: BufWriter::new(file),
+            file,
+            buffer: WalBuffer::with_capacity(buffer_capacity),
             scratch_pad: Vec::with_capacity(4096),
             next_lsn,
             flushed_lsn,
@@ -452,7 +597,6 @@ impl Wal {
         main_data: Option<&[u8]>,
     ) -> Result<Lsn> {
         let lsn = self.next_lsn;
-        self.next_lsn += 1;
 
         self.scratch_pad.clear();
 
@@ -508,8 +652,9 @@ impl Wal {
         hasher.update(&self.scratch_pad);
         let checksum = hasher.finalize();
 
-        self.file.write_all(&self.scratch_pad)?;
-        self.file.write_all(&checksum.to_le_bytes())?;
+        self.scratch_pad.extend_from_slice(&checksum.to_le_bytes());
+        self.buffer.push_record(lsn, &self.scratch_pad)?;
+        self.next_lsn += 1;
 
         Ok(lsn)
     }
@@ -526,9 +671,14 @@ impl Wal {
         };
 
         if needs_flush {
-            self.file.flush().map_err(WalError::Io)?;
-            DiskManager::sync_file_and_dir(self.file.get_ref(), &self.path)?;
-            self.flushed_lsn = Some(lsn);
+            if let Some((bytes_to_flush, durable_lsn)) = self.buffer.durable_prefix_len(lsn) {
+                self.buffer
+                    .write_prefix_to(bytes_to_flush, &mut self.file)?;
+                self.file.flush().map_err(WalError::Io)?;
+                DiskManager::sync_file_and_dir(&self.file, &self.path)?;
+                self.buffer.consume_prefix(bytes_to_flush);
+                self.flushed_lsn = Some(durable_lsn);
+            }
         }
         Ok(())
     }
@@ -650,6 +800,55 @@ mod tests {
 
         wal.flush_up_to(second)?;
         assert_eq!(wal.flushed_lsn, Some(second));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_circular_buffer_wraparound_preserves_record_order() -> Result<()> {
+        let dir = tempdir().map_err(WalError::Io)?;
+        let wal_path = dir.path().join("wraparound.wal");
+
+        let mut wal = Wal::new_with_buffer_capacity(&wal_path, 96)?;
+
+        for txn_id in 0..3 {
+            wal.append(WalRecordType::Commit, txn_id, &[], None)?;
+        }
+        wal.flush_up_to(1)?;
+
+        for txn_id in 3..5 {
+            wal.append(WalRecordType::Commit, txn_id, &[], None)?;
+        }
+        wal.flush_up_to(4)?;
+
+        let mut iter = WalIterator::new(&wal_path).map_err(WalError::Io)?;
+        for expected in 0..5 {
+            let record = iter.next_record().unwrap()?;
+            assert_eq!(record.lsn, expected);
+            assert_eq!(record.txn_id, expected);
+        }
+        assert!(iter.next_record().is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_circular_buffer_append_error_does_not_consume_lsn() -> Result<()> {
+        let dir = tempdir().map_err(WalError::Io)?;
+        let wal_path = dir.path().join("too_small.wal");
+
+        let mut wal = Wal::new_with_buffer_capacity(&wal_path, 27)?;
+        let result = wal.append(WalRecordType::Commit, 1, &[], None);
+
+        assert!(matches!(
+            result,
+            Err(WalError::RecordTooLarge {
+                lsn: 0,
+                record_len: 28,
+                capacity: 27
+            })
+        ));
+        assert_eq!(wal.next_lsn, 0);
 
         Ok(())
     }
