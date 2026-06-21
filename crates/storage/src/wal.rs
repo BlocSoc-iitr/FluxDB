@@ -53,6 +53,9 @@ pub type Result<T> = std::result::Result<T, WalError>;
 
 /// Default bytes reserved for WAL records before they are flushed to disk.
 const WAL_BUFFER_CAPACITY: usize = 16 * 1024 * 1024;
+const WAL_SEGMENT_SIZE: u64 = 16 * 1024 * 1024;
+const WAL_SEGMENT_PREFIX: &str = "wal_";
+const WAL_SEGMENT_SUFFIX: &str = ".log";
 
 /// Identifies the physiological operation that a WAL record represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,10 +121,22 @@ pub struct WalRecord<'a> {
     pub main_data: Option<&'a [u8]>,
 }
 
+#[derive(Debug, Clone)]
+struct WalLayout {
+    dir: PathBuf,
+    segment_size: u64,
+}
+
 /// An iterator that sequentially reads and validates records from a WAL file.
 pub struct WalIterator {
-    reader: BufReader<File>,
+    reader: WalReader,
     scratch: Vec<u8>,
+}
+
+struct WalReader {
+    segments: Vec<PathBuf>,
+    current_segment: usize,
+    current: Option<BufReader<File>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -160,6 +175,13 @@ struct WalShared {
 pub struct Wal {
     shared: Arc<WalShared>,
     flusher: Option<JoinHandle<()>>,
+}
+
+struct SegmentWriter {
+    layout: WalLayout,
+    segment_index: u64,
+    offset: u64,
+    file: File,
 }
 
 impl WalBuffer {
@@ -245,18 +267,23 @@ impl WalBuffer {
         last_lsn.map(|lsn| (bytes, lsn))
     }
 
-    fn copy_prefix(&self, mut bytes_to_copy: usize) -> Vec<u8> {
-        let mut out = Vec::with_capacity(bytes_to_copy);
+    fn copy_records(&self) -> Vec<(Lsn, Vec<u8>)> {
+        let mut records = Vec::with_capacity(self.records.len());
         let mut cursor = self.read_pos;
 
-        while bytes_to_copy > 0 {
-            let chunk = bytes_to_copy.min(self.capacity() - cursor);
-            out.extend_from_slice(&self.bytes[cursor..cursor + chunk]);
-            bytes_to_copy -= chunk;
-            cursor = (cursor + chunk) % self.capacity();
+        for record in &self.records {
+            let mut bytes_left = record.len;
+            let mut bytes = Vec::with_capacity(record.len);
+            while bytes_left > 0 {
+                let chunk = bytes_left.min(self.capacity() - cursor);
+                bytes.extend_from_slice(&self.bytes[cursor..cursor + chunk]);
+                bytes_left -= chunk;
+                cursor = (cursor + chunk) % self.capacity();
+            }
+            records.push((record.lsn, bytes));
         }
 
-        out
+        records
     }
 
     fn consume_prefix(&mut self, bytes_to_consume: usize) {
@@ -278,12 +305,216 @@ impl WalBuffer {
     }
 }
 
+fn wal_layout_from_path(path: &Path, segment_size: u64) -> WalLayout {
+    let dir = if path.extension().is_some() {
+        path.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    } else {
+        path.to_path_buf()
+    };
+
+    WalLayout { dir, segment_size }
+}
+
+fn segment_file_name(index: u64) -> String {
+    format!("{WAL_SEGMENT_PREFIX}{index:05}{WAL_SEGMENT_SUFFIX}")
+}
+
+fn segment_path(dir: &Path, index: u64) -> PathBuf {
+    dir.join(segment_file_name(index))
+}
+
+fn parse_segment_index(path: &Path) -> Option<u64> {
+    let name = path.file_name()?.to_str()?;
+    let index = name
+        .strip_prefix(WAL_SEGMENT_PREFIX)?
+        .strip_suffix(WAL_SEGMENT_SUFFIX)?;
+    index.parse().ok()
+}
+
+fn list_segments(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => {
+            let mut segments = Vec::new();
+            for entry in entries {
+                let path = entry?.path();
+                if let Some(index) = parse_segment_index(&path) {
+                    segments.push((index, path));
+                }
+            }
+            segments.sort_by_key(|(index, _)| *index);
+            Ok(segments)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(err) => Err(err),
+    }
+}
+
+fn wal_iterator_segments(path: &Path) -> io::Result<Vec<PathBuf>> {
+    if path.is_dir() {
+        return Ok(list_segments(path)?
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect());
+    }
+
+    let layout = wal_layout_from_path(path, WAL_SEGMENT_SIZE);
+    let segments = list_segments(&layout.dir)?;
+    if segments.is_empty() && path.is_file() && parse_segment_index(path).is_none() {
+        Ok(vec![path.to_path_buf()])
+    } else {
+        Ok(segments.into_iter().map(|(_, path)| path).collect())
+    }
+}
+
+impl SegmentWriter {
+    fn open(layout: WalLayout) -> Result<Self> {
+        std::fs::create_dir_all(&layout.dir).map_err(WalError::Io)?;
+        let segments = list_segments(&layout.dir).map_err(WalError::Io)?;
+        let (mut segment_index, mut offset) = match segments.last() {
+            Some((index, path)) => (*index, std::fs::metadata(path).map_err(WalError::Io)?.len()),
+            None => (1, 0),
+        };
+
+        if offset >= layout.segment_size {
+            segment_index += 1;
+            offset = 0;
+        }
+
+        let path = segment_path(&layout.dir, segment_index);
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(WalError::Io)?;
+
+        Ok(Self {
+            layout,
+            segment_index,
+            offset,
+            file,
+        })
+    }
+
+    fn current_path(&self) -> PathBuf {
+        segment_path(&self.layout.dir, self.segment_index)
+    }
+
+    fn rotate(&mut self) -> Result<()> {
+        self.file.flush().map_err(WalError::Io)?;
+        DiskManager::sync_file_and_dir(&self.file, &self.current_path())?;
+
+        self.segment_index += 1;
+        self.offset = 0;
+        let path = self.current_path();
+        self.file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(WalError::Io)?;
+        Ok(())
+    }
+
+    fn write_record(&mut self, lsn: Lsn, record: &[u8]) -> Result<()> {
+        if record.len() as u64 > self.layout.segment_size {
+            return Err(WalError::RecordTooLarge {
+                lsn,
+                record_len: record.len(),
+                capacity: self.layout.segment_size as usize,
+            });
+        }
+
+        if self.offset > 0 && self.offset + record.len() as u64 > self.layout.segment_size {
+            self.rotate()?;
+        }
+
+        self.file.write_all(record)?;
+        self.offset += record.len() as u64;
+        Ok(())
+    }
+
+    fn sync(&mut self) -> Result<()> {
+        self.file.flush().map_err(WalError::Io)?;
+        DiskManager::sync_file_and_dir(&self.file, &self.current_path())?;
+        Ok(())
+    }
+}
+
+impl WalReader {
+    fn new(path: impl AsRef<Path>) -> io::Result<Self> {
+        Ok(Self {
+            segments: wal_iterator_segments(path.as_ref())?,
+            current_segment: 0,
+            current: None,
+        })
+    }
+
+    fn ensure_current(&mut self) -> io::Result<bool> {
+        if self.current.is_some() {
+            return Ok(true);
+        }
+        if self.current_segment >= self.segments.len() {
+            return Ok(false);
+        }
+
+        let file = OpenOptions::new()
+            .read(true)
+            .open(&self.segments[self.current_segment])?;
+        self.current = Some(BufReader::new(file));
+        Ok(true)
+    }
+
+    fn advance_segment(&mut self) {
+        self.current = None;
+        self.current_segment += 1;
+    }
+
+    fn stream_position(&mut self) -> io::Result<u64> {
+        use std::io::Seek;
+        if !self.ensure_current()? {
+            return Ok(0);
+        }
+        self.current.as_mut().unwrap().stream_position()
+    }
+}
+
+impl Read for WalReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if !self.ensure_current()? {
+            return Ok(0);
+        }
+        self.current.as_mut().unwrap().read(buf)
+    }
+}
+
+impl BufRead for WalReader {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        loop {
+            if !self.ensure_current()? {
+                return Ok(&[]);
+            }
+
+            if self.current.as_mut().unwrap().fill_buf()?.is_empty() {
+                self.advance_segment();
+                continue;
+            }
+
+            return self.current.as_mut().unwrap().fill_buf();
+        }
+    }
+
+    fn consume(&mut self, amt: usize) {
+        if let Some(reader) = self.current.as_mut() {
+            reader.consume(amt);
+        }
+    }
+}
+
 impl WalIterator {
     pub fn new(path: impl AsRef<Path>) -> io::Result<WalIterator> {
-        let path = path.as_ref();
-        let file = OpenOptions::new().read(true).open(path)?;
         Ok(WalIterator {
-            reader: BufReader::new(file),
+            reader: WalReader::new(path)?,
             scratch: Vec::with_capacity(4096),
         })
     }
@@ -461,72 +692,75 @@ impl Wal {
     }
 
     fn new_with_buffer_capacity(path: impl AsRef<Path>, buffer_capacity: usize) -> Result<Self> {
+        Self::new_with_options(path, buffer_capacity, WAL_SEGMENT_SIZE)
+    }
+
+    fn new_with_options(
+        path: impl AsRef<Path>,
+        buffer_capacity: usize,
+        segment_size: u64,
+    ) -> Result<Self> {
         let path = path.as_ref();
+        let layout = wal_layout_from_path(path, segment_size);
+        std::fs::create_dir_all(&layout.dir).map_err(WalError::Io)?;
 
         let mut next_lsn = 0;
         let mut flushed_lsn = None;
+        let mut segments = list_segments(&layout.dir).map_err(WalError::Io)?;
+        if segments.is_empty() && path.is_file() && parse_segment_index(path).is_none() {
+            segments.push((0, path.to_path_buf()));
+        }
 
-        match OpenOptions::new().read(true).open(path) {
-            Ok(file) => {
-                let file_len = file.metadata().map_err(WalError::Io)?.len();
-                let mut iter = WalIterator {
-                    reader: BufReader::new(file),
-                    scratch: Vec::with_capacity(4096),
-                };
+        let last_segment_idx = segments.len().saturating_sub(1);
+        for (idx, (_segment_index, segment_path)) in segments.iter().enumerate() {
+            let file_len = std::fs::metadata(segment_path).map_err(WalError::Io)?.len();
+            let mut iter = WalIterator {
+                reader: WalReader {
+                    segments: vec![segment_path.clone()],
+                    current_segment: 0,
+                    current: None,
+                },
+                scratch: Vec::with_capacity(4096),
+            };
 
-                loop {
-                    use std::io::Seek;
-                    let current_offset = iter.reader.stream_position().map_err(WalError::Io)?;
+            loop {
+                let current_offset = iter.reader.stream_position().map_err(WalError::Io)?;
 
-                    match iter.next_record() {
-                        Some(Ok(record)) => {
-                            if record.lsn >= next_lsn {
-                                next_lsn = record.lsn + 1;
-                            }
-                            flushed_lsn = Some(record.lsn);
+                match iter.next_record() {
+                    Some(Ok(record)) => {
+                        if record.lsn >= next_lsn {
+                            next_lsn = record.lsn + 1;
                         }
-                        Some(Err(e)) => {
-                            let err_pos = iter.reader.stream_position().map_err(WalError::Io)?;
+                        flushed_lsn = Some(record.lsn);
+                    }
+                    Some(Err(e)) => {
+                        let err_pos = iter.reader.stream_position().map_err(WalError::Io)?;
 
-                            let is_eof = match &e {
-                                WalError::Io(io_err) => {
-                                    io_err.kind() == io::ErrorKind::UnexpectedEof
-                                }
-                                _ => false,
-                            };
+                        let is_eof = match &e {
+                            WalError::Io(io_err) => io_err.kind() == io::ErrorKind::UnexpectedEof,
+                            _ => false,
+                        };
 
-                            // If the file is corrupted at the end, truncate it
-                            if is_eof || err_pos == file_len {
-                                let f = OpenOptions::new()
-                                    .write(true)
-                                    .open(path)
-                                    .map_err(WalError::Io)?;
-                                // chops off the corrupted part
-                                f.set_len(current_offset).map_err(WalError::Io)?;
-                                f.sync_all().map_err(WalError::Io)?;
-                                break;
-                            } else {
-                                return Err(e);
-                            }
-                        }
-                        None => {
+                        if idx == last_segment_idx && (is_eof || err_pos == file_len) {
+                            let f = OpenOptions::new()
+                                .write(true)
+                                .open(segment_path)
+                                .map_err(WalError::Io)?;
+                            f.set_len(current_offset).map_err(WalError::Io)?;
+                            f.sync_all().map_err(WalError::Io)?;
                             break;
+                        } else {
+                            return Err(e);
                         }
+                    }
+                    None => {
+                        break;
                     }
                 }
             }
-            Err(e) => {
-                if e.kind() != io::ErrorKind::NotFound {
-                    return Err(e.into());
-                }
-            }
-        };
+        }
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .map_err(WalError::Io)?;
+        let writer = SegmentWriter::open(layout)?;
 
         let shared = Arc::new(WalShared {
             state: Mutex::new(WalState {
@@ -540,23 +774,18 @@ impl Wal {
             durable: Condvar::new(),
         });
 
-        let flusher = Some(Self::spawn_flush_thread(
-            Arc::clone(&shared),
-            path.to_path_buf(),
-            file,
-        )?);
+        let flusher = Some(Self::spawn_flush_thread(Arc::clone(&shared), writer)?);
 
         Ok(Wal { shared, flusher })
     }
 
     fn spawn_flush_thread(
         shared: Arc<WalShared>,
-        path: PathBuf,
-        mut file: File,
+        mut writer: SegmentWriter,
     ) -> Result<JoinHandle<()>> {
         thread::Builder::new()
             .name("fluxdb-wal-flusher".into())
-            .spawn(move || run_flush_thread(shared, path, &mut file))
+            .spawn(move || run_flush_thread(shared, &mut writer))
             .map_err(WalError::Io)
     }
 
@@ -744,9 +973,9 @@ impl Drop for Wal {
     }
 }
 
-fn run_flush_thread(shared: Arc<WalShared>, path: PathBuf, file: &mut File) {
+fn run_flush_thread(shared: Arc<WalShared>, writer: &mut SegmentWriter) {
     loop {
-        let (bytes, durable_lsn) = {
+        let (records, bytes_to_consume, durable_lsn) = {
             let mut state = shared.state.lock().unwrap();
 
             loop {
@@ -755,8 +984,8 @@ fn run_flush_thread(shared: Arc<WalShared>, path: PathBuf, file: &mut File) {
                 }
 
                 if let Some((bytes_to_flush, durable_lsn)) = state.buffer.buffered_prefix_len() {
-                    let bytes = state.buffer.copy_prefix(bytes_to_flush);
-                    break (bytes, durable_lsn);
+                    let records = state.buffer.copy_records();
+                    break (records, bytes_to_flush, durable_lsn);
                 }
 
                 state = shared.flush_requested.wait(state).unwrap();
@@ -764,16 +993,17 @@ fn run_flush_thread(shared: Arc<WalShared>, path: PathBuf, file: &mut File) {
         };
 
         let flush_result = (|| -> Result<()> {
-            file.write_all(&bytes)?;
-            file.flush().map_err(WalError::Io)?;
-            DiskManager::sync_file_and_dir(file, &path)?;
+            for (lsn, record) in &records {
+                writer.write_record(*lsn, record)?;
+            }
+            writer.sync()?;
             Ok(())
         })();
 
         let mut state = shared.state.lock().unwrap();
         match flush_result {
             Ok(()) => {
-                state.buffer.consume_prefix(bytes.len());
+                state.buffer.consume_prefix(bytes_to_consume);
                 state.flushed_lsn = Some(durable_lsn);
             }
             Err(err) => {
@@ -986,6 +1216,38 @@ mod tests {
     }
 
     #[test]
+    fn test_wal_rotates_segments_without_splitting_records() -> Result<()> {
+        let dir = tempdir().map_err(WalError::Io)?;
+        let wal_path = dir.path().join("rotating.wal");
+        let wal = Wal::new_with_options(&wal_path, 1024, 64)?;
+
+        for txn_id in 0..5 {
+            wal.log_commit(txn_id)?;
+        }
+        wal.flush_up_to(4)?;
+        drop(wal);
+
+        let segments = list_segments(dir.path()).map_err(WalError::Io)?;
+        assert_eq!(segments.len(), 3);
+        assert_eq!(std::fs::metadata(segment_path(dir.path(), 1))?.len(), 56);
+        assert_eq!(std::fs::metadata(segment_path(dir.path(), 2))?.len(), 56);
+        assert_eq!(std::fs::metadata(segment_path(dir.path(), 3))?.len(), 28);
+
+        let mut iter = WalIterator::new(&wal_path).map_err(WalError::Io)?;
+        for expected in 0..5 {
+            let record = iter.next_record().unwrap()?;
+            assert_eq!(record.lsn, expected);
+            assert_eq!(record.txn_id, expected);
+        }
+        assert!(iter.next_record().is_none());
+
+        let reopened = Wal::new_with_options(&wal_path, 1024, 64)?;
+        assert_eq!(reopened.next_lsn(), 5);
+
+        Ok(())
+    }
+
+    #[test]
     fn test_wal_recovery_torn_tail() -> Result<()> {
         let dir = tempdir().map_err(|e| WalError::Io(e))?;
         let wal_path = dir.path().join("torntail.wal");
@@ -1009,7 +1271,8 @@ mod tests {
             wal.flush_up_to(1)?;
         }
 
-        let mut file = OpenOptions::new().write(true).open(&wal_path)?;
+        let first_segment = segment_path(dir.path(), 1);
+        let mut file = OpenOptions::new().write(true).open(&first_segment)?;
         let file_len = file.metadata()?.len();
 
         file.seek(SeekFrom::Start(file_len - 1))?;
@@ -1049,7 +1312,8 @@ mod tests {
             wal.flush_up_to(1)?;
         }
 
-        let mut file = OpenOptions::new().write(true).open(&wal_path)?;
+        let first_segment = segment_path(dir.path(), 1);
+        let mut file = OpenOptions::new().write(true).open(&first_segment)?;
 
         file.seek(SeekFrom::Start(40))?;
         file.write_all(&[0xFF])?;
@@ -1082,10 +1346,11 @@ mod tests {
             wal.flush_up_to(0)?;
         }
 
+        let first_segment = segment_path(dir.path(), 1);
         let mut file = OpenOptions::new()
             .write(true)
             .append(true)
-            .open(&wal_path)?;
+            .open(&first_segment)?;
         let clean_len = file.metadata()?.len();
 
         file.write_all(&[0xFF, 0xFF, 0xFF, 0xFF])?;
@@ -1093,7 +1358,9 @@ mod tests {
 
         let _ = Wal::new(&wal_path)?;
 
-        let new_file_len = std::fs::metadata(&wal_path).map_err(WalError::Io)?.len();
+        let new_file_len = std::fs::metadata(&first_segment)
+            .map_err(WalError::Io)?
+            .len();
         assert_eq!(
             new_file_len, clean_len,
             "Garbage bytes were not truncated! Expected len {}, got {}",
