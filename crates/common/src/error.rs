@@ -46,6 +46,9 @@ pub enum WalError {
     #[error("WAL buffer full: need {needed} bytes, only {available} available")]
     BufferFull { needed: usize, available: usize },
 
+    #[error("WAL background flush failed: {0}")]
+    FlushFailed(String),
+
     #[error("Invalid entry type: {0}")]
     InvalidEntryType(u8),
 

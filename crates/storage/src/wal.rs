@@ -42,6 +42,8 @@ use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
 
 use crate::disk::DiskManager;
 use crate::page::{Lsn, PAGE_SIZE, PageId};
@@ -139,15 +141,25 @@ struct WalBuffer {
     records: VecDeque<BufferedRecord>,
 }
 
+struct WalState {
+    buffer: WalBuffer,
+    next_lsn: Lsn,
+    flushed_lsn: Option<Lsn>,
+    flush_error: Option<String>,
+    shutdown: bool,
+}
+
+struct WalShared {
+    state: Mutex<WalState>,
+    flush_requested: Condvar,
+    durable: Condvar,
+}
+
 /// The main Write-Ahead Log manager responsible for appending records sequentially
 /// and maintaining the durability guarantees of the database.
 pub struct Wal {
-    path: PathBuf,
-    file: File,
-    buffer: WalBuffer,
-    scratch_pad: Vec<u8>,
-    pub next_lsn: u64,
-    pub flushed_lsn: Option<Lsn>,
+    shared: Arc<WalShared>,
+    flusher: Option<JoinHandle<()>>,
 }
 
 impl WalBuffer {
@@ -221,14 +233,11 @@ impl WalBuffer {
         self.write_pos = (self.write_pos + record.len()) % self.capacity();
     }
 
-    fn durable_prefix_len(&self, target_lsn: Lsn) -> Option<(usize, Lsn)> {
+    fn buffered_prefix_len(&self) -> Option<(usize, Lsn)> {
         let mut bytes = 0;
         let mut last_lsn = None;
 
         for record in &self.records {
-            if record.lsn > target_lsn {
-                break;
-            }
             bytes += record.len;
             last_lsn = Some(record.lsn);
         }
@@ -236,17 +245,18 @@ impl WalBuffer {
         last_lsn.map(|lsn| (bytes, lsn))
     }
 
-    fn write_prefix_to(&self, mut bytes_to_write: usize, writer: &mut impl Write) -> Result<()> {
+    fn copy_prefix(&self, mut bytes_to_copy: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes_to_copy);
         let mut cursor = self.read_pos;
 
-        while bytes_to_write > 0 {
-            let chunk = bytes_to_write.min(self.capacity() - cursor);
-            writer.write_all(&self.bytes[cursor..cursor + chunk])?;
-            bytes_to_write -= chunk;
+        while bytes_to_copy > 0 {
+            let chunk = bytes_to_copy.min(self.capacity() - cursor);
+            out.extend_from_slice(&self.bytes[cursor..cursor + chunk]);
+            bytes_to_copy -= chunk;
             cursor = (cursor + chunk) % self.capacity();
         }
 
-        Ok(())
+        out
     }
 
     fn consume_prefix(&mut self, bytes_to_consume: usize) {
@@ -518,27 +528,58 @@ impl Wal {
             .open(path)
             .map_err(WalError::Io)?;
 
-        Ok(Wal {
-            path: path.to_path_buf(),
+        let shared = Arc::new(WalShared {
+            state: Mutex::new(WalState {
+                buffer: WalBuffer::with_capacity(buffer_capacity),
+                next_lsn,
+                flushed_lsn,
+                flush_error: None,
+                shutdown: false,
+            }),
+            flush_requested: Condvar::new(),
+            durable: Condvar::new(),
+        });
+
+        let flusher = Some(Self::spawn_flush_thread(
+            Arc::clone(&shared),
+            path.to_path_buf(),
             file,
-            buffer: WalBuffer::with_capacity(buffer_capacity),
-            scratch_pad: Vec::with_capacity(4096),
-            next_lsn,
-            flushed_lsn,
-        })
+        )?);
+
+        Ok(Wal { shared, flusher })
     }
-    pub fn log_commit(&mut self, txn_id: u64) -> Result<Lsn> {
+
+    fn spawn_flush_thread(
+        shared: Arc<WalShared>,
+        path: PathBuf,
+        mut file: File,
+    ) -> Result<JoinHandle<()>> {
+        thread::Builder::new()
+            .name("fluxdb-wal-flusher".into())
+            .spawn(move || run_flush_thread(shared, path, &mut file))
+            .map_err(WalError::Io)
+    }
+
+    pub fn next_lsn(&self) -> Lsn {
+        self.shared.state.lock().unwrap().next_lsn
+    }
+
+    pub fn flushed_lsn(&self) -> Option<Lsn> {
+        self.shared.state.lock().unwrap().flushed_lsn
+    }
+
+    pub fn log_commit(&self, txn_id: u64) -> Result<Lsn> {
         self.append(WalRecordType::Commit, txn_id, &[], None)
     }
 
-    pub fn log_abort(&mut self, txn_id: u64) -> Result<Lsn> {
+    pub fn log_abort(&self, txn_id: u64) -> Result<Lsn> {
         self.append(WalRecordType::Abort, txn_id, &[], None)
     }
 
     /// Appends only — durability is deferred to the buffer pool's flush seam
     /// (WAL-before-page) or to the transaction's commit, never an fsync here.
     pub fn log_insert(
-        &mut self,
+        &self,
         txn_id: u64,
         page_id: PageId,
         slot: u16,
@@ -563,13 +604,7 @@ impl Wal {
         self.append(WalRecordType::Insert, txn_id, &[block], None)
     }
 
-    pub fn log_set_xmax(
-        &mut self,
-        txn_id: u64,
-        page_id: PageId,
-        slot: u16,
-        xmax: u64,
-    ) -> Result<Lsn> {
+    pub fn log_set_xmax(&self, txn_id: u64, page_id: PageId, slot: u16, xmax: u64) -> Result<Lsn> {
         let mut payload = Vec::with_capacity(2 + 8);
         payload.extend_from_slice(&slot.to_le_bytes());
         payload.extend_from_slice(&xmax.to_le_bytes());
@@ -590,15 +625,20 @@ impl Wal {
     /// `BufWriter`. Note that the record is not guaranteed to be durable on disk until
     /// `flush_up_to` is called.
     fn append(
-        &mut self,
+        &self,
         entry_type: WalRecordType,
         txn_id: u64,
         blocks: &[Block<'_>],
         main_data: Option<&[u8]>,
     ) -> Result<Lsn> {
-        let lsn = self.next_lsn;
+        let mut state = self.shared.state.lock().unwrap();
+        if let Some(err) = state.flush_error.as_ref() {
+            return Err(WalError::FlushFailed(err.clone()));
+        }
 
-        self.scratch_pad.clear();
+        let lsn = state.next_lsn;
+
+        let mut record = Vec::with_capacity(4096);
 
         let blocks_size = blocks
             .iter()
@@ -617,70 +657,130 @@ impl Wal {
         let main_data_size = main_data.as_ref().map_or(0, |data| data.len());
 
         let record_size = 8 + 4 + 1 + 1 + 8 + 2 + blocks_size + main_data_size + 4;
-        self.scratch_pad.reserve(record_size);
+        record.reserve(record_size);
 
-        self.scratch_pad.extend_from_slice(&lsn.to_le_bytes());
-        self.scratch_pad
-            .extend_from_slice(&(record_size as u32).to_le_bytes());
-        self.scratch_pad.push(entry_type as u8);
-        self.scratch_pad.push(blocks.len() as u8);
-        self.scratch_pad.extend_from_slice(&txn_id.to_le_bytes());
+        record.extend_from_slice(&lsn.to_le_bytes());
+        record.extend_from_slice(&(record_size as u32).to_le_bytes());
+        record.push(entry_type as u8);
+        record.push(blocks.len() as u8);
+        record.extend_from_slice(&txn_id.to_le_bytes());
 
         let main_len = main_data.map_or(0, |data| data.len()) as u16;
-        self.scratch_pad.extend_from_slice(&main_len.to_le_bytes());
+        record.extend_from_slice(&main_len.to_le_bytes());
 
         for block in blocks {
-            self.scratch_pad
-                .extend_from_slice(&block.page_id.to_le_bytes());
-            self.scratch_pad.push(block.blk_flags);
+            record.extend_from_slice(&block.page_id.to_le_bytes());
+            record.push(block.blk_flags);
 
             let data_len = block.data.map_or(0, |d| d.len()) as u16;
-            self.scratch_pad.extend_from_slice(&data_len.to_le_bytes());
+            record.extend_from_slice(&data_len.to_le_bytes());
 
             if let Some(ref fpi) = block.fpi {
-                self.scratch_pad.extend_from_slice(fpi);
+                record.extend_from_slice(fpi);
             }
             if let Some(data) = block.data {
-                self.scratch_pad.extend_from_slice(data);
+                record.extend_from_slice(data);
             }
         }
         if let Some(data) = main_data {
-            self.scratch_pad.extend_from_slice(data);
+            record.extend_from_slice(data);
         }
 
         let mut hasher = Hasher::new();
-        hasher.update(&self.scratch_pad);
+        hasher.update(&record);
         let checksum = hasher.finalize();
 
-        self.scratch_pad.extend_from_slice(&checksum.to_le_bytes());
-        self.buffer.push_record(lsn, &self.scratch_pad)?;
-        self.next_lsn += 1;
+        record.extend_from_slice(&checksum.to_le_bytes());
+        state.buffer.push_record(lsn, &record)?;
+        state.next_lsn += 1;
 
         Ok(lsn)
     }
 
     /// Flushes pending WAL bytes so records up to and including `lsn` are durable.
     ///
-    /// This is a no-op when `flushed_lsn >= lsn`. Otherwise it drains the `BufWriter`,
-    /// fsyncs the WAL file and parent directory, then advances `flushed_lsn` to `lsn`.
+    /// This is a no-op when `flushed_lsn >= lsn`. Otherwise it asks the background
+    /// flusher to sync records through `lsn` and waits on the durability condvar.
     /// Commit code relies on this before publishing a transaction as committed.
-    pub fn flush_up_to(&mut self, lsn: Lsn) -> Result<()> {
-        let needs_flush = match self.flushed_lsn {
-            Some(flushed) => lsn > flushed,
-            None => true,
+    pub fn flush_up_to(&self, lsn: Lsn) -> Result<()> {
+        let mut state = self.shared.state.lock().unwrap();
+
+        let Some(target_lsn) = state
+            .next_lsn
+            .checked_sub(1)
+            .map(|last_lsn| lsn.min(last_lsn))
+        else {
+            return Ok(());
         };
 
-        if needs_flush {
-            if let Some((bytes_to_flush, durable_lsn)) = self.buffer.durable_prefix_len(lsn) {
-                self.buffer
-                    .write_prefix_to(bytes_to_flush, &mut self.file)?;
-                self.file.flush().map_err(WalError::Io)?;
-                DiskManager::sync_file_and_dir(&self.file, &self.path)?;
-                self.buffer.consume_prefix(bytes_to_flush);
-                self.flushed_lsn = Some(durable_lsn);
+        loop {
+            if state
+                .flushed_lsn
+                .is_some_and(|flushed| flushed >= target_lsn)
+            {
+                return Ok(());
+            }
+            if let Some(err) = state.flush_error.as_ref() {
+                return Err(WalError::FlushFailed(err.clone()));
+            }
+
+            self.shared.flush_requested.notify_one();
+            state = self.shared.durable.wait(state).unwrap();
+        }
+    }
+}
+
+impl Drop for Wal {
+    fn drop(&mut self) {
+        {
+            let mut state = self.shared.state.lock().unwrap();
+            state.shutdown = true;
+            self.shared.flush_requested.notify_one();
+        }
+
+        if let Some(flusher) = self.flusher.take() {
+            let _ = flusher.join();
+        }
+    }
+}
+
+fn run_flush_thread(shared: Arc<WalShared>, path: PathBuf, file: &mut File) {
+    loop {
+        let (bytes, durable_lsn) = {
+            let mut state = shared.state.lock().unwrap();
+
+            loop {
+                if state.shutdown {
+                    return;
+                }
+
+                if let Some((bytes_to_flush, durable_lsn)) = state.buffer.buffered_prefix_len() {
+                    let bytes = state.buffer.copy_prefix(bytes_to_flush);
+                    break (bytes, durable_lsn);
+                }
+
+                state = shared.flush_requested.wait(state).unwrap();
+            }
+        };
+
+        let flush_result = (|| -> Result<()> {
+            file.write_all(&bytes)?;
+            file.flush().map_err(WalError::Io)?;
+            DiskManager::sync_file_and_dir(file, &path)?;
+            Ok(())
+        })();
+
+        let mut state = shared.state.lock().unwrap();
+        match flush_result {
+            Ok(()) => {
+                state.buffer.consume_prefix(bytes.len());
+                state.flushed_lsn = Some(durable_lsn);
+            }
+            Err(err) => {
+                state.flush_error = Some(err.to_string());
             }
         }
-        Ok(())
+        shared.durable.notify_all();
     }
 }
 
@@ -688,6 +788,8 @@ impl Wal {
 mod tests {
     use super::*;
     use std::io::{Seek, SeekFrom};
+    use std::sync::Arc;
+    use std::thread;
     use tempfile::tempdir;
 
     #[test]
@@ -695,7 +797,7 @@ mod tests {
         let dir = tempdir().map_err(|e| WalError::Io(e))?;
         let wal_path = dir.path().join("test.wal");
 
-        let mut wal = Wal::new(&wal_path)?;
+        let wal = Wal::new(&wal_path)?;
 
         let block1 = Block {
             page_id: 100,
@@ -756,7 +858,7 @@ mod tests {
         let wal_path = dir.path().join("clean.wal");
 
         {
-            let mut wal = Wal::new(&wal_path)?;
+            let wal = Wal::new(&wal_path)?;
             let block1 = Block {
                 page_id: 100,
                 blk_flags: 2,
@@ -775,7 +877,7 @@ mod tests {
         }
 
         let wal = Wal::new(&wal_path)?;
-        assert_eq!(wal.next_lsn, 2);
+        assert_eq!(wal.next_lsn(), 2);
         Ok(())
     }
 
@@ -784,22 +886,22 @@ mod tests {
         let dir = tempdir().map_err(WalError::Io)?;
         let wal_path = dir.path().join("flush_lsn.wal");
 
-        let mut wal = Wal::new(&wal_path)?;
+        let wal = Wal::new(&wal_path)?;
         let first = wal.append(WalRecordType::Insert, 42, &[], None)?;
         let second = wal.append(WalRecordType::Commit, 42, &[], None)?;
 
         assert_eq!(first, 0);
         assert_eq!(second, 1);
-        assert_eq!(wal.flushed_lsn, None);
+        assert_eq!(wal.flushed_lsn(), None);
 
         wal.flush_up_to(first)?;
-        assert_eq!(wal.flushed_lsn, Some(first));
+        assert!(wal.flushed_lsn().is_some_and(|flushed| flushed >= first));
 
         wal.flush_up_to(first)?;
-        assert_eq!(wal.flushed_lsn, Some(first));
+        assert!(wal.flushed_lsn().is_some_and(|flushed| flushed >= first));
 
         wal.flush_up_to(second)?;
-        assert_eq!(wal.flushed_lsn, Some(second));
+        assert_eq!(wal.flushed_lsn(), Some(second));
 
         Ok(())
     }
@@ -809,7 +911,7 @@ mod tests {
         let dir = tempdir().map_err(WalError::Io)?;
         let wal_path = dir.path().join("wraparound.wal");
 
-        let mut wal = Wal::new_with_buffer_capacity(&wal_path, 96)?;
+        let wal = Wal::new_with_buffer_capacity(&wal_path, 96)?;
 
         for txn_id in 0..3 {
             wal.append(WalRecordType::Commit, txn_id, &[], None)?;
@@ -837,7 +939,7 @@ mod tests {
         let dir = tempdir().map_err(WalError::Io)?;
         let wal_path = dir.path().join("too_small.wal");
 
-        let mut wal = Wal::new_with_buffer_capacity(&wal_path, 27)?;
+        let wal = Wal::new_with_buffer_capacity(&wal_path, 27)?;
         let result = wal.append(WalRecordType::Commit, 1, &[], None);
 
         assert!(matches!(
@@ -848,7 +950,37 @@ mod tests {
                 capacity: 27
             })
         ));
-        assert_eq!(wal.next_lsn, 0);
+        assert_eq!(wal.next_lsn(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_background_flush_wakes_multiple_waiters() -> Result<()> {
+        let dir = tempdir().map_err(WalError::Io)?;
+        let wal_path = dir.path().join("group_commit.wal");
+        let wal = Arc::new(Wal::new(&wal_path)?);
+
+        let mut handles = Vec::new();
+        for txn_id in 0..8 {
+            let lsn = wal.log_commit(txn_id)?;
+            let wal = Arc::clone(&wal);
+            handles.push(thread::spawn(move || wal.flush_up_to(lsn)));
+        }
+
+        for handle in handles {
+            handle.join().expect("flush waiter panicked")?;
+        }
+
+        assert_eq!(wal.flushed_lsn(), Some(7));
+
+        let mut iter = WalIterator::new(&wal_path).map_err(WalError::Io)?;
+        for expected in 0..8 {
+            let record = iter.next_record().unwrap()?;
+            assert_eq!(record.lsn, expected);
+            assert_eq!(record.txn_id, expected);
+        }
+        assert!(iter.next_record().is_none());
 
         Ok(())
     }
@@ -859,7 +991,7 @@ mod tests {
         let wal_path = dir.path().join("torntail.wal");
 
         {
-            let mut wal = Wal::new(&wal_path)?;
+            let wal = Wal::new(&wal_path)?;
             let block1 = Block {
                 page_id: 100,
                 blk_flags: 2,
@@ -885,7 +1017,7 @@ mod tests {
         file.sync_all()?;
 
         let wal = Wal::new(&wal_path)?;
-        assert_eq!(wal.next_lsn, 1);
+        assert_eq!(wal.next_lsn(), 1);
 
         let new_file_len = file.metadata()?.len();
         assert!(new_file_len < file_len);
@@ -899,7 +1031,7 @@ mod tests {
         let wal_path = dir.path().join("midlog.wal");
 
         {
-            let mut wal = Wal::new(&wal_path)?;
+            let wal = Wal::new(&wal_path)?;
             let block1 = Block {
                 page_id: 100,
                 blk_flags: 2,
@@ -939,7 +1071,7 @@ mod tests {
         let wal_path = dir.path().join("torn_lsn.wal");
 
         {
-            let mut wal = Wal::new(&wal_path)?;
+            let wal = Wal::new(&wal_path)?;
             let block1 = Block {
                 page_id: 100,
                 blk_flags: 2,

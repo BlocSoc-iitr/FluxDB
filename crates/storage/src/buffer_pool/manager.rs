@@ -17,7 +17,7 @@ impl BufferPoolManager {
     ///
     /// It initializes the shards and sets the `next_page_id` based on the
     /// current number of pages in the disk file.
-    pub fn new(disk_manager: Arc<DiskManager>, wal: Arc<Mutex<Wal>>) -> Self {
+    pub fn new(disk_manager: Arc<DiskManager>, wal: Arc<Wal>) -> Self {
         let existing_pages = disk_manager.num_pages().unwrap_or(0);
         let shard_size = MAX_FRAMES / NUM_SHARDS;
         let shards = (0..NUM_SHARDS)

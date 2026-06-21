@@ -44,7 +44,7 @@ type BTStack = Vec<BTStackEntry>;
 
 pub struct BTreeIndex<K: Key, V: Value> {
     pool: Arc<BufferPoolManager>,
-    wal: Arc<Mutex<crate::wal::Wal>>,
+    wal: Arc<crate::wal::Wal>,
     root: Mutex<PageId>,
     _key: PhantomData<K>,
     _val: PhantomData<V>,
@@ -53,7 +53,7 @@ pub struct BTreeIndex<K: Key, V: Value> {
 impl<K: Key, V: Value> BTreeIndex<K, V> {
     // ── Constructors ──────────────────────────────────────────────────────────
 
-    pub fn open(pool: Arc<BufferPoolManager>, wal: Arc<Mutex<crate::wal::Wal>>) -> Result<Self> {
+    pub fn open(pool: Arc<BufferPoolManager>, wal: Arc<crate::wal::Wal>) -> Result<Self> {
         // Page 0 is the superblock. fetch_page verifies its checksum, so a torn
         // write surfaces here as BufferPoolError::PageCorruption.
         let meta = pool.fetch_page(0)?;
@@ -99,7 +99,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
 
     pub fn create(
         pool: Arc<BufferPoolManager>,
-        wal: Arc<Mutex<crate::wal::Wal>>,
+        wal: Arc<crate::wal::Wal>,
     ) -> Result<(Self, PageId)> {
         let mut meta_guard = pool.new_page()?;
         let meta_pid = meta_guard.page_id;
@@ -122,11 +122,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         *self.root.lock().unwrap()
     }
 
-    fn from_root(
-        pool: Arc<BufferPoolManager>,
-        wal: Arc<Mutex<crate::wal::Wal>>,
-        root: PageId,
-    ) -> Self {
+    fn from_root(pool: Arc<BufferPoolManager>, wal: Arc<crate::wal::Wal>, root: PageId) -> Self {
         Self {
             pool,
             wal,
@@ -279,7 +275,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                     // commit, never fsynced at insert time. Stamp the record's LSN as the
                     // page LSN so the gate flushes the WAL through it before the page lands.
                     let val_bytes = V::as_bytes(value);
-                    let lsn = self.wal.lock().unwrap().log_insert(
+                    let lsn = self.wal.log_insert(
                         txn.txn_id,
                         page_id,
                         slot as u16,
@@ -373,12 +369,9 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
 
             // Set xmax to mark this version as deleted by our transaction.
             let page_id = leaf_guard.page_id;
-            let lsn = self.wal.lock().unwrap().log_set_xmax(
-                txn.txn_id,
-                page_id,
-                visible_slot as u16,
-                txn.txn_id,
-            )?;
+            let lsn =
+                self.wal
+                    .log_set_xmax(txn.txn_id, page_id, visible_slot as u16, txn.txn_id)?;
             LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmax(visible_slot, txn.txn_id);
             LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
             return Ok(());
@@ -487,12 +480,9 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
 
             // ── ATOMIC: set xmax on old + insert new (same latch) ────────────
             let page_id = leaf_guard.page_id;
-            let _lsn_xmax = self.wal.lock().unwrap().log_set_xmax(
-                txn.txn_id,
-                page_id,
-                visible_slot as u16,
-                txn.txn_id,
-            )?;
+            let _lsn_xmax =
+                self.wal
+                    .log_set_xmax(txn.txn_id, page_id, visible_slot as u16, txn.txn_id)?;
             LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmax(visible_slot, txn.txn_id);
             // Find insert position for the new version.
             let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
@@ -502,7 +492,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             // If the new version fits in place, insert() cannot fail — so we can
             // log to the WAL *before* dirtying the page (WAL-before-page).
             if acc.can_fit_direct(key_len, val_bytes.as_ref().len()) {
-                let lsn = self.wal.lock().unwrap().log_insert(
+                let lsn = self.wal.log_insert(
                     txn.txn_id,
                     page_id,
                     slot as u16,
@@ -1202,17 +1192,17 @@ mod tests {
     use std::mem::forget;
     use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, OnceLock};
     use tempfile::tempdir;
 
     /// Open a throwaway WAL under `dir`. The index and pool must share one WAL,
     /// so callers build it once here and clone the `Arc` to both.
-    fn make_wal(dir: &Path) -> Arc<Mutex<Wal>> {
-        Arc::new(Mutex::new(Wal::new(dir.join("wal.log")).unwrap()))
+    fn make_wal(dir: &Path) -> Arc<Wal> {
+        Arc::new(Wal::new(dir.join("wal.log")).unwrap())
     }
 
     /// Wrap `disk` in a pool backed by `wal` (required for WAL-before-page).
-    fn make_pool(disk: Arc<DiskManager>, wal: Arc<Mutex<Wal>>) -> Arc<BufferPoolManager> {
+    fn make_pool(disk: Arc<DiskManager>, wal: Arc<Wal>) -> Arc<BufferPoolManager> {
         Arc::new(BufferPoolManager::new(disk, wal))
     }
 
@@ -1734,16 +1724,12 @@ mod tests {
             BTreeIndex::<&'static [u8], &'static [u8]>::create(pool.clone(), wal.clone()).unwrap();
 
         // `create` logs nothing, so the LSN counter starts at 0.
-        assert_eq!(wal.lock().unwrap().next_lsn, 0);
+        assert_eq!(wal.next_lsn(), 0);
 
         // Two in-place inserts on the same leaf → two Insert records (LSN 0, 1).
         index.insert(&(&b"a"[..]), &(&b"1"[..]), &auto()).unwrap();
         index.insert(&(&b"b"[..]), &(&b"2"[..]), &auto()).unwrap();
-        assert_eq!(
-            wal.lock().unwrap().next_lsn,
-            2,
-            "each insert appends a record"
-        );
+        assert_eq!(wal.next_lsn(), 2, "each insert appends a record");
 
         // The leaf page must carry the latest insert's LSN (set_lsn under the latch).
         let leaf = pool.fetch_page(root).unwrap();
@@ -1753,11 +1739,7 @@ mod tests {
         // Flushing the dirty leaf must drive the WAL durable through that page LSN
         // (the WAL-before-page gate firing on a real, non-zero LSN).
         pool.flush_all_pages().unwrap();
-        assert_eq!(
-            wal.lock().unwrap().flushed_lsn,
-            Some(1),
-            "gate flushed WAL to page LSN"
-        );
+        assert_eq!(wal.flushed_lsn(), Some(1), "gate flushed WAL to page LSN");
     }
 
     #[test]
@@ -1775,13 +1757,10 @@ mod tests {
         let val: &[u8] = b"1";
         index.insert(&key, &val, &auto()).unwrap();
 
-        let n = wal.lock().unwrap().next_lsn;
+        let n = wal.next_lsn();
         assert_eq!(n, 1);
         index.delete(&key, &txn).unwrap();
-        assert!(
-            wal.lock().unwrap().next_lsn == n + 1,
-            "delete appends one record"
-        );
+        assert!(wal.next_lsn() == n + 1, "delete appends one record");
 
         // The leaf page must carry the latest delete's LSN (set_lsn under the latch).
         let leaf = pool.fetch_page(root).unwrap();
@@ -1819,14 +1798,11 @@ mod tests {
         let new_val: &[u8] = b"2";
         index.insert(&key, &val, &auto()).unwrap();
 
-        let n = wal.lock().unwrap().next_lsn;
+        let n = wal.next_lsn();
         assert_eq!(n, 1);
 
         index.update(&key, &new_val, &txn).unwrap();
-        assert!(
-            wal.lock().unwrap().next_lsn == n + 2,
-            "update appends two records"
-        );
+        assert!(wal.next_lsn() == n + 2, "update appends two records");
 
         // The leaf page must carry the latest delete's LSN (set_lsn under the latch).
         let leaf = pool.fetch_page(root).unwrap();
