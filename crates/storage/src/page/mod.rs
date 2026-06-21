@@ -36,9 +36,31 @@ pub const PAGE_SIZE: usize = 4096;
 // ── Shared header offsets (present in both page types) ───────────────────────
 
 pub(super) const OFF_PAGE_TYPE: usize = 0; // u8
-// Byte 1 is reserved (was `flags`, never used).
+pub(super) const OFF_FLAGS: usize = 1; // u8 — page-header flag bits
 pub(super) const OFF_PAGE_ID: usize = 8; // u64
 pub(super) const OFF_LSN: usize = 16; // u64
+
+/// Page split but its parent lacks the downlink yet (cleared on InsertDownlink).
+pub const FLAG_INCOMPLETE_SPLIT: u8 = 0b0000_0001;
+
+/// Stamp the LSN of the last WAL record that touched the page (any page type).
+pub fn set_lsn(page: &mut [u8], lsn: u64) {
+    write_u64(page, OFF_LSN, lsn);
+}
+
+pub fn is_incomplete_split(page: &[u8]) -> bool {
+    read_u8(page, OFF_FLAGS) & FLAG_INCOMPLETE_SPLIT != 0
+}
+
+pub fn set_incomplete_split(page: &mut [u8]) {
+    let f = read_u8(page, OFF_FLAGS) | FLAG_INCOMPLETE_SPLIT;
+    write_u8(page, OFF_FLAGS, f);
+}
+
+pub fn clear_incomplete_split(page: &mut [u8]) {
+    let f = read_u8(page, OFF_FLAGS) & !FLAG_INCOMPLETE_SPLIT;
+    write_u8(page, OFF_FLAGS, f);
+}
 
 const CHECKSUM_LEN: usize = 4;
 /// Checksum offset for a leaf page .

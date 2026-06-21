@@ -17,12 +17,15 @@ use db_core::transaction_manager::TransactionManager;
 use crate::buffer_pool::{BufferPoolManager, PageReadGuard, PageWriteGuard};
 use crate::page::{
     INTERNAL, InternalPageAccessor, InternalPageBuilder, InternalPageMutator, LEAF,
-    LeafPageAccessor, LeafPageBuilder, LeafPageMutator, PageId,
+    LeafPageAccessor, LeafPageBuilder, LeafPageMutator, PAGE_SIZE, PageId,
 };
 use common::IndexError;
 use db_core::transaction::Transaction;
 
 pub type Result<T> = std::result::Result<T, IndexError>;
+
+/// Sentinel `txn_id` for structural/maintenance records — owned by no txn.
+const SYSTEM_TXN_ID: u64 = 0;
 
 // ── SplitResult ───────────────────────────────────────────────────────────────
 
@@ -203,6 +206,15 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         // ── Phase 1: Optimistic descent (shared latches only) ────────────
         let leaf_pid = loop {
             let page = self.pool.fetch_page(pid)?;
+            // Lazily finish a split left incomplete (crash window / concurrent
+            // split), then restart from the root.
+            if crate::page::is_incomplete_split(&page[..]) {
+                drop(page);
+                self.finish_split(pid, &stack)?;
+                stack.clear();
+                pid = *self.root.lock().unwrap();
+                continue;
+            }
             match page[0] {
                 INTERNAL => {
                     let acc = InternalPageAccessor::<K>::new(&page[..]);
@@ -290,8 +302,6 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                     LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
                     Ok(())
                 }
-                // TODO(WAL): the split path is not logged yet — it needs LeafSplit (FPI)
-                // records before an insert that triggers a split is recoverable.
                 Err(_) => self.split_and_insert(leaf_guard, key, value, txn, &mut stack),
             };
         }
@@ -519,8 +529,6 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             }
 
             // Doesn't fit → split.
-            // TODO(WAL): the split path is not logged yet — it needs LeafSplit (FPI)
-            // records before an insert that triggers a split is recoverable.
             return self.split_and_insert(leaf_guard, key, value, txn, &mut stack);
         }
     }
@@ -826,11 +834,16 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             &txn.tm,
         );
 
-        // TODO(WAL): Log PageCompact FPI record and stamp new LSN here (design doc 32 step 3)
-        //   let lsn = self.wal.append(PageCompact { leaf_pid, fpi })?;
-        //   LeafPageMutator::new(&mut leaf_guard[..]).set_lsn(lsn);
-
+        // PageCompact FPI — only when compaction actually repacked the page.
         if dead_count > 0 {
+            let fpi = <&[u8; PAGE_SIZE]>::try_from(&leaf_guard[..]).unwrap();
+            let lsn = self
+                .wal
+                .lock()
+                .unwrap()
+                .log_page_compact(SYSTEM_TXN_ID, leaf_pid_actual, fpi)?;
+            LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
+
             let key_bytes = K::as_bytes(key);
             let val_bytes = V::as_bytes(value);
             let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
@@ -838,12 +851,20 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             if acc.can_fit_direct(key_bytes.as_ref().len(), val_bytes.as_ref().len()) {
                 let (slot, _) = acc.position(key);
 
-                // Single mutator for insert + set_xmin
                 let mut mutator = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]);
                 mutator.insert(slot, key, value)?;
                 mutator.set_xmin(slot, txn.txn_id);
 
-                // Compact avoided the split - done
+                // Insert logged separately under the real txn; compact avoided the split.
+                let lsn = self.wal.lock().unwrap().log_insert(
+                    txn.txn_id,
+                    leaf_pid_actual,
+                    slot as u16,
+                    key_bytes.as_ref(),
+                    val_bytes.as_ref(),
+                    txn.txn_id,
+                )?;
+                LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
                 return Ok(());
             }
         }
@@ -858,12 +879,25 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 leaf_pid_actual
             };
 
-        // Optimize existing split path (reuse mutator)
+        // Insert the new tuple into its target half and log it under the real txn.
+        let val_bytes = V::as_bytes(value);
         if target_pid == leaf_pid_actual {
             let (s, _) = LeafPageAccessor::<K, V>::new(&leaf_guard[..]).position(key);
             let mut mutator = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]);
             mutator.insert(s, key, value)?;
             mutator.set_xmin(s, txn.txn_id);
+            let lsn = self.wal.lock().unwrap().log_insert(
+                txn.txn_id,
+                leaf_pid_actual,
+                s as u16,
+                key_bytes.as_ref(),
+                val_bytes.as_ref(),
+                txn.txn_id,
+            )?;
+            LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
+            // Release before propagation so the downlink step can latch the leaf
+            // to clear its flag (no descendant latch held across the ancestor walk).
+            drop(leaf_guard);
         } else {
             drop(leaf_guard);
             let mut right = self.pool.fetch_page_mut(target_pid)?;
@@ -871,9 +905,18 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             let mut mutator = LeafPageMutator::<K, V>::new(&mut right[..]);
             mutator.insert(s, key, value)?;
             mutator.set_xmin(s, txn.txn_id);
+            let lsn = self.wal.lock().unwrap().log_insert(
+                txn.txn_id,
+                target_pid,
+                s as u16,
+                key_bytes.as_ref(),
+                val_bytes.as_ref(),
+                txn.txn_id,
+            )?;
+            LeafPageMutator::<K, V>::new(&mut right[..]).set_lsn(lsn);
         }
 
-        self.insert_separator_via_stack(stack, split.separator_key, split.new_page_id)
+        self.insert_separator_via_stack(stack, split.separator_key, split.new_page_id, leaf_pid_actual)
     }
 
     fn split_leaf_ly(
@@ -955,15 +998,19 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             builder.finish();
         }
 
-        drop(right_guard);
-        if let Some(old_right_pid) = old_rightlink {
-            let mut old_right = self.pool.fetch_page_mut(old_right_pid)?;
-            LeafPageMutator::<K, V>::new(&mut old_right[..]).set_prev_page(Some(right_pid));
-        }
+        // Fix the old neighbour's back-link; held until logging so its post-fix
+        // image lands in the LeafSplit FPI set.
+        let mut old_right_guard = match old_rightlink {
+            Some(old_right_pid) => {
+                let mut g = self.pool.fetch_page_mut(old_right_pid)?;
+                LeafPageMutator::<K, V>::new(&mut g[..]).set_prev_page(Some(right_pid));
+                Some(g)
+            }
+            None => None,
+        };
 
         // Rebuild left page from scratch (high_key changes slot base).
         {
-            let lsn = LeafPageAccessor::<K, V>::new(&leaf_guard[..]).lsn();
             let prev = LeafPageAccessor::<K, V>::new(&leaf_guard[..]).prev_page();
             let mut builder = LeafPageBuilder::<K, V>::new(leaf_pid, &mut leaf_guard[..]);
             builder.set_high_key(&separator_key);
@@ -972,9 +1019,31 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             for (k, v, xmin, xmax) in &left_entries {
                 builder.push_with_mvcc(&K::from_bytes(k), &V::from_bytes(v), *xmin, *xmax);
             }
-            let mut m = builder.finish();
-            m.set_lsn(lsn);
+            builder.finish();
         }
+
+        // INCOMPLETE_SPLIT until the downlink lands; captured in the left FPI.
+        crate::page::set_incomplete_split(&mut leaf_guard[..]);
+
+        // Atomic LeafSplit FPI set; stamp the record LSN on every touched page.
+        let left_fpi = <&[u8; PAGE_SIZE]>::try_from(&leaf_guard[..]).unwrap();
+        let right_fpi = <&[u8; PAGE_SIZE]>::try_from(&right_guard[..]).unwrap();
+        let neigh = old_right_guard
+            .as_ref()
+            .map(|g| (g.page_id, <&[u8; PAGE_SIZE]>::try_from(&g[..]).unwrap()));
+        let lsn = self.wal.lock().unwrap().log_leaf_split(
+            SYSTEM_TXN_ID,
+            (leaf_pid, left_fpi),
+            (right_pid, right_fpi),
+            neigh,
+        )?;
+        LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
+        LeafPageMutator::<K, V>::new(&mut right_guard[..]).set_lsn(lsn);
+        if let Some(g) = old_right_guard.as_mut() {
+            LeafPageMutator::<K, V>::new(&mut g[..]).set_lsn(lsn);
+        }
+        drop(right_guard);
+        drop(old_right_guard);
 
         Ok(SplitResult {
             separator_key,
@@ -982,33 +1051,59 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         })
     }
 
+    /// Insert the downlink `(sep_key, right_pid)` into the parent of `left_child`
+    /// (the page that split) and clear `left_child`'s INCOMPLETE_SPLIT flag.
+    /// Idempotent: a downlink already present (concurrent completion / redo) is a
+    /// no-op that still clears the flag.
     fn insert_separator_via_stack(
         &self,
         stack: &mut BTStack,
         mut sep_key: Vec<u8>,
         mut right_pid: PageId,
+        mut left_child: PageId,
     ) -> Result<()> {
         loop {
             if stack.is_empty() {
-                let old_root_pid = *self.root.lock().unwrap();
+                // The splitting page is the root unless one was created concurrently.
+                if *self.root.lock().unwrap() != left_child {
+                    crate::page::clear_incomplete_split(
+                        &mut self.pool.fetch_page_mut(left_child)?[..],
+                    );
+                    return Ok(());
+                }
                 let mut new_root_guard = self.pool.new_page()?;
                 let new_root_pid = new_root_guard.page_id;
 
                 let mut builder =
                     InternalPageBuilder::<K>::new(new_root_pid, &mut new_root_guard[..]);
-                builder.push_first_child(old_root_pid);
+                builder.push_first_child(left_child);
                 builder.push_key_and_right_child(&K::from_bytes(&sep_key), right_pid);
                 builder.finish();
+
+                // Point page 0 at the new root in memory.
+                let mut meta_guard = self.pool.fetch_page_mut(0)?;
+                crate::page::meta::set_root(&mut meta_guard[..], new_root_pid);
+
+                // NewRoot: new-root FPI + page-0 pointer in one atomic record.
+                let new_root_fpi = <&[u8; PAGE_SIZE]>::try_from(&new_root_guard[..]).unwrap();
+                let lsn = self
+                    .wal
+                    .lock()
+                    .unwrap()
+                    .log_new_root(SYSTEM_TXN_ID, (new_root_pid, new_root_fpi))?;
+                InternalPageMutator::<K>::new(&mut new_root_guard[..]).set_lsn(lsn);
+                crate::page::meta::set_lsn(&mut meta_guard[..], lsn);
                 drop(new_root_guard);
+                drop(meta_guard);
+
+                // Old root's split is now linked via the new root — clear its flag.
+                {
+                    let mut old = self.pool.fetch_page_mut(left_child)?;
+                    crate::page::clear_incomplete_split(&mut old[..]);
+                    crate::page::set_lsn(&mut old[..], lsn);
+                }
 
                 *self.root.lock().unwrap() = new_root_pid;
-                // updating new root in metadata page
-                {
-                    let mut meta = self.pool.fetch_page_mut(0)?;
-                    //TODO: Integrate this with WAL later
-                    crate::page::meta::set_root(&mut meta[..], new_root_pid);
-                } // drops the meta guard before flush_page(0)
-                self.pool.flush_page(0)?;
                 return Ok(());
             }
 
@@ -1030,22 +1125,83 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 break;
             }
 
+            // insert-if-absent: skip if the downlink is already present.
+            let already = {
+                let acc = InternalPageAccessor::<K>::new(&parent_guard[..]);
+                let n = acc.num_keys() as usize;
+                (0..=n).any(|i| acc.child_page_at(i) == right_pid)
+            };
+            if already {
+                drop(parent_guard);
+                crate::page::clear_incomplete_split(
+                    &mut self.pool.fetch_page_mut(left_child)?[..],
+                );
+                return Ok(());
+            }
+
             let acc = InternalPageAccessor::<K>::new(&parent_guard[..]);
+            let (idx, _) = acc.find_child(&K::from_bytes(&sep_key));
             if acc.can_fit(sep_key.len()) {
-                let (idx, _) = acc.find_child(&K::from_bytes(&sep_key));
                 InternalPageMutator::<K>::new(&mut parent_guard[..]).insert_key_and_right_child(
                     idx,
                     &K::from_bytes(&sep_key),
                     right_pid,
                 )?;
+                let lsn = self.wal.lock().unwrap().log_insert_downlink(
+                    SYSTEM_TXN_ID,
+                    parent_pid,
+                    idx as u16,
+                    &sep_key,
+                    right_pid,
+                    left_child,
+                )?;
+                InternalPageMutator::<K>::new(&mut parent_guard[..]).set_lsn(lsn);
+                // Clear the child's flag — logged via the InsertDownlink child block.
+                let mut child = self.pool.fetch_page_mut(left_child)?;
+                crate::page::clear_incomplete_split(&mut child[..]);
+                crate::page::set_lsn(&mut child[..], lsn);
                 return Ok(());
             }
 
+            // Parent splits: split_internal_ly fuses in the downlink. Clear the
+            // child's flag in memory (self-heals on redo until that path logs it).
             let parent_split = self.split_internal_ly(&mut parent_guard, &sep_key, right_pid)?;
             drop(parent_guard);
+            crate::page::clear_incomplete_split(&mut self.pool.fetch_page_mut(left_child)?[..]);
 
             sep_key = parent_split.separator_key;
             right_pid = parent_split.new_page_id;
+            left_child = parent_pid;
+        }
+    }
+
+    /// Complete an incomplete split lazily: insert the missing downlink for
+    /// `child_pid` (insert-if-absent) and clear its flag. Re-checks under a write
+    /// latch so a racing completer / already-finished split is a no-op.
+    fn finish_split(&self, child_pid: PageId, stack: &BTStack) -> Result<()> {
+        let mut guard = self.pool.fetch_page_mut(child_pid)?;
+        if !crate::page::is_incomplete_split(&guard[..]) {
+            return Ok(());
+        }
+        // separator = the page's high key; right sibling = its rightlink.
+        let (sep_key, right_pid) = match guard[0] {
+            LEAF => {
+                let acc = LeafPageAccessor::<K, V>::new(&guard[..]);
+                (acc.high_key_bytes().map(|b| b.to_vec()), acc.rightlink())
+            }
+            INTERNAL => {
+                let acc = InternalPageAccessor::<K>::new(&guard[..]);
+                (acc.high_key_bytes().map(|b| b.to_vec()), acc.rightlink())
+            }
+            _ => return Ok(()),
+        };
+        if let (Some(sep_key), Some(right_pid)) = (sep_key, right_pid) {
+            drop(guard);
+            self.insert_separator_via_stack(&mut stack.clone(), sep_key, right_pid, child_pid)
+        } else {
+            // Spurious flag (no right sibling) — clear it so descent can proceed.
+            crate::page::clear_incomplete_split(&mut guard[..]);
+            Ok(())
         }
     }
 
@@ -1101,10 +1257,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             }
             builder.finish();
         }
-        drop(right_guard);
-
         {
-            let lsn = InternalPageAccessor::<K>::new(&guard[..]).lsn();
             let mut builder = InternalPageBuilder::<K>::new(internal_pid, &mut guard[..]);
             builder.set_rightlink(Some(right_pid));
             builder.set_high_key(&push_up_key);
@@ -1112,9 +1265,23 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             for i in 0..mid {
                 builder.push_key_and_right_child(&K::from_bytes(&keys[i]), children[i + 1]);
             }
-            let mut m = builder.finish();
-            m.set_lsn(lsn);
+            builder.finish();
         }
+
+        // INCOMPLETE_SPLIT until the downlink lands; captured in the left FPI.
+        crate::page::set_incomplete_split(&mut guard[..]);
+
+        // Atomic InternalSplit FPI set — left + new right.
+        let left_fpi = <&[u8; PAGE_SIZE]>::try_from(&guard[..]).unwrap();
+        let right_fpi = <&[u8; PAGE_SIZE]>::try_from(&right_guard[..]).unwrap();
+        let lsn = self.wal.lock().unwrap().log_internal_split(
+            SYSTEM_TXN_ID,
+            (internal_pid, left_fpi),
+            (right_pid, right_fpi),
+        )?;
+        InternalPageMutator::<K>::new(&mut guard[..]).set_lsn(lsn);
+        InternalPageMutator::<K>::new(&mut right_guard[..]).set_lsn(lsn);
+        drop(right_guard);
 
         Ok(SplitResult {
             separator_key: push_up_key,
@@ -1437,6 +1604,61 @@ mod tests {
                 .unwrap()
                 .unwrap_or_else(|| panic!("key {} missing", i));
             assert_eq!(got, k.as_ref());
+        }
+    }
+
+    #[test]
+    fn descent_finishes_incomplete_split() {
+        let idx = make_index();
+        // Build a multi-level tree with gaps (even keys) so an odd key routes
+        // into an existing leaf.
+        for i in (0u32..2000).step_by(2) {
+            let k = i.to_be_bytes();
+            idx.insert(&(k.as_ref()), &(k.as_ref()), &auto()).unwrap();
+        }
+
+        // Leftmost leaf — it has split, so it carries a rightlink + high key.
+        let mut pid = idx.root_page_id();
+        let leftmost = loop {
+            let page = idx.pool.fetch_page(pid).unwrap();
+            if page[0] == LEAF {
+                break pid;
+            }
+            let child = InternalPageAccessor::<&[u8]>::new(&page[..]).child_page_at(0);
+            drop(page);
+            pid = child;
+        };
+        assert!(
+            LeafPageAccessor::<&[u8], &[u8]>::new(&idx.pool.fetch_page(leftmost).unwrap()[..])
+                .rightlink()
+                .is_some(),
+            "test needs a split tree",
+        );
+
+        // Simulate a recovered/raced incomplete split: flag set, downlink present.
+        crate::page::set_incomplete_split(&mut idx.pool.fetch_page_mut(leftmost).unwrap()[..]);
+        assert!(crate::page::is_incomplete_split(
+            &idx.pool.fetch_page(leftmost).unwrap()[..]
+        ));
+
+        // An insert that descends through the leaf must finish the split.
+        let k1 = 1u32.to_be_bytes();
+        idx.insert(&(k1.as_ref()), &(k1.as_ref()), &auto()).unwrap();
+
+        assert!(
+            !crate::page::is_incomplete_split(&idx.pool.fetch_page(leftmost).unwrap()[..]),
+            "descent should have cleared the flag",
+        );
+
+        // No duplicate downlink, no lost data.
+        assert_eq!(idx.get(&(k1.as_ref()), &auto()).unwrap().unwrap(), k1.as_ref());
+        for i in (0u32..2000).step_by(2) {
+            let k = i.to_be_bytes();
+            assert!(
+                idx.get(&(k.as_ref()), &auto()).unwrap().is_some(),
+                "key {} missing",
+                i
+            );
         }
     }
 

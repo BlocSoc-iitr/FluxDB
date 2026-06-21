@@ -511,7 +511,7 @@ impl Wal {
         parent_payload.extend_from_slice(&at_index.to_le_bytes());
         parent_payload.extend_from_slice(&(sep_key.len() as u16).to_le_bytes());
         parent_payload.extend_from_slice(&right_child.to_le_bytes());
-        parent_payload.extend_from_slice(&sep_key[..]);
+        parent_payload.extend_from_slice(sep_key);
         let parent_block = Block {
             page_id: parent_page,
             blk_flags: BLK_HAS_DATA,
@@ -552,10 +552,6 @@ impl Wal {
         self.append(WalRecordType::NewRoot, txn_id, &blocks, None)
     }
 
-    /// Logs an in-place leaf compaction (dead-tuple repack). The whole rebuilt
-    /// leaf is captured as a full-page image, since the repack depends on live
-    /// transaction state and rewrites the page wholesale — redo just stamps the
-    /// image down.
     pub fn log_page_compact(
         &mut self,
         txn_id: u64,
