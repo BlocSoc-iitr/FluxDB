@@ -48,7 +48,7 @@ where
         let disk_manager = Arc::new(DiskManager::new(path.join("data.db"), PAGE_SIZE)?);
         // initialize wal;
         // Arc is needed on WAL as both index and buffer_pool will later have a wal instance.
-        let wal = Arc::new(Wal::new(path.join("wal.log"))?);
+        let wal = Arc::new(Wal::new(path.join("wal"))?);
         let buffer_pool = Arc::new(BufferPoolManager::new(
             Arc::clone(&disk_manager),
             Arc::clone(&wal),
@@ -81,7 +81,7 @@ where
         let disk_manager = Arc::new(DiskManager::new(path.join("data.db"), PAGE_SIZE)?);
         // Wal::new opens the existing log (and creates it if a pre-WAL database
         // never had one) — the tail scan / LSN resume lands with the log manager work
-        let wal = Arc::new(Wal::new(path.join("wal.log"))?);
+        let wal = Arc::new(Wal::new(path.join("wal"))?);
         let buffer_pool = Arc::new(BufferPoolManager::new(
             Arc::clone(&disk_manager),
             Arc::clone(&wal),

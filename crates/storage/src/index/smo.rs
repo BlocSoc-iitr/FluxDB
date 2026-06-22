@@ -31,9 +31,9 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         // PageCompact FPI — only when compaction actually repacked the page.
         if dead_count > 0 {
             let fpi = <&[u8; PAGE_SIZE]>::try_from(&leaf_guard[..]).unwrap();
-                let lsn = self
-                    .wal
-                    .log_page_compact(SYSTEM_TXN_ID, leaf_pid_actual, fpi)?;
+            let lsn = self
+                .wal
+                .log_page_compact(SYSTEM_TXN_ID, leaf_pid_actual, fpi)?;
             LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
 
             let key_bytes = K::as_bytes(key);

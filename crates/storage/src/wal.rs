@@ -39,7 +39,7 @@
 
 use crc32fast::Hasher;
 use std::collections::VecDeque;
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, create_dir_all, metadata, read_dir};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -305,18 +305,6 @@ impl WalBuffer {
     }
 }
 
-fn wal_layout_from_path(path: &Path, segment_size: u64) -> WalLayout {
-    let dir = if path.extension().is_some() {
-        path.parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf()
-    } else {
-        path.to_path_buf()
-    };
-
-    WalLayout { dir, segment_size }
-}
-
 fn segment_file_name(index: u64) -> String {
     format!("{WAL_SEGMENT_PREFIX}{index:05}{WAL_SEGMENT_SUFFIX}")
 }
@@ -334,7 +322,7 @@ fn parse_segment_index(path: &Path) -> Option<u64> {
 }
 
 fn list_segments(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
-    match std::fs::read_dir(dir) {
+    match read_dir(dir) {
         Ok(entries) => {
             let mut segments = Vec::new();
             for entry in entries {
@@ -352,28 +340,18 @@ fn list_segments(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
 }
 
 fn wal_iterator_segments(path: &Path) -> io::Result<Vec<PathBuf>> {
-    if path.is_dir() {
-        return Ok(list_segments(path)?
-            .into_iter()
-            .map(|(_, path)| path)
-            .collect());
-    }
-
-    let layout = wal_layout_from_path(path, WAL_SEGMENT_SIZE);
-    let segments = list_segments(&layout.dir)?;
-    if segments.is_empty() && path.is_file() && parse_segment_index(path).is_none() {
-        Ok(vec![path.to_path_buf()])
-    } else {
-        Ok(segments.into_iter().map(|(_, path)| path).collect())
-    }
+    Ok(list_segments(path)?
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect())
 }
 
 impl SegmentWriter {
     fn open(layout: WalLayout) -> Result<Self> {
-        std::fs::create_dir_all(&layout.dir).map_err(WalError::Io)?;
+        create_dir_all(&layout.dir).map_err(WalError::Io)?;
         let segments = list_segments(&layout.dir).map_err(WalError::Io)?;
         let (mut segment_index, mut offset) = match segments.last() {
-            Some((index, path)) => (*index, std::fs::metadata(path).map_err(WalError::Io)?.len()),
+            Some((index, path)) => (*index, metadata(path).map_err(WalError::Io)?.len()),
             None => (1, 0),
         };
 
@@ -686,9 +664,9 @@ impl WalIterator {
 }
 
 impl Wal {
-    /// Opens an existing WAL file for appending, or creates a new one if it does not exist.
+    /// Opens an existing WAL directory for appending, or creates it if needed.
     ///
-    /// Upon opening an existing file, this method scans the entire log to find the maximum
+    /// Upon opening an existing directory, this method scans every segment to find the maximum
     /// LSN and handles any torn-tail corruption by truncating the file to the last valid
     /// record boundary. If mid-log corruption is detected, an error is returned.
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
@@ -704,20 +682,19 @@ impl Wal {
         buffer_capacity: usize,
         segment_size: u64,
     ) -> Result<Self> {
-        let path = path.as_ref();
-        let layout = wal_layout_from_path(path, segment_size);
-        std::fs::create_dir_all(&layout.dir).map_err(WalError::Io)?;
+        let layout = WalLayout {
+            dir: path.as_ref().to_path_buf(),
+            segment_size,
+        };
+        create_dir_all(&layout.dir).map_err(WalError::Io)?;
 
         let mut next_lsn = 0;
         let mut flushed_lsn = None;
-        let mut segments = list_segments(&layout.dir).map_err(WalError::Io)?;
-        if segments.is_empty() && path.is_file() && parse_segment_index(path).is_none() {
-            segments.push((0, path.to_path_buf()));
-        }
+        let segments = list_segments(&layout.dir).map_err(WalError::Io)?;
 
         let last_segment_idx = segments.len().saturating_sub(1);
         for (idx, (_segment_index, segment_path)) in segments.iter().enumerate() {
-            let file_len = std::fs::metadata(segment_path).map_err(WalError::Io)?.len();
+            let file_len = metadata(segment_path).map_err(WalError::Io)?.len();
             let mut iter = WalIterator {
                 reader: WalReader {
                     segments: vec![segment_path.clone()],
@@ -937,11 +914,7 @@ impl Wal {
         blocks.push(child_block);
         self.append(WalRecordType::InsertDownLink, txn_id, &blocks, None)
     }
-    pub fn log_new_root(
-        &self,
-        txn_id: u64,
-        new_root: (PageId, &[u8; PAGE_SIZE]),
-    ) -> Result<Lsn> {
+    pub fn log_new_root(&self, txn_id: u64, new_root: (PageId, &[u8; PAGE_SIZE])) -> Result<Lsn> {
         let mut blocks = Vec::with_capacity(2);
         let new_root_block = Block {
             page_id: new_root.0,
@@ -1154,9 +1127,9 @@ mod tests {
     #[test]
     fn test_wal_roundtrip() -> Result<()> {
         let dir = tempdir().map_err(|e| WalError::Io(e))?;
-        let wal_path = dir.path().join("test.wal");
+        let wal_dir = dir.path().join("test-wal");
 
-        let wal = Wal::new(&wal_path)?;
+        let wal = Wal::new(&wal_dir)?;
 
         let block1 = Block {
             page_id: 100,
@@ -1184,7 +1157,7 @@ mod tests {
 
         wal.flush_up_to(2)?;
 
-        let mut iter = WalIterator::new(&wal_path).map_err(|e| WalError::Io(e))?;
+        let mut iter = WalIterator::new(&wal_dir).map_err(|e| WalError::Io(e))?;
 
         {
             let entry1 = iter.next_record().unwrap()?;
@@ -1215,10 +1188,10 @@ mod tests {
     #[test]
     fn test_wal_recovery_clean() -> Result<()> {
         let dir = tempdir().map_err(|e| WalError::Io(e))?;
-        let wal_path = dir.path().join("clean.wal");
+        let wal_dir = dir.path().join("clean-wal");
 
         {
-            let wal = Wal::new(&wal_path)?;
+            let wal = Wal::new(&wal_dir)?;
             let block1 = Block {
                 page_id: 100,
                 blk_flags: 2,
@@ -1236,7 +1209,7 @@ mod tests {
             wal.flush_up_to(1)?;
         }
 
-        let wal = Wal::new(&wal_path)?;
+        let wal = Wal::new(&wal_dir)?;
         assert_eq!(wal.next_lsn(), 2);
         Ok(())
     }
@@ -1244,9 +1217,9 @@ mod tests {
     #[test]
     fn test_flush_tracks_requested_lsn_and_noops_when_durable() -> Result<()> {
         let dir = tempdir().map_err(WalError::Io)?;
-        let wal_path = dir.path().join("flush_lsn.wal");
+        let wal_dir = dir.path().join("flush-lsn-wal");
 
-        let wal = Wal::new(&wal_path)?;
+        let wal = Wal::new(&wal_dir)?;
         let first = wal.append(WalRecordType::Insert, 42, &[], None)?;
         let second = wal.append(WalRecordType::Commit, 42, &[], None)?;
 
@@ -1269,9 +1242,9 @@ mod tests {
     #[test]
     fn test_circular_buffer_wraparound_preserves_record_order() -> Result<()> {
         let dir = tempdir().map_err(WalError::Io)?;
-        let wal_path = dir.path().join("wraparound.wal");
+        let wal_dir = dir.path().join("wraparound-wal");
 
-        let wal = Wal::new_with_buffer_capacity(&wal_path, 96)?;
+        let wal = Wal::new_with_buffer_capacity(&wal_dir, 96)?;
 
         for txn_id in 0..3 {
             wal.append(WalRecordType::Commit, txn_id, &[], None)?;
@@ -1283,7 +1256,7 @@ mod tests {
         }
         wal.flush_up_to(4)?;
 
-        let mut iter = WalIterator::new(&wal_path).map_err(WalError::Io)?;
+        let mut iter = WalIterator::new(&wal_dir).map_err(WalError::Io)?;
         for expected in 0..5 {
             let record = iter.next_record().unwrap()?;
             assert_eq!(record.lsn, expected);
@@ -1297,9 +1270,9 @@ mod tests {
     #[test]
     fn test_circular_buffer_append_error_does_not_consume_lsn() -> Result<()> {
         let dir = tempdir().map_err(WalError::Io)?;
-        let wal_path = dir.path().join("too_small.wal");
+        let wal_dir = dir.path().join("too-small-wal");
 
-        let wal = Wal::new_with_buffer_capacity(&wal_path, 27)?;
+        let wal = Wal::new_with_buffer_capacity(&wal_dir, 27)?;
         let result = wal.append(WalRecordType::Commit, 1, &[], None);
 
         assert!(matches!(
@@ -1318,8 +1291,8 @@ mod tests {
     #[test]
     fn test_background_flush_wakes_multiple_waiters() -> Result<()> {
         let dir = tempdir().map_err(WalError::Io)?;
-        let wal_path = dir.path().join("group_commit.wal");
-        let wal = Arc::new(Wal::new(&wal_path)?);
+        let wal_dir = dir.path().join("group-commit-wal");
+        let wal = Arc::new(Wal::new(&wal_dir)?);
 
         let mut handles = Vec::new();
         for txn_id in 0..8 {
@@ -1334,7 +1307,7 @@ mod tests {
 
         assert_eq!(wal.flushed_lsn(), Some(7));
 
-        let mut iter = WalIterator::new(&wal_path).map_err(WalError::Io)?;
+        let mut iter = WalIterator::new(&wal_dir).map_err(WalError::Io)?;
         for expected in 0..8 {
             let record = iter.next_record().unwrap()?;
             assert_eq!(record.lsn, expected);
@@ -1348,8 +1321,8 @@ mod tests {
     #[test]
     fn test_wal_rotates_segments_without_splitting_records() -> Result<()> {
         let dir = tempdir().map_err(WalError::Io)?;
-        let wal_path = dir.path().join("rotating.wal");
-        let wal = Wal::new_with_options(&wal_path, 1024, 64)?;
+        let wal_dir = dir.path().join("rotating-wal");
+        let wal = Wal::new_with_options(&wal_dir, 1024, 64)?;
 
         for txn_id in 0..5 {
             wal.log_commit(txn_id)?;
@@ -1357,13 +1330,13 @@ mod tests {
         wal.flush_up_to(4)?;
         drop(wal);
 
-        let segments = list_segments(dir.path()).map_err(WalError::Io)?;
+        let segments = list_segments(&wal_dir).map_err(WalError::Io)?;
         assert_eq!(segments.len(), 3);
-        assert_eq!(std::fs::metadata(segment_path(dir.path(), 1))?.len(), 56);
-        assert_eq!(std::fs::metadata(segment_path(dir.path(), 2))?.len(), 56);
-        assert_eq!(std::fs::metadata(segment_path(dir.path(), 3))?.len(), 28);
+        assert_eq!(metadata(segment_path(&wal_dir, 1))?.len(), 56);
+        assert_eq!(metadata(segment_path(&wal_dir, 2))?.len(), 56);
+        assert_eq!(metadata(segment_path(&wal_dir, 3))?.len(), 28);
 
-        let mut iter = WalIterator::new(&wal_path).map_err(WalError::Io)?;
+        let mut iter = WalIterator::new(&wal_dir).map_err(WalError::Io)?;
         for expected in 0..5 {
             let record = iter.next_record().unwrap()?;
             assert_eq!(record.lsn, expected);
@@ -1371,7 +1344,7 @@ mod tests {
         }
         assert!(iter.next_record().is_none());
 
-        let reopened = Wal::new_with_options(&wal_path, 1024, 64)?;
+        let reopened = Wal::new_with_options(&wal_dir, 1024, 64)?;
         assert_eq!(reopened.next_lsn(), 5);
 
         Ok(())
@@ -1380,10 +1353,10 @@ mod tests {
     #[test]
     fn test_wal_recovery_torn_tail() -> Result<()> {
         let dir = tempdir().map_err(|e| WalError::Io(e))?;
-        let wal_path = dir.path().join("torntail.wal");
+        let wal_dir = dir.path().join("torntail-wal");
 
         {
-            let wal = Wal::new(&wal_path)?;
+            let wal = Wal::new(&wal_dir)?;
             let block1 = Block {
                 page_id: 100,
                 blk_flags: 2,
@@ -1401,7 +1374,7 @@ mod tests {
             wal.flush_up_to(1)?;
         }
 
-        let first_segment = segment_path(dir.path(), 1);
+        let first_segment = segment_path(&wal_dir, 1);
         let mut file = OpenOptions::new().write(true).open(&first_segment)?;
         let file_len = file.metadata()?.len();
 
@@ -1409,7 +1382,7 @@ mod tests {
         file.write_all(&[0xFF])?;
         file.sync_all()?;
 
-        let wal = Wal::new(&wal_path)?;
+        let wal = Wal::new(&wal_dir)?;
         assert_eq!(wal.next_lsn(), 1);
 
         let new_file_len = file.metadata()?.len();
@@ -1421,10 +1394,10 @@ mod tests {
     #[test]
     fn test_wal_mid_log_corruption() -> Result<()> {
         let dir = tempdir().map_err(|e| WalError::Io(e))?;
-        let wal_path = dir.path().join("midlog.wal");
+        let wal_dir = dir.path().join("midlog-wal");
 
         {
-            let wal = Wal::new(&wal_path)?;
+            let wal = Wal::new(&wal_dir)?;
             let block1 = Block {
                 page_id: 100,
                 blk_flags: 2,
@@ -1442,14 +1415,14 @@ mod tests {
             wal.flush_up_to(1)?;
         }
 
-        let first_segment = segment_path(dir.path(), 1);
+        let first_segment = segment_path(&wal_dir, 1);
         let mut file = OpenOptions::new().write(true).open(&first_segment)?;
 
         file.seek(SeekFrom::Start(40))?;
         file.write_all(&[0xFF])?;
         file.sync_all()?;
 
-        let result = Wal::new(&wal_path);
+        let result = Wal::new(&wal_dir);
         match result {
             Err(WalError::ChecksumMismatch { lsn, .. }) => assert_eq!(lsn, 0),
             Err(e) => panic!("Expected ChecksumMismatch error, got error: {:?}", e),
@@ -1462,10 +1435,10 @@ mod tests {
     #[test]
     fn test_wal_torn_lsn() -> Result<()> {
         let dir = tempdir().map_err(WalError::Io)?;
-        let wal_path = dir.path().join("torn_lsn.wal");
+        let wal_dir = dir.path().join("torn-lsn-wal");
 
         {
-            let wal = Wal::new(&wal_path)?;
+            let wal = Wal::new(&wal_dir)?;
             let block1 = Block {
                 page_id: 100,
                 blk_flags: 2,
@@ -1476,7 +1449,7 @@ mod tests {
             wal.flush_up_to(0)?;
         }
 
-        let first_segment = segment_path(dir.path(), 1);
+        let first_segment = segment_path(&wal_dir, 1);
         let mut file = OpenOptions::new()
             .write(true)
             .append(true)
@@ -1486,11 +1459,9 @@ mod tests {
         file.write_all(&[0xFF, 0xFF, 0xFF, 0xFF])?;
         file.sync_all()?;
 
-        let _ = Wal::new(&wal_path)?;
+        let _ = Wal::new(&wal_dir)?;
 
-        let new_file_len = std::fs::metadata(&first_segment)
-            .map_err(WalError::Io)?
-            .len();
+        let new_file_len = metadata(&first_segment).map_err(WalError::Io)?.len();
         assert_eq!(
             new_file_len, clean_len,
             "Garbage bytes were not truncated! Expected len {}, got {}",

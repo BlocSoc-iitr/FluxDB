@@ -13,7 +13,7 @@ use tempfile::tempdir;
 /// Open a throwaway WAL under `dir`. The index and pool must share one WAL,
 /// so callers build it once here and clone the `Arc` to both.
 fn make_wal(dir: &Path) -> Arc<Wal> {
-    Arc::new(Wal::new(dir.join("wal.log")).unwrap())
+    Arc::new(Wal::new(dir.join("wal")).unwrap())
 }
 
 /// Wrap `disk` in a pool backed by `wal` (required for WAL-before-page).
@@ -602,11 +602,7 @@ fn insert_logs_record_stamps_page_lsn_and_gate_flushes() {
     // Two in-place inserts on the same leaf → two Insert records (LSN 0, 1).
     index.insert(&(&b"a"[..]), &(&b"1"[..]), &auto()).unwrap();
     index.insert(&(&b"b"[..]), &(&b"2"[..]), &auto()).unwrap();
-    assert_eq!(
-        wal.next_lsn(),
-        2,
-        "each insert appends a record"
-    );
+    assert_eq!(wal.next_lsn(), 2, "each insert appends a record");
 
     // The leaf page must carry the latest insert's LSN (set_lsn under the latch).
     let leaf = pool.fetch_page(root).unwrap();
@@ -616,11 +612,7 @@ fn insert_logs_record_stamps_page_lsn_and_gate_flushes() {
     // Flushing the dirty leaf must drive the WAL durable through that page LSN
     // (the WAL-before-page gate firing on a real, non-zero LSN).
     pool.flush_all_pages().unwrap();
-    assert_eq!(
-        wal.flushed_lsn(),
-        Some(1),
-        "gate flushed WAL to page LSN"
-    );
+    assert_eq!(wal.flushed_lsn(), Some(1), "gate flushed WAL to page LSN");
 }
 
 #[test]
@@ -641,10 +633,7 @@ fn delete_emits_one_setxmax() {
     let n = wal.next_lsn();
     assert_eq!(n, 1);
     index.delete(&key, &txn).unwrap();
-    assert!(
-        wal.next_lsn() == n + 1,
-        "delete appends one record"
-    );
+    assert!(wal.next_lsn() == n + 1, "delete appends one record");
 
     // The leaf page must carry the latest delete's LSN (set_lsn under the latch).
     let leaf = pool.fetch_page(root).unwrap();
@@ -654,7 +643,7 @@ fn delete_emits_one_setxmax() {
     // Flushing the dirty leaf must drive the WAL durable through that page LSN
     // (the WAL-before-page gate firing on a real, non-zero LSN).
     pool.flush_all_pages().unwrap();
-    let mut it = WalIterator::new(dir.path().join("wal.log")).unwrap();
+    let mut it = WalIterator::new(dir.path().join("wal")).unwrap();
     it.next_record();
     let rec = it.next_record().unwrap().unwrap();
     assert!(rec.entry_type == WalRecordType::SetXMax);
@@ -686,10 +675,7 @@ fn update_emits_setxmax_then_insert_in_lsn_order() {
     assert_eq!(n, 1);
 
     index.update(&key, &new_val, &txn).unwrap();
-    assert!(
-        wal.next_lsn() == n + 2,
-        "update appends two records"
-    );
+    assert!(wal.next_lsn() == n + 2, "update appends two records");
 
     // The leaf page must carry the latest delete's LSN (set_lsn under the latch).
     let leaf = pool.fetch_page(root).unwrap();
@@ -697,7 +683,7 @@ fn update_emits_setxmax_then_insert_in_lsn_order() {
     drop(leaf);
 
     pool.flush_all_pages().unwrap();
-    let mut it = WalIterator::new(dir.path().join("wal.log")).unwrap();
+    let mut it = WalIterator::new(dir.path().join("wal")).unwrap();
     it.next_record();
 
     let rec = it.next_record().unwrap().unwrap(); // SetXmax (LSN 1)
