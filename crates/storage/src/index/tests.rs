@@ -596,21 +596,21 @@ fn insert_logs_record_stamps_page_lsn_and_gate_flushes() {
     let (index, root) =
         BTreeIndex::<&'static [u8], &'static [u8]>::create(pool.clone(), wal.clone()).unwrap();
 
-    // `create` logs nothing, so the LSN counter starts at 0.
-    assert_eq!(wal.lock().unwrap().next_lsn, 0);
+    // `create` logs nothing, so the LSN counter starts at 1 (LSN 0 reserved).
+    assert_eq!(wal.lock().unwrap().next_lsn, 1);
 
-    // Two in-place inserts on the same leaf → two Insert records (LSN 0, 1).
+    // Two in-place inserts on the same leaf → two Insert records (LSN 1, 2).
     index.insert(&(&b"a"[..]), &(&b"1"[..]), &auto()).unwrap();
     index.insert(&(&b"b"[..]), &(&b"2"[..]), &auto()).unwrap();
     assert_eq!(
         wal.lock().unwrap().next_lsn,
-        2,
+        3,
         "each insert appends a record"
     );
 
     // The leaf page must carry the latest insert's LSN (set_lsn under the latch).
     let leaf = pool.fetch_page(root).unwrap();
-    assert_eq!(crate::page::page_lsn(&leaf[..]), 1, "page LSN stamped");
+    assert_eq!(crate::page::page_lsn(&leaf[..]), 2, "page LSN stamped");
     drop(leaf);
 
     // Flushing the dirty leaf must drive the WAL durable through that page LSN
@@ -618,7 +618,7 @@ fn insert_logs_record_stamps_page_lsn_and_gate_flushes() {
     pool.flush_all_pages().unwrap();
     assert_eq!(
         wal.lock().unwrap().flushed_lsn,
-        Some(1),
+        Some(2),
         "gate flushed WAL to page LSN"
     );
 }
@@ -639,7 +639,7 @@ fn delete_emits_one_setxmax() {
     index.insert(&key, &val, &auto()).unwrap();
 
     let n = wal.lock().unwrap().next_lsn;
-    assert_eq!(n, 1);
+    assert_eq!(n, 2);
     index.delete(&key, &txn).unwrap();
     assert!(
         wal.lock().unwrap().next_lsn == n + 1,
@@ -648,7 +648,7 @@ fn delete_emits_one_setxmax() {
 
     // The leaf page must carry the latest delete's LSN (set_lsn under the latch).
     let leaf = pool.fetch_page(root).unwrap();
-    assert_eq!(crate::page::page_lsn(&leaf[..]), 1, "page LSN stamped");
+    assert_eq!(crate::page::page_lsn(&leaf[..]), 2, "page LSN stamped");
     drop(leaf);
 
     // Flushing the dirty leaf must drive the WAL durable through that page LSN
@@ -683,7 +683,7 @@ fn update_emits_setxmax_then_insert_in_lsn_order() {
     index.insert(&key, &val, &auto()).unwrap();
 
     let n = wal.lock().unwrap().next_lsn;
-    assert_eq!(n, 1);
+    assert_eq!(n, 2);
 
     index.update(&key, &new_val, &txn).unwrap();
     assert!(
@@ -700,12 +700,12 @@ fn update_emits_setxmax_then_insert_in_lsn_order() {
     let mut it = WalIterator::new(dir.path().join("wal.log")).unwrap();
     it.next_record();
 
-    let rec = it.next_record().unwrap().unwrap(); // SetXmax (LSN 1)
+    let rec = it.next_record().unwrap().unwrap(); // SetXmax (LSN 2)
     assert_eq!(rec.entry_type, WalRecordType::SetXMax);
     assert_eq!(rec.txn_id, txn.txn_id);
     let xmax_lsn = rec.lsn;
 
-    let rec = it.next_record().unwrap().unwrap(); // Insert (LSN 2)
+    let rec = it.next_record().unwrap().unwrap(); // Insert (LSN 3)
     assert_eq!(rec.entry_type, WalRecordType::Insert);
     let ins_lsn = rec.lsn;
 
