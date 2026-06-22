@@ -97,7 +97,7 @@ pub const BLK_HAS_DATA: u8 = 0b10;
 pub struct Block<'a> {
     pub page_id: PageId,
     pub blk_flags: u8,
-    pub fpi: Option<[u8; PAGE_SIZE]>,
+    pub fpi: Option<&'a [u8; PAGE_SIZE]>,
     pub data: Option<&'a [u8]>,
 }
 
@@ -218,13 +218,15 @@ impl WalIterator {
             let data_len = u16::from_le_bytes(data_len_buf);
             hasher.update(&data_len_buf);
 
-            let fpi = if blk_flags & 1 == 1 {
-                let mut fpi_buf = [0u8; PAGE_SIZE];
-                if let Err(e) = self.reader.read_exact(&mut fpi_buf) {
+            let fpi_range = if blk_flags & 1 == 1 {
+                let start = self.scratch.len();
+                let end = start + PAGE_SIZE;
+                self.scratch.resize(end, 0);
+                if let Err(e) = self.reader.read_exact(&mut self.scratch[start..end]) {
                     return Some(Err(e.into()));
                 }
-                hasher.update(&fpi_buf);
-                Some(fpi_buf)
+                hasher.update(&self.scratch[start..end]);
+                Some((start, end))
             } else {
                 None
             };
@@ -242,7 +244,7 @@ impl WalIterator {
                 None
             };
 
-            temp_blocks.push((page_id, blk_flags, fpi, data_range));
+            temp_blocks.push((page_id, blk_flags, fpi_range, data_range));
         }
 
         let main_data_range = if main_len > 0 {
@@ -276,7 +278,9 @@ impl WalIterator {
 
         let blocks = temp_blocks
             .into_iter()
-            .map(|(page_id, blk_flags, fpi, data_range)| {
+            .map(|(page_id, blk_flags, fpi_range, data_range)| {
+                let fpi = fpi_range
+                    .map(|(s, e)| <&[u8; PAGE_SIZE]>::try_from(&self.scratch[s..e]).unwrap());
                 let data = data_range.map(|(s, e)| &self.scratch[s..e]);
                 Block {
                     page_id,
@@ -309,7 +313,10 @@ impl Wal {
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
 
-        let mut next_lsn = 0;
+        // LSN 0 is reserved as the "null" LSN (an untouched page reads page_lsn
+        // == 0), so real records start at 1 — otherwise redo can't distinguish
+        // "no record applied" from "the first record applied".
+        let mut next_lsn = 1;
         let mut flushed_lsn = None;
 
         match OpenOptions::new().read(true).open(path) {
@@ -437,6 +444,131 @@ impl Wal {
         };
         self.append(WalRecordType::SetXMax, txn_id, &[block], None)
     }
+    pub fn log_leaf_split(
+        &mut self,
+        txn_id: u64,
+        left: (PageId, &[u8; PAGE_SIZE]),
+        right: (PageId, &[u8; PAGE_SIZE]),
+        old_neighbour: Option<(PageId, &[u8; PAGE_SIZE])>,
+    ) -> Result<Lsn> {
+        let mut blocks = Vec::with_capacity(3);
+        let left_block = Block {
+            page_id: left.0,
+            blk_flags: BLK_HAS_FPI,
+            fpi: Some(left.1),
+            data: None,
+        };
+        blocks.push(left_block);
+        let right_block = Block {
+            page_id: right.0,
+            blk_flags: BLK_HAS_FPI,
+            fpi: Some(right.1),
+            data: None,
+        };
+        blocks.push(right_block);
+        if let Some((pid, img)) = old_neighbour {
+            let neighbour_block = Block {
+                page_id: pid,
+                blk_flags: BLK_HAS_FPI,
+                fpi: Some(img),
+                data: None,
+            };
+            blocks.push(neighbour_block);
+        }
+        self.append(WalRecordType::LeafSplit, txn_id, &blocks, None)
+    }
+    pub fn log_internal_split(
+        &mut self,
+        txn_id: u64,
+        left: (PageId, &[u8; PAGE_SIZE]),
+        right: (PageId, &[u8; PAGE_SIZE]),
+    ) -> Result<Lsn> {
+        let mut blocks = Vec::with_capacity(2);
+        let left_block = Block {
+            page_id: left.0,
+            blk_flags: BLK_HAS_FPI,
+            fpi: Some(left.1),
+            data: None,
+        };
+        let right_block = Block {
+            page_id: right.0,
+            blk_flags: BLK_HAS_FPI,
+            fpi: Some(right.1),
+            data: None,
+        };
+        blocks.push(left_block);
+        blocks.push(right_block);
+        self.append(WalRecordType::InternalSPlit, txn_id, &blocks, None)
+    }
+    pub fn log_insert_downlink(
+        &mut self,
+        txn_id: u64,
+        parent_page: PageId,
+        at_index: u16,
+        sep_key: &[u8],
+        right_child: PageId,
+        left_child: PageId,
+    ) -> Result<Lsn> {
+        let mut blocks = Vec::with_capacity(2);
+        let mut parent_payload: Vec<u8> = Vec::with_capacity(2 + 2 + 8 + sep_key.len());
+        parent_payload.extend_from_slice(&at_index.to_le_bytes());
+        parent_payload.extend_from_slice(&(sep_key.len() as u16).to_le_bytes());
+        parent_payload.extend_from_slice(&right_child.to_le_bytes());
+        parent_payload.extend_from_slice(sep_key);
+        let parent_block = Block {
+            page_id: parent_page,
+            blk_flags: BLK_HAS_DATA,
+            fpi: None,
+            data: Some(&parent_payload),
+        };
+        blocks.push(parent_block);
+        let child_block = Block {
+            page_id: left_child,
+            blk_flags: 0,
+            fpi: None,
+            data: None,
+        };
+        blocks.push(child_block);
+        self.append(WalRecordType::InsertDownLink, txn_id, &blocks, None)
+    }
+    pub fn log_new_root(
+        &mut self,
+        txn_id: u64,
+        new_root: (PageId, &[u8; PAGE_SIZE]),
+    ) -> Result<Lsn> {
+        let mut blocks = Vec::with_capacity(2);
+        let new_root_block = Block {
+            page_id: new_root.0,
+            blk_flags: BLK_HAS_FPI,
+            fpi: Some(new_root.1),
+            data: None,
+        };
+        blocks.push(new_root_block);
+        let root_bytes = new_root.0.to_le_bytes();
+        let meta_block = Block {
+            page_id: 0, // updating metadata page
+            blk_flags: BLK_HAS_DATA,
+            fpi: None,
+            data: Some(&root_bytes),
+        };
+        blocks.push(meta_block);
+        self.append(WalRecordType::NewRoot, txn_id, &blocks, None)
+    }
+
+    pub fn log_page_compact(
+        &mut self,
+        txn_id: u64,
+        page_id: PageId,
+        image: &[u8; PAGE_SIZE],
+    ) -> Result<Lsn> {
+        let block = Block {
+            page_id,
+            blk_flags: BLK_HAS_FPI,
+            fpi: Some(image),
+            data: None,
+        };
+        self.append(WalRecordType::PageCompact, txn_id, &[block], None)
+    }
 
     /// Appends a new physiological record to the WAL buffer.
     ///
@@ -493,7 +625,7 @@ impl Wal {
             let data_len = block.data.map_or(0, |d| d.len()) as u16;
             self.scratch_pad.extend_from_slice(&data_len.to_le_bytes());
 
-            if let Some(ref fpi) = block.fpi {
+            if let Some(fpi) = block.fpi {
                 self.scratch_pad.extend_from_slice(fpi);
             }
             if let Some(data) = block.data {
@@ -556,10 +688,11 @@ mod tests {
 
         wal.append(WalRecordType::Insert, 42, &[block1], None)?;
 
+        let fpi2 = [0u8; PAGE_SIZE];
         let block2 = Block {
             page_id: 101,
             blk_flags: 1,
-            fpi: Some([0u8; PAGE_SIZE]),
+            fpi: Some(&fpi2),
             data: None,
         };
 
@@ -576,7 +709,7 @@ mod tests {
 
         {
             let entry1 = iter.next_record().unwrap()?;
-            assert_eq!(entry1.lsn, 0);
+            assert_eq!(entry1.lsn, 1);
             assert_eq!(entry1.entry_type, WalRecordType::Insert);
             assert_eq!(entry1.txn_id, 42);
             assert_eq!(entry1.blocks.len(), 1);
@@ -586,7 +719,7 @@ mod tests {
 
         {
             let entry2 = iter.next_record().unwrap()?;
-            assert_eq!(entry2.lsn, 1);
+            assert_eq!(entry2.lsn, 2);
             assert_eq!(entry2.entry_type, WalRecordType::Commit);
             assert_eq!(entry2.txn_id, 43);
             assert_eq!(entry2.blocks.len(), 1);
@@ -625,7 +758,7 @@ mod tests {
         }
 
         let wal = Wal::new(&wal_path)?;
-        assert_eq!(wal.next_lsn, 2);
+        assert_eq!(wal.next_lsn, 3);
         Ok(())
     }
 
@@ -638,8 +771,8 @@ mod tests {
         let first = wal.append(WalRecordType::Insert, 42, &[], None)?;
         let second = wal.append(WalRecordType::Commit, 42, &[], None)?;
 
-        assert_eq!(first, 0);
-        assert_eq!(second, 1);
+        assert_eq!(first, 1);
+        assert_eq!(second, 2);
         assert_eq!(wal.flushed_lsn, None);
 
         wal.flush_up_to(first)?;
@@ -686,7 +819,7 @@ mod tests {
         file.sync_all()?;
 
         let wal = Wal::new(&wal_path)?;
-        assert_eq!(wal.next_lsn, 1);
+        assert_eq!(wal.next_lsn, 2);
 
         let new_file_len = file.metadata()?.len();
         assert!(new_file_len < file_len);
@@ -726,7 +859,7 @@ mod tests {
 
         let result = Wal::new(&wal_path);
         match result {
-            Err(WalError::ChecksumMismatch { lsn, .. }) => assert_eq!(lsn, 0),
+            Err(WalError::ChecksumMismatch { lsn, .. }) => assert_eq!(lsn, 1),
             Err(e) => panic!("Expected ChecksumMismatch error, got error: {:?}", e),
             Ok(_) => panic!("Expected ChecksumMismatch error, got Ok(_)"),
         }
@@ -748,7 +881,7 @@ mod tests {
                 data: Some(&[1, 2, 3, 4]),
             };
             wal.append(WalRecordType::Insert, 42, &[block1], None)?;
-            wal.flush_up_to(0)?;
+            wal.flush_up_to(1)?;
         }
 
         let mut file = OpenOptions::new()

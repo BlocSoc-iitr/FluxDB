@@ -44,6 +44,11 @@ pub fn set_root(page: &mut [u8], root_page_id: PageId) {
     write_u64(page, OFF_ROOT, root_page_id);
 }
 
+/// Stamp the LSN of the last WAL record that modified page 0.
+pub fn set_lsn(page: &mut [u8], lsn: u64) {
+    write_u64(page, super::OFF_LSN, lsn);
+}
+
 pub fn read_root(page: &[u8]) -> Option<PageId> {
     if read_u8(page, OFF_PAGE_TYPE) != META
         || read_u32(page, OFF_MAGIC) != MAGIC
