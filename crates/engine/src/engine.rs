@@ -4,6 +4,13 @@
 //! commit-observability rule: a write transaction is marked committed only
 //! after its commit WAL record has been appended and flushed. Public autocommit
 //! methods propagate that durability error instead of acknowledging success.
+//!
+//! ## On-Disk Layout
+//!
+//! Each engine directory stores table pages in `data.db` and WAL segments in
+//! `wal/`. Opening an engine constructs the WAL manager, runs crash recovery
+//! from that segment directory, then opens the B+Tree index once page 0 and the
+//! transaction CLOG have been rebuilt.
 
 use common::{EngineError, Key, Value};
 use db_core::transaction_manager::TransactionManager;
@@ -17,6 +24,14 @@ use storage::recovery::RecoveryManager;
 use storage::wal::Wal;
 
 use crate::txn::TxnHandle;
+
+/// Database facade for a single typed key/value index.
+///
+/// The engine owns the shared [`Wal`], [`BufferPoolManager`], [`DiskManager`],
+/// and [`TransactionManager`]. User-facing operations either run as autocommit
+/// transactions or through [`TxnHandle`], but all writes pass through the same
+/// commit path so WAL durability is established before a transaction becomes
+/// visible.
 pub struct Engine<K, V>
 where
     K: Key,
@@ -37,7 +52,11 @@ where
     K: Key,
     V: Value,
 {
-    /// Creates a new database directory with an initialized data file and WAL.
+    /// Creates a new database directory.
+    ///
+    /// This initializes `data.db`, creates the segmented `wal/` directory, and
+    /// writes the initial metadata/root pages. Creating over an existing
+    /// database returns [`EngineError::AlreadyExists`].
     pub fn create(dir_path: impl AsRef<Path>) -> Result<Engine<K, V>, EngineError> {
         let path = dir_path.as_ref();
         std::fs::create_dir_all(path)?;
@@ -47,8 +66,7 @@ where
         }
         // initialize disk manager
         let disk_manager = Arc::new(DiskManager::new(path.join("data.db"), PAGE_SIZE)?);
-        // initialize wal;
-        // Arc is needed on WAL as both index and buffer_pool will later have a wal instance.
+        // initialize WAL shared by the index and buffer pool.
         let wal = Arc::new(Wal::new(path.join("wal"))?);
         let buffer_pool = Arc::new(BufferPoolManager::new(
             Arc::clone(&disk_manager),
@@ -56,7 +74,7 @@ where
         ));
         let transaction_manager = Arc::new(TransactionManager::new());
         let (index, _root) = BTreeIndex::create(Arc::clone(&buffer_pool), Arc::clone(&wal))?;
-        // index needs Arc as it will be later cloned by vaccum to call index.vaccum()
+        // index needs Arc because vacuum will later clone it.
         let index = Arc::new(index);
         // TODO! spawn checkpoint thread once checkpoint is there
         // TODO! spawn vacuum thread once vacuum is implemented
@@ -70,9 +88,9 @@ where
     }
     /// Opens an existing database.
     ///
-    /// `Wal::new` scans the existing log before returning, so the in-memory WAL
-    /// resumes with `next_lsn = max_lsn + 1` and `flushed_lsn` set to the last
-    /// valid durable record.
+    /// The data file is the existence marker. Recovery replays `wal/` before
+    /// the index opens so page changes and transaction statuses are restored
+    /// before any user query can observe the database.
     pub fn open(dir_path: impl AsRef<Path>) -> Result<Engine<K, V>, EngineError> {
         let path = dir_path.as_ref();
         // the data file is the marker that a database lives here
@@ -80,14 +98,14 @@ where
             return Err(EngineError::NotFound);
         }
         let disk_manager = Arc::new(DiskManager::new(path.join("data.db"), PAGE_SIZE)?);
-        // Wal::new opens the existing log (and creates it if a pre-WAL database
-        // never had one) — the tail scan / LSN resume lands with the log manager work
+        // WAL segments live under `<db>/wal`; recovery replays the same directory.
         let wal = Arc::new(Wal::new(path.join("wal"))?);
         let buffer_pool = Arc::new(BufferPoolManager::new(
             Arc::clone(&disk_manager),
             Arc::clone(&wal),
         ));
         let transaction_manager = Arc::new(TransactionManager::new());
+        // Recovery must rebuild page 0/root and CLOG before the index opens.
         let recovery = RecoveryManager::new(
             Arc::clone(&buffer_pool),
             path.join("wal"),

@@ -8,7 +8,21 @@
 //! -   **Durability tracking**: `flushed_lsn` records the highest LSN known to
 //!     be durable; `flush_up_to(lsn)` fsyncs only when needed.
 //! -   **Checksumming**: Every record is protected by a CRC32 checksum to detect corruption.
-//! -   **Sequential I/O**: Optimized for append-only writes.
+//! -   **Segmented sequential I/O**: WAL records are appended to `wal_XXXXX.log`
+//!     files under one WAL directory.
+//!
+//! ## Segment Layout
+//!
+//! `Wal::new(path)` treats `path` as a WAL segment directory. A database usually
+//! passes `<db>/wal`, producing files such as `wal_00001.log`, `wal_00002.log`,
+//! and so on. Records are never split across segments; rotation happens before
+//! appending a record that would cross the configured segment size.
+//!
+//! ## LSN Convention
+//!
+//! LSN 0 is reserved as the null pageLSN for pages that have no WAL-backed
+//! changes. Real WAL records start at LSN 1, which lets recovery distinguish an
+//! untouched page from a page that has already applied the first record.
 //!
 //! ## Record Layout (On-Disk Format)
 //!
@@ -127,7 +141,11 @@ struct WalLayout {
     segment_size: u64,
 }
 
-/// An iterator that sequentially reads and validates records from a WAL file.
+/// Iterator that reads and validates WAL records across segment files.
+///
+/// The iterator takes a WAL segment directory, opens segment files lazily, and
+/// yields records in segment/offset order. Each record is checksum-validated
+/// before it is returned.
 pub struct WalIterator {
     reader: WalReader,
     scratch: Vec<u8>,
@@ -170,8 +188,12 @@ struct WalShared {
     durable: Condvar,
 }
 
-/// The main Write-Ahead Log manager responsible for appending records sequentially
-/// and maintaining the durability guarantees of the database.
+/// Write-ahead log manager for one WAL segment directory.
+///
+/// `Wal` assigns logical LSNs, serializes records into an in-memory ring buffer,
+/// and uses a background flush thread to write complete records to segment
+/// files. Callers use [`Wal::flush_up_to`] to wait until records are durable
+/// before exposing commit or page-flush effects.
 pub struct Wal {
     shared: Arc<WalShared>,
     flusher: Option<JoinHandle<()>>,
@@ -663,11 +685,13 @@ impl WalIterator {
 }
 
 impl Wal {
-    /// Opens an existing WAL directory for appending, or creates it if needed.
+    /// Opens an existing WAL segment directory, or creates it if needed.
     ///
-    /// Upon opening an existing directory, this method scans every segment to find the maximum
-    /// LSN and handles any torn-tail corruption by truncating the file to the last valid
+    /// Scans every segment to find the maximum LSN and handles torn-tail
+    /// corruption by truncating the last segment to the last valid
     /// record boundary. If mid-log corruption is detected, an error is returned.
+    /// New WAL directories start at LSN 1 because LSN 0 is reserved as the null
+    /// pageLSN.
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         Self::new_with_buffer_capacity(path, WAL_BUFFER_CAPACITY)
     }
@@ -687,9 +711,7 @@ impl Wal {
         };
         create_dir_all(&layout.dir).map_err(WalError::Io)?;
 
-        // LSN 0 is reserved as the "null" LSN (an untouched page reads page_lsn
-        // == 0), so real records start at 1 — otherwise redo can't distinguish
-        // "no record applied" from "the first record applied".
+        // LSN 0 is the null pageLSN; real WAL records start at 1.
         let mut next_lsn = 1;
         let mut flushed_lsn = None;
         let segments = list_segments(&layout.dir).map_err(WalError::Io)?;
@@ -1030,11 +1052,11 @@ impl Wal {
         Ok(lsn)
     }
 
-    /// Flushes pending WAL bytes so records up to and including `lsn` are durable.
+    /// Flushes pending WAL bytes through `lsn`.
     ///
-    /// This is a no-op when `flushed_lsn >= lsn`. Otherwise it asks the background
-    /// flusher to sync records through `lsn` and waits on the durability condvar.
-    /// Commit code relies on this before publishing a transaction as committed.
+    /// LSN 0 is the null pageLSN, so it never needs flushing. Commit code calls
+    /// this before publishing a write transaction as committed; the buffer pool
+    /// calls it before writing a page image whose pageLSN is non-zero.
     pub fn flush_up_to(&self, lsn: Lsn) -> Result<()> {
         if lsn == 0 {
             return Ok(());
