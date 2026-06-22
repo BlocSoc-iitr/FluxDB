@@ -1036,6 +1036,10 @@ impl Wal {
     /// flusher to sync records through `lsn` and waits on the durability condvar.
     /// Commit code relies on this before publishing a transaction as committed.
     pub fn flush_up_to(&self, lsn: Lsn) -> Result<()> {
+        if lsn == 0 {
+            return Ok(());
+        }
+
         let mut state = self.shared.state.lock().unwrap();
 
         let Some(target_lsn) = state
@@ -1256,12 +1260,12 @@ mod tests {
         for txn_id in 3..5 {
             wal.append(WalRecordType::Commit, txn_id, &[], None)?;
         }
-        wal.flush_up_to(4)?;
+        wal.flush_up_to(5)?;
 
         let mut iter = WalIterator::new(&wal_dir).map_err(WalError::Io)?;
         for expected in 0..5 {
             let record = iter.next_record().unwrap()?;
-            assert_eq!(record.lsn, expected);
+            assert_eq!(record.lsn, expected + 1);
             assert_eq!(record.txn_id, expected);
         }
         assert!(iter.next_record().is_none());
@@ -1280,12 +1284,12 @@ mod tests {
         assert!(matches!(
             result,
             Err(WalError::RecordTooLarge {
-                lsn: 0,
+                lsn: 1,
                 record_len: 28,
                 capacity: 27
             })
         ));
-        assert_eq!(wal.next_lsn(), 0);
+        assert_eq!(wal.next_lsn(), 1);
 
         Ok(())
     }
@@ -1307,12 +1311,12 @@ mod tests {
             handle.join().expect("flush waiter panicked")?;
         }
 
-        assert_eq!(wal.flushed_lsn(), Some(7));
+        assert_eq!(wal.flushed_lsn(), Some(8));
 
         let mut iter = WalIterator::new(&wal_dir).map_err(WalError::Io)?;
         for expected in 0..8 {
             let record = iter.next_record().unwrap()?;
-            assert_eq!(record.lsn, expected);
+            assert_eq!(record.lsn, expected + 1);
             assert_eq!(record.txn_id, expected);
         }
         assert!(iter.next_record().is_none());
@@ -1329,7 +1333,7 @@ mod tests {
         for txn_id in 0..5 {
             wal.log_commit(txn_id)?;
         }
-        wal.flush_up_to(4)?;
+        wal.flush_up_to(5)?;
         drop(wal);
 
         let segments = list_segments(&wal_dir).map_err(WalError::Io)?;
@@ -1341,13 +1345,13 @@ mod tests {
         let mut iter = WalIterator::new(&wal_dir).map_err(WalError::Io)?;
         for expected in 0..5 {
             let record = iter.next_record().unwrap()?;
-            assert_eq!(record.lsn, expected);
+            assert_eq!(record.lsn, expected + 1);
             assert_eq!(record.txn_id, expected);
         }
         assert!(iter.next_record().is_none());
 
         let reopened = Wal::new_with_options(&wal_dir, 1024, 64)?;
-        assert_eq!(reopened.next_lsn(), 5);
+        assert_eq!(reopened.next_lsn(), 6);
 
         Ok(())
     }

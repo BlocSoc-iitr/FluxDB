@@ -90,7 +90,7 @@ where
         let transaction_manager = Arc::new(TransactionManager::new());
         let recovery = RecoveryManager::new(
             Arc::clone(&buffer_pool),
-            path.join("wal.log"),
+            path.join("wal"),
             Arc::clone(&transaction_manager),
         );
         recovery.recover::<K, V>()?;
