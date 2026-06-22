@@ -313,7 +313,10 @@ impl Wal {
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
 
-        let mut next_lsn = 0;
+        // LSN 0 is reserved as the "null" LSN (an untouched page reads page_lsn
+        // == 0), so real records start at 1 — otherwise redo can't distinguish
+        // "no record applied" from "the first record applied".
+        let mut next_lsn = 1;
         let mut flushed_lsn = None;
 
         match OpenOptions::new().read(true).open(path) {
@@ -706,7 +709,7 @@ mod tests {
 
         {
             let entry1 = iter.next_record().unwrap()?;
-            assert_eq!(entry1.lsn, 0);
+            assert_eq!(entry1.lsn, 1);
             assert_eq!(entry1.entry_type, WalRecordType::Insert);
             assert_eq!(entry1.txn_id, 42);
             assert_eq!(entry1.blocks.len(), 1);
@@ -716,7 +719,7 @@ mod tests {
 
         {
             let entry2 = iter.next_record().unwrap()?;
-            assert_eq!(entry2.lsn, 1);
+            assert_eq!(entry2.lsn, 2);
             assert_eq!(entry2.entry_type, WalRecordType::Commit);
             assert_eq!(entry2.txn_id, 43);
             assert_eq!(entry2.blocks.len(), 1);
@@ -755,7 +758,7 @@ mod tests {
         }
 
         let wal = Wal::new(&wal_path)?;
-        assert_eq!(wal.next_lsn, 2);
+        assert_eq!(wal.next_lsn, 3);
         Ok(())
     }
 
@@ -768,8 +771,8 @@ mod tests {
         let first = wal.append(WalRecordType::Insert, 42, &[], None)?;
         let second = wal.append(WalRecordType::Commit, 42, &[], None)?;
 
-        assert_eq!(first, 0);
-        assert_eq!(second, 1);
+        assert_eq!(first, 1);
+        assert_eq!(second, 2);
         assert_eq!(wal.flushed_lsn, None);
 
         wal.flush_up_to(first)?;
@@ -816,7 +819,7 @@ mod tests {
         file.sync_all()?;
 
         let wal = Wal::new(&wal_path)?;
-        assert_eq!(wal.next_lsn, 1);
+        assert_eq!(wal.next_lsn, 2);
 
         let new_file_len = file.metadata()?.len();
         assert!(new_file_len < file_len);
@@ -856,7 +859,7 @@ mod tests {
 
         let result = Wal::new(&wal_path);
         match result {
-            Err(WalError::ChecksumMismatch { lsn, .. }) => assert_eq!(lsn, 0),
+            Err(WalError::ChecksumMismatch { lsn, .. }) => assert_eq!(lsn, 1),
             Err(e) => panic!("Expected ChecksumMismatch error, got error: {:?}", e),
             Ok(_) => panic!("Expected ChecksumMismatch error, got Ok(_)"),
         }
@@ -878,7 +881,7 @@ mod tests {
                 data: Some(&[1, 2, 3, 4]),
             };
             wal.append(WalRecordType::Insert, 42, &[block1], None)?;
-            wal.flush_up_to(0)?;
+            wal.flush_up_to(1)?;
         }
 
         let mut file = OpenOptions::new()

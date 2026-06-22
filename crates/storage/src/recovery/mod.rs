@@ -32,9 +32,6 @@ impl RecoveryManager {
 
     /// Replay the WAL in LSN order: rebuild the CLOG, mark crash victims, restore
     /// the txn-id allocator, and redo page changes. Idempotent (LSN-gated).
-    ///
-    /// Generic over the index's `(K, V)` — physiological redo drives the typed
-    /// page mutators. Assumes a single index per WAL.
     pub fn recover<K: Key, V: Value>(&self) -> Result<()> {
         let mut iter = WalIterator::new(&self.wal_path).map_err(WalError::Io)?;
 
@@ -58,7 +55,7 @@ impl RecoveryManager {
         }
 
         // Crash victims: a txn that did work but never settled was in-flight at
-        // the crash → abort (redo-only, no undo).
+        // the crash
         for &txn_id in &seen {
             if !self.tm.is_committed(txn_id) && !self.tm.is_aborted(txn_id) {
                 self.tm.mark_aborted(txn_id);
@@ -145,8 +142,7 @@ impl RecoveryManager {
                 crate::page::meta::set_root(page, root_page_id);
             }
             _ => {
-                // No physiological apply for this (type, block). FPI blocks never
-                // reach here; v2 records aren't emitted yet.
+                // No physiological apply for this (type, block). FPI blocks never reach here.
             }
         }
         Ok(())
