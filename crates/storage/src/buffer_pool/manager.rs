@@ -2,6 +2,7 @@ use crate::buffer_pool::shard::{BufferPoolShard, PageReadGuard, PageWriteGuard};
 use crate::disk::DiskManager;
 use crate::wal::Wal;
 use common::{BufferPoolError, MAX_FRAMES, NUM_SHARDS, SHARD_MASK};
+use std::cmp::max;
 use std::sync::{Arc, Mutex};
 
 pub type Result<T> = std::result::Result<T, BufferPoolError>;
@@ -217,5 +218,52 @@ impl BufferPoolManager {
     /// * Returns [`BufferPoolError::InternalError`] if a disk I/O error occurs.
     pub fn delete_page(&self, page_id: u64) -> Result<()> {
         self.get_shard(page_id).delete_page(page_id)
+    }
+
+    pub fn ensure_page(&self, page_id: u64) -> Result<PageWriteGuard<'_>> {
+        let shard = self.get_shard(page_id);
+        let (frame_id, needs_load) = shard.acquire_frame(page_id)?;
+        let mut data = shard.pages[frame_id].write().unwrap();
+        if needs_load {
+            let num_pages = shard.disk_manager.num_pages()?;
+            if num_pages > page_id {
+                let load = shard
+                    .disk_manager
+                    .read_page(page_id, data.0.as_mut())
+                    .map_err(BufferPoolError::from)
+                    .and_then(|()| {
+                        crate::page::verify_checksum(&data[..]).map_err(|(expected, actual)| {
+                            BufferPoolError::PageCorruption {
+                                page_id,
+                                expected,
+                                actual,
+                            }
+                        })
+                    });
+                match load {
+                    // Still holding `data` (page write lock) while finish_load takes
+                    // the inner lock — page→inner order is deadlock-free.
+                    Ok(()) => shard.finish_load(page_id, frame_id, true),
+                    Err(e) => {
+                        drop(data);
+                        shard.finish_load(page_id, frame_id, false);
+                        return Err(e);
+                    }
+                }
+            } else {
+                data.fill(0);
+                shard.finish_load(page_id, frame_id, true);
+            }
+        }
+        {
+            let mut id = self.next_page_id.lock().unwrap();
+            *id = max(*id, page_id + 1);
+        }
+        Ok(PageWriteGuard {
+            shard,
+            page_id,
+            guard: Some(data),
+            dirty: false,
+        })
     }
 }

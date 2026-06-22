@@ -13,6 +13,7 @@ use storage::buffer_pool::BufferPoolManager;
 use storage::disk::DiskManager;
 use storage::index::BTreeIndex;
 use storage::page::PAGE_SIZE;
+use storage::recovery::RecoveryManager;
 use storage::wal::Wal;
 
 use crate::txn::TxnHandle;
@@ -87,11 +88,13 @@ where
             Arc::clone(&wal),
         ));
         let transaction_manager = Arc::new(TransactionManager::new());
-        // recovery runs HERE — after the pool exists, before the index opens:
-        // read checkpoint from superblock → seed CLOG from pinned_aborted[] →
-        // replay WAL from redo_point → mark crash victims Aborted →
-        // inject next_txn_id / next_page_id watermarks (from_recovered)
-        // index reads the root page id from the page-0 superblock
+        let recovery = RecoveryManager::new(
+            Arc::clone(&buffer_pool),
+            path.join("wal.log"),
+            Arc::clone(&transaction_manager),
+        );
+        recovery.recover::<K, V>()?;
+
         let index = Arc::new(BTreeIndex::open(
             Arc::clone(&buffer_pool),
             Arc::clone(&wal),

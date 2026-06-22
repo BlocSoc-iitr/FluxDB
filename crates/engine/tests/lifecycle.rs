@@ -33,9 +33,6 @@ fn open_without_database_fails_with_not_found() {
 }
 
 #[test]
-#[ignore = "durability across restart is not built yet: committed pages live only \
-in the buffer pool until eviction/checkpoint/close-flush exists (I-9/I-13). \
-Un-ignore when close() flushes dirty pages or recovery lands."]
 fn reopen_sees_committed_data() {
     let dir = TempDir::new().unwrap();
     {
