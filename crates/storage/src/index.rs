@@ -579,11 +579,17 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 let page = self.pool.fetch_page(leaf_pid).expect("fetch_page failed");
                 let acc = LeafPageAccessor::<K, V>::new(&page[..]);
                 let (slot, exact) = acc.position(k);
-                if exact {
-                    (Some(leaf_pid), slot as i64)
-                } else if slot > 0 {
-                    (Some(leaf_pid), (slot - 1) as i64)
+                
+                let s = if exact {
+                    Self::duplicate_slot_bounds(&acc, k, slot).1 as i64 - 1
                 } else {
+                    slot as i64 - 1
+                };
+                if s >= 0 {
+                    (Some(leaf_pid), s)
+                } else {
+                    // Upper bound is below every key on this leaf — start from
+                    // the last slot of the previous leaf.
                     (acc.prev_page(), -1)
                 }
             }
@@ -591,9 +597,15 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 let leaf_pid = self.find_leaf(root_pid, k).expect("find_leaf failed");
                 let page = self.pool.fetch_page(leaf_pid).expect("fetch_page failed");
                 let acc = LeafPageAccessor::<K, V>::new(&page[..]);
-                let (slot, _exact) = acc.position(k);
-                if slot > 0 {
-                    (Some(leaf_pid), (slot - 1) as i64)
+                let (slot, exact) = acc.position(k);
+                
+                let s = if exact {
+                    Self::duplicate_slot_bounds(&acc, k, slot).0 as i64 - 1
+                } else {
+                    slot as i64 - 1
+                };
+                if s >= 0 {
+                    (Some(leaf_pid), s)
                 } else {
                     (acc.prev_page(), -1)
                 }
@@ -1776,6 +1788,8 @@ mod tests {
         let last = u32::from_be_bytes(results.last().unwrap().0[..4].try_into().unwrap());
         assert_eq!(first, 19);
         assert_eq!(last, 10);
+    }
+
     fn range_scan_included_start_can_miss_only_visible_duplicate_before_position_result() {
         let tm = std::sync::Arc::new(db_core::transaction_manager::TransactionManager::new());
         let idx = make_index();
