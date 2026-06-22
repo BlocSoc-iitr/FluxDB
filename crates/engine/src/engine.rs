@@ -93,7 +93,7 @@ where
             path.join("wal.log"),
             Arc::clone(&transaction_manager),
         );
-        recovery.recover::<K,V>()?;
+        recovery.recover::<K, V>()?;
 
         let index = Arc::new(BTreeIndex::open(
             Arc::clone(&buffer_pool),
