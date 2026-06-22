@@ -40,7 +40,7 @@
 use crc32fast::Hasher;
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions, create_dir_all, metadata, read_dir};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -449,7 +449,6 @@ impl WalReader {
     }
 
     fn stream_position(&mut self) -> io::Result<u64> {
-        use std::io::Seek;
         if !self.ensure_current()? {
             return Ok(0);
         }
