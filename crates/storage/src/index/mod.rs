@@ -592,6 +592,76 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         }
     }
 
+    pub fn range_backward<R>(&self, range: R, txn: &Transaction) -> BackwardRangeScan<'_, K, V>
+    where
+        K: 'static,
+        R: RangeBounds<K::SelfType<'static>>,
+    {
+        let root_pid = *self.root.lock().unwrap();
+
+        let (current_leaf, start_slot) = match range.end_bound() {
+            Bound::Included(k) => {
+                let leaf_pid = self.find_leaf(root_pid, k).expect("find_leaf failed");
+                let page = self.pool.fetch_page(leaf_pid).expect("fetch_page failed");
+                let acc = LeafPageAccessor::<K, V>::new(&page[..]);
+                let (slot, exact) = acc.position(k);
+
+                let s = if exact {
+                    Self::duplicate_slot_bounds(&acc, k, slot).1 as i64 - 1
+                } else {
+                    slot as i64 - 1
+                };
+                if s >= 0 {
+                    (Some(leaf_pid), s)
+                } else {
+                    // Upper bound is below every key on this leaf — start from
+                    // the last slot of the previous leaf.
+                    (acc.prev_page(), -1)
+                }
+            }
+            Bound::Excluded(k) => {
+                let leaf_pid = self.find_leaf(root_pid, k).expect("find_leaf failed");
+                let page = self.pool.fetch_page(leaf_pid).expect("fetch_page failed");
+                let acc = LeafPageAccessor::<K, V>::new(&page[..]);
+                let (slot, exact) = acc.position(k);
+
+                let s = if exact {
+                    Self::duplicate_slot_bounds(&acc, k, slot).0 as i64 - 1
+                } else {
+                    slot as i64 - 1
+                };
+                if s >= 0 {
+                    (Some(leaf_pid), s)
+                } else {
+                    (acc.prev_page(), -1)
+                }
+            }
+            Bound::Unbounded => {
+                let leaf_pid = self
+                    .find_rightmost_leaf(root_pid)
+                    .expect("find_rightmost_leaf failed");
+                (Some(leaf_pid), -1)
+            }
+        };
+
+        let (start_key, start_inclusive) = match range.start_bound() {
+            Bound::Included(k) => (Some(K::as_bytes(k).as_ref().to_vec()), true),
+            Bound::Excluded(k) => (Some(K::as_bytes(k).as_ref().to_vec()), false),
+            Bound::Unbounded => (None, false),
+        };
+
+        BackwardRangeScan {
+            pool: &self.pool,
+            current_leaf,
+            slot: start_slot,
+            start_key,
+            start_inclusive,
+            txn: txn.clone(),
+            _key: PhantomData,
+            _val: PhantomData,
+        }
+    }
+
     // ── MVCC helpers ──────────────────────────────────────────────────────────
 
     /// Returns the `[first, past_end)` slot range for the duplicate run
@@ -809,6 +879,47 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             }
         }
     }
+
+    fn find_rightmost_leaf(&self, start_pid: PageId) -> Result<PageId> {
+        let mut pid = start_pid;
+        loop {
+            let page = self.pool.fetch_page(pid)?;
+            match page[0] {
+                INTERNAL => {
+                    let acc = InternalPageAccessor::<K>::new(&page[..]);
+                    let n = acc.num_keys() as usize;
+                    let child = acc.child_page_at(n);
+                    drop(page);
+                    pid = child;
+                }
+                LEAF => {
+                    // Sweep rightlinks to correct for any in-flight splits.
+                    drop(page);
+                    loop {
+                        let page = self.pool.fetch_page(pid)?;
+                        let acc = LeafPageAccessor::<K, V>::new(&page[..]);
+                        match acc.rightlink() {
+                            Some(right) => {
+                                drop(page);
+                                pid = right;
+                            }
+                            None => {
+                                drop(page);
+                                return Ok(pid);
+                            }
+                        }
+                    }
+                }
+                found => {
+                    drop(page);
+                    return Err(IndexError::UnexpectedPageType {
+                        expected: LEAF,
+                        found,
+                    });
+                }
+            }
+        }
+    }
 }
 
 // ── RangeScan ─────────────────────────────────────────────────────────────────
@@ -873,6 +984,86 @@ impl<'a, K: Key, V: Value> Iterator for RangeScan<'a, K, V> {
 
             self.current_leaf = acc.rightlink();
             self.slot = 0;
+        }
+    }
+}
+
+pub struct BackwardRangeScan<'a, K: Key, V: Value> {
+    pool: &'a BufferPoolManager,
+    current_leaf: Option<PageId>,
+    slot: i64, // signed! counts DOWN, -1 is the "uninitialized" sentinel
+    start_key: Option<Vec<u8>>,
+    start_inclusive: bool,
+    txn: Transaction,
+    _key: PhantomData<K>,
+    _val: PhantomData<V>,
+}
+
+impl<'a, K: Key, V: Value> Iterator for BackwardRangeScan<'a, K, V> {
+    type Item = Result<(Vec<u8>, Vec<u8>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let leaf_pid = self.current_leaf?;
+            let page = match self.pool.fetch_page(leaf_pid) {
+                Ok(p) => p,
+                Err(e) => return Some(Err(e.into())),
+            };
+            let acc = LeafPageAccessor::<K, V>::new(&page[..]);
+
+            // If slot was not yet initialized for this page (== -1 sentinel),
+            // set it to the last slot on the page.
+            if self.slot < 0 {
+                let n = acc.num_pairs() as usize;
+                if n == 0 {
+                    // Empty page — follow leftlink.
+                    self.current_leaf = acc.prev_page();
+                    self.slot = -1;
+                    continue;
+                }
+                self.slot = (n - 1) as i64;
+            }
+
+            while self.slot >= 0 {
+                let s = self.slot as usize;
+                let xmin = acc.get_xmin(s);
+                let xmax = acc.get_xmax(s);
+
+                // Skip records not visible to our snapshot.
+                if !self.txn.is_visible(xmin, xmax) {
+                    self.slot -= 1;
+                    continue;
+                }
+
+                let k = K::as_bytes(&acc.get_key(s)).as_ref().to_vec();
+                let v = V::as_bytes(&acc.get_value(s)).as_ref().to_vec();
+
+                let in_range = match &self.start_key {
+                    None => true,
+                    Some(start) => {
+                        let cmp = K::compare(&k, start);
+                        if self.start_inclusive {
+                            cmp != Ordering::Less
+                        } else {
+                            cmp == Ordering::Greater
+                        }
+                    }
+                };
+
+                if !in_range {
+                    self.current_leaf = None;
+                    return None;
+                }
+
+                self.slot -= 1;
+                if self.slot < 0 {
+                    self.current_leaf = acc.prev_page();
+                }
+                return Some(Ok((k, v)));
+            }
+
+            self.current_leaf = acc.prev_page();
+            self.slot = -1; // sentinel: will be set to last slot on next iteration
         }
     }
 }
