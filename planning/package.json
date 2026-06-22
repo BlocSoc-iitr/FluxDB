@@ -1,0 +1,10 @@
+{
+  "name": "fluxdb-roadmap",
+  "version": "1.0.0",
+  "private": true,
+  "description": "FluxDB roadmap — a static page tracking what's shipped and what's next.",
+  "scripts": {
+    "start": "node server.js",
+    "serve": "node server.js"
+  }
+}
