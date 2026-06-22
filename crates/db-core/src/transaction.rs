@@ -129,22 +129,20 @@ impl Snapshot {
     /// - Its ID is between `xmin` and `xmax` AND not in the active list.
     pub fn is_committed(&self, txn_id: u64, tm: &TransactionManager) -> bool {
         if txn_id == 0 {
-            return true; // txn_id 0 is the "auto" transaction, always committed
+            return true; // the "auto" transaction is always committed
         }
-        if tm.is_aborted(txn_id) {
-            return false;
-        }
-        if tm.is_committed(txn_id) {
-            return true;
-        }
-        if txn_id < self.xmin {
-            return true; // finished before snapshot
-        }
+        // Snapshot bounds take precedence over the live CLOG: a txn that was
+        // unborn or in-flight when this snapshot was taken must never become
+        // visible to it later, or reads stop being repeatable.
         if txn_id >= self.xmax {
-            return false; // not yet started
+            return false; // started after the snapshot
         }
-        // Between xmin and xmax: committed if NOT in active list
-        !self.active.contains(&txn_id)
+        if self.active.contains(&txn_id) {
+            return false; // in-flight when the snapshot was taken
+        }
+        // Settled before the snapshot (below xmax, not active) → committed
+        // unless it aborted (presumed commit).
+        !tm.is_aborted(txn_id)
     }
 
     /// Is the given transaction still in-progress from this snapshot's
@@ -298,6 +296,25 @@ mod tests {
         let s = snap(10, 20, &[12, 15]);
         // xmin=12 in active list → not committed → invisible
         assert!(!is_vis(12, 0, &s));
+    }
+
+    #[test]
+    fn active_at_snapshot_stays_invisible_after_commit() {
+        // Snapshot taken while txn 12 was in-flight (12 ∈ active set).
+        let s = snap(10, 20, &[12, 15]);
+        let tm = TransactionManager::new();
+
+        // While 12 is active, its writes are invisible.
+        assert!(!is_visible(12, 0, &s, &tm));
+
+        // Snapshot isolation: a txn that was active when the snapshot was taken
+        // must STAY invisible to this snapshot even after it commits — otherwise
+        // the reader gets a non-repeatable read (the row appears mid-txn).
+        tm.mark_committed(12);
+        assert!(
+            !is_visible(12, 0, &s, &tm),
+            "txn active at snapshot time must stay invisible after it commits"
+        );
     }
 
     #[test]
