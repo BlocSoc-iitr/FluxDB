@@ -58,6 +58,7 @@ use std::io::{self, BufRead, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
+use std::sync::atomic::{AtomicU64,Ordering};//
 
 use crate::disk::DiskManager;
 use crate::page::{Lsn, PAGE_SIZE, PageId};
@@ -175,8 +176,7 @@ struct WalBuffer {
 }
 
 struct WalState {
-    buffer: WalBuffer,
-    next_lsn: Lsn,
+    buffer: WalBuffer,//
     flushed_lsn: Option<Lsn>,
     flush_error: Option<String>,
     shutdown: bool,
@@ -187,6 +187,7 @@ struct WalShared {
     flush_requested: Condvar,
     durable: Condvar,
     segment_size: u64,
+    next_lsn: AtomicU64,//
 }
 
 /// Write-ahead log manager for one WAL segment directory.
@@ -771,8 +772,7 @@ impl Wal {
 
         let shared = Arc::new(WalShared {
             state: Mutex::new(WalState {
-                buffer: WalBuffer::with_capacity(buffer_capacity),
-                next_lsn,
+                buffer: WalBuffer::with_capacity(buffer_capacity),//
                 flushed_lsn,
                 flush_error: None,
                 shutdown: false,
@@ -780,6 +780,7 @@ impl Wal {
             flush_requested: Condvar::new(),
             durable: Condvar::new(),
             segment_size,
+            next_lsn: AtomicU64::new(next_lsn),
         });
 
         let flusher = Some(Self::spawn_flush_thread(Arc::clone(&shared), writer)?);
@@ -798,7 +799,7 @@ impl Wal {
     }
 
     pub fn next_lsn(&self) -> Lsn {
-        self.shared.state.lock().unwrap().next_lsn
+        self.shared.next_lsn.load(Ordering::Relaxed)
     }
 
     pub fn flushed_lsn(&self) -> Option<Lsn> {
@@ -1015,12 +1016,12 @@ impl Wal {
             });
         }
 
-        let mut state = self.shared.state.lock().unwrap();
-        if let Some(err) = state.flush_error.as_ref() {
-            return Err(WalError::FlushFailed(err.clone()));
-        }
+        // let mut state = self.shared.state.lock().unwrap();
+        // if let Some(err) = state.flush_error.as_ref() {
+        //     return Err(WalError::FlushFailed(err.clone()));
+        // }
 
-        let lsn = state.next_lsn;
+        let lsn = self.shared.next_lsn.fetch_add(1,Ordering::Relaxed);
 
         let mut record = Vec::with_capacity(record_size);
         record.reserve(record_size);
@@ -1057,8 +1058,13 @@ impl Wal {
         let checksum = hasher.finalize();
 
         record.extend_from_slice(&checksum.to_le_bytes());
+        
+        let mut state = self.shared.state.lock().unwrap();
+        if let Some(err) = state.flush_error.as_ref(){
+            return Err(WalError::FlushFailed(err.clone()));
+        }
+
         state.buffer.push_record(lsn, &record)?;
-        state.next_lsn += 1;
 
         Ok(lsn)
     }
@@ -1070,13 +1076,12 @@ impl Wal {
     /// 0, the call is a no-op — preventing a permanent park on the `durable`
     /// condvar.
     pub fn flush_up_to(&self, lsn: Lsn) -> Result<()> {
-        let mut state = self.shared.state.lock().unwrap();
+        let current_next_lsn = self.shared.next_lsn.load(Ordering::Relaxed);
 
         // Guard the *clamped target*, not just the argument. When next_lsn == 1
         // (no records appended), checked_sub(1) yields Some(0) and the flusher
         // has nothing buffered, so parking on `durable` would hang forever.
-        let target_lsn = state
-            .next_lsn
+        let target_lsn = current_next_lsn
             .checked_sub(1)
             .map(|last| lsn.min(last))
             .unwrap_or(0);
@@ -1084,6 +1089,7 @@ impl Wal {
             return Ok(());
         }
 
+        let mut state = self.shared.state.lock().unwrap();
         loop {
             if state
                 .flushed_lsn
