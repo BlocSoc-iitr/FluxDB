@@ -178,13 +178,13 @@ struct WalState {
     buffer: WalBuffer,
     next_lsn: Lsn,
     flushed_lsn: Option<Lsn>,
+    is_flushing: bool,
     flush_error: Option<String>,
-    shutdown: bool,
 }
 
 struct WalShared {
     state: Mutex<WalState>,
-    flush_requested: Condvar,
+    writer: Mutex<SegmentWriter>,
     durable: Condvar,
     segment_size: u64,
 }
@@ -192,12 +192,10 @@ struct WalShared {
 /// Write-ahead log manager for one WAL segment directory.
 ///
 /// `Wal` assigns logical LSNs, serializes records into an in-memory ring buffer,
-/// and uses a background flush thread to write complete records to segment
-/// files. Callers use [`Wal::flush_up_to`] to wait until records are durable
-/// before exposing commit or page-flush effects.
+/// and uses leader/follower fsync batching. Callers use [`Wal::flush_up_to`] to wait
+/// until records are durable before exposing commit or page-flush effects.
 pub struct Wal {
     shared: Arc<WalShared>,
-    flusher: Option<JoinHandle<()>>,
 }
 
 struct SegmentWriter {
@@ -774,27 +772,15 @@ impl Wal {
                 buffer: WalBuffer::with_capacity(buffer_capacity),
                 next_lsn,
                 flushed_lsn,
+                is_flushing: false,
                 flush_error: None,
-                shutdown: false,
             }),
-            flush_requested: Condvar::new(),
+            writer: Mutex::new(writer),
             durable: Condvar::new(),
             segment_size,
         });
 
-        let flusher = Some(Self::spawn_flush_thread(Arc::clone(&shared), writer)?);
-
-        Ok(Wal { shared, flusher })
-    }
-
-    fn spawn_flush_thread(
-        shared: Arc<WalShared>,
-        mut writer: SegmentWriter,
-    ) -> Result<JoinHandle<()>> {
-        thread::Builder::new()
-            .name("fluxdb-wal-flusher".into())
-            .spawn(move || run_flush_thread(shared, &mut writer))
-            .map_err(WalError::Io)
+        Ok(Wal { shared })
     }
 
     pub fn next_lsn(&self) -> Lsn {
@@ -1095,66 +1081,46 @@ impl Wal {
                 return Err(WalError::FlushFailed(err.clone()));
             }
 
-            self.shared.flush_requested.notify_one();
-            state = self.shared.durable.wait(state).unwrap();
-        }
-    }
-}
+            if state.is_flushing {
+                state = self.shared.durable.wait(state).unwrap();
+            } else {
+                state.is_flushing = true;
+                
+                let (records, bytes_to_consume, durable_lsn) = if let Some((bytes, dur_lsn)) = state.buffer.buffered_prefix_len() {
+                    (state.buffer.copy_records(), bytes, dur_lsn)
+                } else {
+                    state.is_flushing = false;
+                    self.shared.durable.notify_all();
+                    return Ok(());
+                };
 
-impl Drop for Wal {
-    fn drop(&mut self) {
-        {
-            let mut state = self.shared.state.lock().unwrap();
-            state.shutdown = true;
-            self.shared.flush_requested.notify_one();
-        }
+                drop(state);
 
-        if let Some(flusher) = self.flusher.take() {
-            let _ = flusher.join();
-        }
-    }
-}
+                let flush_result = (|| -> Result<()> {
+                    let mut writer = self.shared.writer.lock().unwrap();
+                    for (rec_lsn, record) in &records {
+                        writer.write_record(*rec_lsn, record)?;
+                    }
+                    writer.sync()?;
+                    Ok(())
+                })();
 
-fn run_flush_thread(shared: Arc<WalShared>, writer: &mut SegmentWriter) {
-    loop {
-        let (records, bytes_to_consume, durable_lsn) = {
-            let mut state = shared.state.lock().unwrap();
+                state = self.shared.state.lock().unwrap();
+                state.is_flushing = false;
 
-            loop {
-                if state.shutdown {
-                    return;
+                match flush_result {
+                    Ok(()) => {
+                        state.buffer.consume_prefix(bytes_to_consume);
+                        state.flushed_lsn = Some(durable_lsn);
+                    }
+                    Err(err) => {
+                        state.flush_error = Some(err.to_string());
+                    }
                 }
 
-                if let Some((bytes_to_flush, durable_lsn)) = state.buffer.buffered_prefix_len() {
-                    let records = state.buffer.copy_records();
-                    break (records, bytes_to_flush, durable_lsn);
-                }
-
-                state = shared.flush_requested.wait(state).unwrap();
-            }
-        };
-
-        let flush_result = (|| -> Result<()> {
-            for (lsn, record) in &records {
-                writer.write_record(*lsn, record)?;
-            }
-            writer.sync()?;
-            Ok(())
-        })();
-
-        let mut state = shared.state.lock().unwrap();
-        match flush_result {
-            Ok(()) => {
-                state.buffer.consume_prefix(bytes_to_consume);
-                state.flushed_lsn = Some(durable_lsn);
-            }
-            Err(err) => {
-                state.flush_error = Some(err.to_string());
-                shared.durable.notify_all();
-                return;
+                self.shared.durable.notify_all();
             }
         }
-        shared.durable.notify_all();
     }
 }
 
@@ -1531,12 +1497,11 @@ mod tests {
         Ok(())
     }
 
-    /// Finding 2+8: after a persistent I/O error the flush thread must reach
-    /// a terminal state — record the error, wake all waiters, and stop.
-    /// Before the fix the thread hot-retried the same failing write, spinning
-    /// a core and never draining the buffer.
+    /// Finding 2+8: after a persistent I/O error the leader must reach
+    /// a terminal state — record the error, wake all waiters.
+    /// Before the fix the thread hot-retried the same failing write.
     #[test]
-    fn test_flush_thread_stops_on_io_error() -> Result<()> {
+    fn test_flush_stops_on_io_error() -> Result<()> {
         let dir = tempdir().map_err(WalError::Io)?;
         let wal_dir = dir.path().join("io-error-wal");
 
