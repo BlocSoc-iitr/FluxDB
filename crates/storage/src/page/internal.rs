@@ -778,3 +778,338 @@ mod tests {
         b.push_key_and_right_child(&(&[1][..]), 2);
     }
 }
+
+// ── Property-based tests ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use crate::page::{PAGE_SIZE, PageBuffer};
+    use proptest::prelude::*;
+    use std::cmp::Ordering;
+
+    // Helper functions to check if internal pages are valid
+    // Internal pages are more complex than leaf pages - they have 3 sections!
+
+    /// Check all the structural invariants for an internal page
+    /// Internal pages store keys and child page pointers
+    fn check_internal_structural_invariants(page: &[u8]) -> Result<(), String> {
+        // First make sure this is actually an internal page
+        let page_type = read_u8(page, OFF_PAGE_TYPE);
+        if page_type != INTERNAL {
+            return Err(format!(
+                "page_type: expected {} (INTERNAL), got {}",
+                INTERNAL, page_type
+            ));
+        }
+
+        let num_keys = read_u16(page, OFF_INT_NUM_KEYS) as usize;
+        let high_key_len = read_u16(page, OFF_INT_HIGH_KEY_LEN) as usize;
+
+        // Check that all the child pointers fit in the page
+        // We have num_keys + 1 children (Lehman-Yao B+tree property)
+        let children_end = INT_HEADER_SIZE + (num_keys + 1) * 8;
+        if children_end > PAGE_SIZE {
+            return Err(format!(
+                "children_overflow: {} children need {} bytes, PAGE_SIZE = {}",
+                num_keys + 1,
+                children_end,
+                PAGE_SIZE
+            ));
+        }
+
+        // Make sure all child pointers are valid (non-zero)
+        // Zero is used as "no page" in other places, but here every child must be real
+        for i in 0..=num_keys {
+            let child = read_u64(page, int_child_offset(i));
+            if child == 0 {
+                return Err(format!(
+                    "child_{}_zero: child page ID is 0 (should be a valid page ID)",
+                    i
+                ));
+            }
+        }
+
+        // Check that the key-end offsets are in increasing order
+        // These tell us where each key starts and ends in Section C
+        if num_keys > 0 {
+            let mut prev_end = 0u32;
+            for i in 0..num_keys {
+                let key_end = read_u32(page, int_key_end_offset(num_keys, i));
+                if key_end <= prev_end {
+                    return Err(format!(
+                        "key_end_not_monotonic: key_end[{}] ({}) <= key_end[{}] ({})",
+                        i,
+                        key_end,
+                        if i == 0 { 0 } else { i - 1 },
+                        prev_end
+                    ));
+                }
+                prev_end = key_end;
+            }
+
+            // Make sure the key data doesn't overlap with the high key
+            // High key is stored at the END of the page
+            let total_key_data = prev_end as usize;
+            let key_data_start = int_key_data_base(num_keys);
+            let key_data_end = key_data_start + total_key_data;
+            let high_key_start = PAGE_SIZE - high_key_len;
+
+            if key_data_end > high_key_start {
+                return Err(format!(
+                    "key_data_overlap: key data region [{}, {}) overlaps high key region [{}, {})",
+                    key_data_start, key_data_end, high_key_start, PAGE_SIZE
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check that keys are in sorted order on an internal page
+    fn check_internal_key_ordering(page: &[u8]) -> Result<(), String> {
+        type K = &'static [u8];
+
+        let acc = InternalPageAccessor::<K>::new(page);
+        let n = acc.num_keys() as usize;
+
+        // Make sure keys are sorted
+        for i in 0..n.saturating_sub(1) {
+            let k1 = acc.key_at(i);
+            let k2 = acc.key_at(i + 1);
+            if <K as Key>::compare(
+                <K as common::Value>::as_bytes(&k1).as_ref(),
+                <K as common::Value>::as_bytes(&k2).as_ref(),
+            ) != Ordering::Less
+            {
+                return Err(format!(
+                    "keys_not_sorted: key[{}] ({:?}) >= key[{}] ({:?})",
+                    i,
+                    k1,
+                    i + 1,
+                    k2
+                ));
+            }
+        }
+
+        // If there's a high key, make sure all keys are less than it
+        if let Some(hk) = acc.high_key_bytes() {
+            for i in 0..n {
+                let k = acc.key_at(i);
+                if <K as Key>::compare(<K as common::Value>::as_bytes(&k).as_ref(), hk)
+                    != Ordering::Less
+                {
+                    return Err(format!(
+                        "key_exceeds_high_key: key[{}] ({:?}) >= high_key ({:?})",
+                        i, k, hk
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Main checker - calls both structural and ordering checks
+    fn check_internal_all_invariants(page: &[u8]) -> Result<(), String> {
+        check_internal_structural_invariants(page)?;
+        check_internal_key_ordering(page)?;
+        Ok(())
+    }
+
+    // ── Test data generators for internal pages ────────────────────────────────
+
+    type K = &'static [u8];
+
+    /// Generate random keys (same as leaf page tests)
+    fn key_strategy() -> impl Strategy<Value = Vec<u8>> {
+        prop::collection::vec(any::<u8>(), 1..=16usize)
+    }
+
+    /// Operations we can do on internal pages
+    #[derive(Debug, Clone)]
+    enum InternalOp {
+        Insert { key: Vec<u8>, child_id: u64 },
+        RemoveLeft { index: usize },
+        RemoveRight { index: usize },
+    }
+
+    fn internal_op_strategy() -> impl Strategy<Value = InternalOp> {
+        prop_oneof![
+            60 => (key_strategy(), 1u64..10000)
+                .prop_map(|(k, c)| InternalOp::Insert { key: k, child_id: c }),
+            20 => (0usize..100)
+                .prop_map(|idx| InternalOp::RemoveLeft { index: idx }),
+            20 => (0usize..100)
+                .prop_map(|idx| InternalOp::RemoveRight { index: idx }),
+        ]
+    }
+
+    /// Sort and deduplicate keys, returning sorted unique keys.
+    fn sort_dedup_keys(mut keys: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    // ── Property tests ───────────────────────────────────────────────────────
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// Building an internal page from sorted unique keys always produces a valid page.
+        #[test]
+        fn prop_internal_build_valid(
+            keys in prop::collection::vec(key_strategy(), 1..20),
+            first_child in 1u64..1000,
+        ) {
+            let sorted = sort_dedup_keys(keys);
+            let mut buf = PageBuffer::new();
+            let mut builder = InternalPageBuilder::<K>::new(1, buf.memory_mut());
+            builder.push_first_child(first_child);
+
+            // Pre-calculate available space: PAGE_SIZE - header - first_child(8) - high_key(0)
+            let mut used = INT_HEADER_SIZE + 8; // header + first child pointer
+            let mut child_id = first_child + 1;
+            for k in &sorted {
+                // Each key+child costs: 8 (child) + 4 (key_end offset) + key.len() (key data)
+                let cost = 8 + 4 + k.len();
+                if used + cost > PAGE_SIZE {
+                    break;
+                }
+                builder.push_key_and_right_child(&k.as_slice(), child_id);
+                used += cost;
+                child_id += 1;
+            }
+            builder.finish();
+
+            check_internal_all_invariants(buf.memory())
+                .map_err(|e| TestCaseError::fail(format!("after build: {}", e)))?;
+        }
+
+        /// Building with a high key produces a valid page where all keys < high_key.
+        #[test]
+        fn prop_internal_build_with_high_key(
+            keys in prop::collection::vec(key_strategy(), 1..15),
+            first_child in 1u64..1000,
+        ) {
+            let sorted = sort_dedup_keys(keys);
+            let mut buf = PageBuffer::new();
+
+            let high_key = vec![0xFF; 17]; // larger than any 16-byte key
+
+            let mut builder = InternalPageBuilder::<K>::new(1, buf.memory_mut());
+            builder.push_first_child(first_child);
+            builder.set_high_key(&high_key);
+
+            let mut child_id = first_child + 1;
+            for k in &sorted {
+                // Conservative: stop after a few to avoid overflow
+                if child_id > first_child + 10 {
+                    break;
+                }
+                builder.push_key_and_right_child(&k.as_slice(), child_id);
+                child_id += 1;
+            }
+            builder.finish();
+
+            check_internal_all_invariants(buf.memory())
+                .map_err(|e| TestCaseError::fail(format!("after build with high key: {}", e)))?;
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Arbitrary insert/remove sequences on an internal page preserve invariants.
+        #[test]
+        fn prop_internal_op_sequence_maintains_invariants(
+            ops in prop::collection::vec(internal_op_strategy(), 1..20)
+        ) {
+            // Build a minimal internal page: first_child only
+            let mut buf = PageBuffer::new();
+            {
+                let mut builder = InternalPageBuilder::<K>::new(1, buf.memory_mut());
+                builder.push_first_child(1);
+                builder.finish();
+            }
+
+            let mut next_child: u64 = 2;
+
+            for (i, op) in ops.iter().enumerate() {
+                match op {
+                    InternalOp::Insert { key, child_id } => {
+                        let acc = InternalPageAccessor::<K>::new(buf.memory());
+                        if !acc.can_fit(key.len()) {
+                            continue;
+                        }
+                        // Find insert position using binary search
+                        let n = acc.num_keys() as usize;
+                        let mut lo = 0usize;
+                        let mut hi = n;
+                        while lo < hi {
+                            let mid = lo + (hi - lo) / 2;
+                            if <K as Key>::compare(
+                                <K as common::Value>::as_bytes(&acc.key_at(mid)).as_ref(),
+                                key.as_slice(),
+                            ) == Ordering::Greater
+                            {
+                                hi = mid;
+                            } else {
+                                lo = mid + 1;
+                            }
+                        }
+
+                        // Skip if key already exists at this position
+                        if lo > 0 {
+                            let existing = acc.key_at(lo - 1);
+                            if <K as Key>::compare(
+                                <K as common::Value>::as_bytes(&existing).as_ref(),
+                                key.as_slice(),
+                            ) == Ordering::Equal
+                            {
+                                continue;
+                            }
+                        }
+
+                        let child = if *child_id == 0 { next_child } else { *child_id };
+                        next_child = next_child.max(child + 1);
+
+                        drop(acc);
+                        InternalPageMutator::<K>::new(buf.memory_mut())
+                            .insert_key_and_right_child(lo, &key.as_slice(), child)
+                            .unwrap();
+                    }
+                    InternalOp::RemoveLeft { index } => {
+                        let n = InternalPageAccessor::<K>::new(buf.memory())
+                            .num_keys() as usize;
+                        if n == 0 {
+                            continue;
+                        }
+                        let pos = (*index).min(n - 1);
+                        InternalPageMutator::<K>::new(buf.memory_mut())
+                            .remove_key_at(pos, ChildSide::Left);
+                    }
+                    InternalOp::RemoveRight { index } => {
+                        let n = InternalPageAccessor::<K>::new(buf.memory())
+                            .num_keys() as usize;
+                        if n == 0 {
+                            continue;
+                        }
+                        let pos = (*index).min(n - 1);
+                        InternalPageMutator::<K>::new(buf.memory_mut())
+                            .remove_key_at(pos, ChildSide::Right);
+                    }
+                }
+
+                // Check invariants after EVERY operation
+                check_internal_all_invariants(buf.memory()).map_err(|e| {
+                    TestCaseError::fail(format!(
+                        "Invariant violated after op #{} ({:?}): {}",
+                        i, op, e
+                    ))
+                })?;
+            }
+        }
+    }
+}
