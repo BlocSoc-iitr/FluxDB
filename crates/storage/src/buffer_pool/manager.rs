@@ -193,7 +193,8 @@ impl BufferPoolManager {
     ///
     /// * Returns [`BufferPoolError::InternalError`] if a disk I/O error occurs.
     pub fn flush_page(&self, page_id: u64) -> Result<()> {
-        self.get_shard(page_id).flush_page(page_id)
+        self.get_shard(page_id).flush_page(page_id)?;
+        Ok(())
     }
 
     /// Flushes all dirty pages in the buffer pool to disk.

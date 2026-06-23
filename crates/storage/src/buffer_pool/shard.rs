@@ -266,7 +266,15 @@ impl BufferPoolShard {
     /// # Errors
     ///
     /// * Returns [`BufferPoolError::InternalError`] if a disk I/O error occurs.
-    pub fn flush_page(&self, page_id: u64) -> Result<()> {
+    pub fn flush_page(&self, page_id: u64) -> Result<bool> {
+        self.flush_page_inner(page_id, true)
+    }
+
+    pub fn flush_page_without_sync(&self, page_id: u64) -> Result<bool> {
+        self.flush_page_inner(page_id, false)
+    }
+
+    fn flush_page_inner(&self, page_id: u64, sync_data: bool) -> Result<bool> {
         let (pid, frame_id) = {
             let mut inner = self.inner.lock().unwrap();
             if let Some(&id) = inner.page_table.get(&page_id) {
@@ -276,14 +284,19 @@ impl BufferPoolShard {
                     meta.pin_count += 1;
                     (meta.page_id, id)
                 } else {
-                    return Ok(());
+                    return Ok(false);
                 }
             } else {
-                return Ok(());
+                return Ok(false);
             }
         };
 
-        let res = self.write_frame_to_disk(frame_id, pid);
+        let res = self.write_frame_to_disk(frame_id, pid).and_then(|()| {
+            if sync_data {
+                self.disk_manager.sync_data()?;
+            }
+            Ok(())
+        });
 
         let mut inner = self.inner.lock().unwrap();
         let meta = &mut inner.metadata[frame_id];
@@ -296,10 +309,11 @@ impl BufferPoolShard {
             return Err(e);
         }
 
-        Ok(())
+        Ok(true)
     }
 
     pub fn flush_all_pages(&self) -> Result<()> {
+        let mut written_pages = Vec::new();
         let n_frames = self.pages.len();
         for frame_id in 0..n_frames {
             let (pid, is_dirty) = {
@@ -308,7 +322,20 @@ impl BufferPoolShard {
                 (meta.page_id, meta.is_dirty)
             };
             if is_dirty && pid != INVALID_FRAME_ID {
-                self.flush_page(pid)?;
+                if self.flush_page_without_sync(pid)? {
+                    written_pages.push(pid);
+                }
+            }
+        }
+        if !written_pages.is_empty() {
+            if let Err(e) = self.disk_manager.sync_data() {
+                let mut inner = self.inner.lock().unwrap();
+                for pid in written_pages {
+                    if let Some(&frame_id) = inner.page_table.get(&pid) {
+                        inner.metadata[frame_id].is_dirty = true;
+                    }
+                }
+                return Err(e.into());
             }
         }
         Ok(())
@@ -335,7 +362,6 @@ impl BufferPoolShard {
         crate::page::stamp_checksum(&mut buf);
 
         self.disk_manager.write_page(page_id, &buf)?;
-        self.disk_manager.sync_data()?;
         Ok(())
     }
 
