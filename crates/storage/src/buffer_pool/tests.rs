@@ -3,13 +3,13 @@ use crate::buffer_pool::replacer::ClockReplacer;
 use crate::disk::DiskManager;
 use crate::wal::Wal;
 use common::{MAX_FRAMES, MAX_PAGE_SIZE};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tempfile::{TempDir, tempdir};
 
 /// Build a `BufferPoolManager` backed by a throwaway WAL in `dir`. The WAL is
 /// required since the pool enforces WAL-before-page at its flush seam.
 fn make_bpm(disk_manager: Arc<DiskManager>, dir: &TempDir) -> BufferPoolManager {
-    let wal = Arc::new(Mutex::new(Wal::new(dir.path().join("test.wal")).unwrap()));
+    let wal = Arc::new(Wal::new(dir.path().join("wal")).unwrap());
     BufferPoolManager::new(disk_manager, wal)
 }
 

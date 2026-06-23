@@ -31,11 +31,9 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         // PageCompact FPI — only when compaction actually repacked the page.
         if dead_count > 0 {
             let fpi = <&[u8; PAGE_SIZE]>::try_from(&leaf_guard[..]).unwrap();
-            let lsn =
-                self.wal
-                    .lock()
-                    .unwrap()
-                    .log_page_compact(SYSTEM_TXN_ID, leaf_pid_actual, fpi)?;
+            let lsn = self
+                .wal
+                .log_page_compact(SYSTEM_TXN_ID, leaf_pid_actual, fpi)?;
             LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
 
             let key_bytes = K::as_bytes(key);
@@ -50,7 +48,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 mutator.set_xmin(slot, txn.txn_id);
 
                 // Insert logged separately under the real txn; compact avoided the split.
-                let lsn = self.wal.lock().unwrap().log_insert(
+                let lsn = self.wal.log_insert(
                     txn.txn_id,
                     leaf_pid_actual,
                     slot as u16,
@@ -80,7 +78,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             let mut mutator = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]);
             mutator.insert(s, key, value)?;
             mutator.set_xmin(s, txn.txn_id);
-            let lsn = self.wal.lock().unwrap().log_insert(
+            let lsn = self.wal.log_insert(
                 txn.txn_id,
                 leaf_pid_actual,
                 s as u16,
@@ -99,7 +97,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             let mut mutator = LeafPageMutator::<K, V>::new(&mut right[..]);
             mutator.insert(s, key, value)?;
             mutator.set_xmin(s, txn.txn_id);
-            let lsn = self.wal.lock().unwrap().log_insert(
+            let lsn = self.wal.log_insert(
                 txn.txn_id,
                 target_pid,
                 s as u16,
@@ -230,7 +228,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         let neigh = old_right_guard
             .as_ref()
             .map(|g| (g.page_id, <&[u8; PAGE_SIZE]>::try_from(&g[..]).unwrap()));
-        let lsn = self.wal.lock().unwrap().log_leaf_split(
+        let lsn = self.wal.log_leaf_split(
             SYSTEM_TXN_ID,
             (leaf_pid, left_fpi),
             (right_pid, right_fpi),
@@ -287,8 +285,6 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 let new_root_fpi = <&[u8; PAGE_SIZE]>::try_from(&new_root_guard[..]).unwrap();
                 let lsn = self
                     .wal
-                    .lock()
-                    .unwrap()
                     .log_new_root(SYSTEM_TXN_ID, (new_root_pid, new_root_fpi))?;
                 InternalPageMutator::<K>::new(&mut new_root_guard[..]).set_lsn(lsn);
                 crate::page::meta::set_lsn(&mut meta_guard[..], lsn);
@@ -344,7 +340,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                     &K::from_bytes(&sep_key),
                     right_pid,
                 )?;
-                let lsn = self.wal.lock().unwrap().log_insert_downlink(
+                let lsn = self.wal.log_insert_downlink(
                     SYSTEM_TXN_ID,
                     parent_pid,
                     idx as u16,
@@ -471,7 +467,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         // Atomic InternalSplit FPI set — left + new right.
         let left_fpi = <&[u8; PAGE_SIZE]>::try_from(&guard[..]).unwrap();
         let right_fpi = <&[u8; PAGE_SIZE]>::try_from(&right_guard[..]).unwrap();
-        let lsn = self.wal.lock().unwrap().log_internal_split(
+        let lsn = self.wal.log_internal_split(
             SYSTEM_TXN_ID,
             (internal_pid, left_fpi),
             (right_pid, right_fpi),

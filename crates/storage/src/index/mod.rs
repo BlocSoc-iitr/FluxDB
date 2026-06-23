@@ -19,6 +19,7 @@ use crate::page::{
     INTERNAL, InternalPageAccessor, InternalPageBuilder, InternalPageMutator, LEAF,
     LeafPageAccessor, LeafPageBuilder, LeafPageMutator, PAGE_SIZE, PageId,
 };
+use crate::wal::Wal;
 use common::IndexError;
 use db_core::transaction::Transaction;
 
@@ -47,7 +48,7 @@ type BTStack = Vec<BTStackEntry>;
 
 pub struct BTreeIndex<K: Key, V: Value> {
     pool: Arc<BufferPoolManager>,
-    wal: Arc<Mutex<crate::wal::Wal>>,
+    wal: Arc<Wal>,
     root: Mutex<PageId>,
     _key: PhantomData<K>,
     _val: PhantomData<V>,
@@ -56,7 +57,7 @@ pub struct BTreeIndex<K: Key, V: Value> {
 impl<K: Key, V: Value> BTreeIndex<K, V> {
     // ── Constructors ──────────────────────────────────────────────────────────
 
-    pub fn open(pool: Arc<BufferPoolManager>, wal: Arc<Mutex<crate::wal::Wal>>) -> Result<Self> {
+    pub fn open(pool: Arc<BufferPoolManager>, wal: Arc<Wal>) -> Result<Self> {
         // Page 0 is the superblock. fetch_page verifies its checksum, so a torn
         // write surfaces here as BufferPoolError::PageCorruption.
         let meta = pool.fetch_page(0)?;
@@ -100,10 +101,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         Ok(total_dead)
     }
 
-    pub fn create(
-        pool: Arc<BufferPoolManager>,
-        wal: Arc<Mutex<crate::wal::Wal>>,
-    ) -> Result<(Self, PageId)> {
+    pub fn create(pool: Arc<BufferPoolManager>, wal: Arc<Wal>) -> Result<(Self, PageId)> {
         let mut meta_guard = pool.new_page()?;
         let meta_pid = meta_guard.page_id;
         // create root page first
@@ -125,11 +123,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         *self.root.lock().unwrap()
     }
 
-    fn from_root(
-        pool: Arc<BufferPoolManager>,
-        wal: Arc<Mutex<crate::wal::Wal>>,
-        root: PageId,
-    ) -> Self {
+    fn from_root(pool: Arc<BufferPoolManager>, wal: Arc<Wal>, root: PageId) -> Self {
         Self {
             pool,
             wal,
@@ -291,7 +285,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                     // commit, never fsynced at insert time. Stamp the record's LSN as the
                     // page LSN so the gate flushes the WAL through it before the page lands.
                     let val_bytes = V::as_bytes(value);
-                    let lsn = self.wal.lock().unwrap().log_insert(
+                    let lsn = self.wal.log_insert(
                         txn.txn_id,
                         page_id,
                         slot as u16,
@@ -383,12 +377,9 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
 
             // Set xmax to mark this version as deleted by our transaction.
             let page_id = leaf_guard.page_id;
-            let lsn = self.wal.lock().unwrap().log_set_xmax(
-                txn.txn_id,
-                page_id,
-                visible_slot as u16,
-                txn.txn_id,
-            )?;
+            let lsn =
+                self.wal
+                    .log_set_xmax(txn.txn_id, page_id, visible_slot as u16, txn.txn_id)?;
             LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmax(visible_slot, txn.txn_id);
             LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
             return Ok(());
@@ -497,12 +488,9 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
 
             // ── ATOMIC: set xmax on old + insert new (same latch) ────────────
             let page_id = leaf_guard.page_id;
-            let _lsn_xmax = self.wal.lock().unwrap().log_set_xmax(
-                txn.txn_id,
-                page_id,
-                visible_slot as u16,
-                txn.txn_id,
-            )?;
+            let _lsn_xmax =
+                self.wal
+                    .log_set_xmax(txn.txn_id, page_id, visible_slot as u16, txn.txn_id)?;
             LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmax(visible_slot, txn.txn_id);
             // Find insert position for the new version.
             let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
@@ -512,7 +500,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             // If the new version fits in place, insert() cannot fail — so we can
             // log to the WAL *before* dirtying the page (WAL-before-page).
             if acc.can_fit_direct(key_len, val_bytes.as_ref().len()) {
-                let lsn = self.wal.lock().unwrap().log_insert(
+                let lsn = self.wal.log_insert(
                     txn.txn_id,
                     page_id,
                     slot as u16,

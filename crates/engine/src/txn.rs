@@ -34,9 +34,8 @@ where
             return Ok(());
         }
         {
-            let mut guard = self.wal.lock().unwrap();
-            let lsn = guard.log_commit(txn.txn_id)?;
-            guard.flush_up_to(lsn)?;
+            let lsn = self.wal.log_commit(txn.txn_id)?;
+            self.wal.flush_up_to(lsn)?;
             self.transaction_manager.mark_committed(txn.txn_id);
         }
         Ok(())
@@ -53,7 +52,7 @@ where
             return Ok(());
         }
         {
-            let _ = self.wal.lock().unwrap().log_abort(txn.txn_id)?;
+            let _ = self.wal.log_abort(txn.txn_id)?;
 
             self.transaction_manager.mark_aborted(txn.txn_id);
         }

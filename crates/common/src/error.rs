@@ -36,6 +36,19 @@ pub enum WalError {
     #[error("Corrupted log: {0}")]
     CorruptedLog(String),
 
+    #[error("WAL record too large: LSN {lsn} is {record_len} bytes, buffer capacity is {capacity}")]
+    RecordTooLarge {
+        lsn: u64,
+        record_len: usize,
+        capacity: usize,
+    },
+
+    #[error("WAL buffer full: need {needed} bytes, only {available} available")]
+    BufferFull { needed: usize, available: usize },
+
+    #[error("WAL background flush failed: {0}")]
+    FlushFailed(String),
+
     #[error("Invalid entry type: {0}")]
     InvalidEntryType(u8),
 

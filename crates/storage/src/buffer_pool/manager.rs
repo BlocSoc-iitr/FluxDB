@@ -18,7 +18,7 @@ impl BufferPoolManager {
     ///
     /// It initializes the shards and sets the `next_page_id` based on the
     /// current number of pages in the disk file.
-    pub fn new(disk_manager: Arc<DiskManager>, wal: Arc<Mutex<Wal>>) -> Self {
+    pub fn new(disk_manager: Arc<DiskManager>, wal: Arc<Wal>) -> Self {
         let existing_pages = disk_manager.num_pages().unwrap_or(0);
         let shard_size = MAX_FRAMES / NUM_SHARDS;
         let shards = (0..NUM_SHARDS)
@@ -220,6 +220,18 @@ impl BufferPoolManager {
         self.get_shard(page_id).delete_page(page_id)
     }
 
+    /// Ensures a page exists in the buffer pool and returns it for writing.
+    ///
+    /// Recovery uses this for redo records whose target page may be beyond the
+    /// current end of `data.db`. Existing pages are loaded and checksum-verified;
+    /// missing pages are materialized as zeroed frames and `next_page_id` is
+    /// advanced so later allocations cannot reuse recovered page IDs.
+    ///
+    /// # Errors
+    ///
+    /// * Returns [`BufferPoolError::NoEvictableFrames`] if no frame can be reserved.
+    /// * Returns [`BufferPoolError::PageCorruption`] if an existing page fails checksum verification.
+    /// * Returns [`BufferPoolError::Disk`] if the disk manager returns an I/O error.
     pub fn ensure_page(&self, page_id: u64) -> Result<PageWriteGuard<'_>> {
         let shard = self.get_shard(page_id);
         let (frame_id, needs_load) = shard.acquire_frame(page_id)?;

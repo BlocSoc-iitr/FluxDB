@@ -1,5 +1,14 @@
-//! Crash recovery: replays the WAL at startup to rebuild the CLOG and redo
-//! page changes, run before the engine serves queries. Redo-only (no undo).
+//! Crash recovery.
+//!
+//! Recovery replays WAL records at engine startup before the B+Tree index is
+//! opened. It rebuilds the transaction manager's CLOG from commit/abort records
+//! and redoes page changes that may not have reached `data.db`.
+//!
+//! ## Recovery Model
+//!
+//! This is redo-only recovery. Transactions that wrote records but never logged
+//! a commit or abort are marked aborted after the WAL scan. Their page changes
+//! may still be redone, but MVCC visibility hides them through the rebuilt CLOG.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -15,25 +24,35 @@ use crate::wal::{WalIterator, WalRecord, WalRecordType};
 
 pub type Result<T> = std::result::Result<T, IndexError>;
 
+/// Redo-only WAL recovery for one database directory.
+///
+/// The manager owns no background state. `Engine::open` constructs it with the
+/// freshly opened buffer pool, the WAL segment directory, and a fresh
+/// transaction manager, then calls [`RecoveryManager::recover`] before opening
+/// the index.
 pub struct RecoveryManager {
     pool: Arc<BufferPoolManager>,
-    wal_path: PathBuf,
+    wal_dir: PathBuf,
     tm: Arc<TransactionManager>,
 }
 
 impl RecoveryManager {
+    /// Creates a recovery manager over a WAL segment directory.
+    ///
+    /// `wal_dir` must be the same directory used by the live [`crate::wal::Wal`]
+    /// manager, usually `<db>/wal`.
     pub fn new(
         pool: Arc<BufferPoolManager>,
-        wal_path: PathBuf,
+        wal_dir: PathBuf,
         tm: Arc<TransactionManager>,
     ) -> Self {
-        Self { pool, wal_path, tm }
+        Self { pool, wal_dir, tm }
     }
 
     /// Replay the WAL in LSN order: rebuild the CLOG, mark crash victims, restore
     /// the txn-id allocator, and redo page changes. Idempotent (LSN-gated).
     pub fn recover<K: Key, V: Value>(&self) -> Result<()> {
-        let mut iter = WalIterator::new(&self.wal_path).map_err(WalError::Io)?;
+        let mut iter = WalIterator::new(&self.wal_dir).map_err(WalError::Io)?;
 
         // Every txn that did work, and the highest id seen.
         let mut seen: HashSet<u64> = HashSet::new();

@@ -134,12 +134,12 @@ pub struct BufferPoolShard {
     pub pages: Vec<RwLock<PageData>>,
     pub inner: Mutex<ShardInner>,
     pub load_done: Condvar, // singalled when any load finishes(success or fail)
-    pub wal: Arc<Mutex<Wal>>,
+    pub wal: Arc<Wal>,
 }
 
 impl BufferPoolShard {
     /// Creates a new `BufferPoolShard` with the specified number of frames.
-    pub fn new(disk_manager: Arc<DiskManager>, size: usize, wal: Arc<Mutex<Wal>>) -> Self {
+    pub fn new(disk_manager: Arc<DiskManager>, size: usize, wal: Arc<Wal>) -> Self {
         let mut metadata = Vec::with_capacity(size);
         let mut free_list = Vec::with_capacity(size);
         for frame_id in 0..size {
@@ -329,7 +329,7 @@ impl BufferPoolShard {
         // WAL-before-page: a page image carrying `page_lsn` must not reach disk
         // until the WAL is durable through `page_lsn`. No-op when already durable.
         // (`?` converts WalError → BufferPoolError via `#[from]`.)
-        self.wal.lock().unwrap().flush_up_to(page_lsn)?;
+        self.wal.flush_up_to(page_lsn)?;
 
         // Stamp the CRC32 on the outgoing copy so corruption is detectable on the next load
         crate::page::stamp_checksum(&mut buf);

@@ -7,17 +7,17 @@ use common::MAX_PAGE_SIZE;
 use std::mem::forget;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use tempfile::tempdir;
 
 /// Open a throwaway WAL under `dir`. The index and pool must share one WAL,
 /// so callers build it once here and clone the `Arc` to both.
-fn make_wal(dir: &Path) -> Arc<Mutex<Wal>> {
-    Arc::new(Mutex::new(Wal::new(dir.join("wal.log")).unwrap()))
+fn make_wal(dir: &Path) -> Arc<Wal> {
+    Arc::new(Wal::new(dir.join("wal")).unwrap())
 }
 
 /// Wrap `disk` in a pool backed by `wal` (required for WAL-before-page).
-fn make_pool(disk: Arc<DiskManager>, wal: Arc<Mutex<Wal>>) -> Arc<BufferPoolManager> {
+fn make_pool(disk: Arc<DiskManager>, wal: Arc<Wal>) -> Arc<BufferPoolManager> {
     Arc::new(BufferPoolManager::new(disk, wal))
 }
 
@@ -676,16 +676,12 @@ fn insert_logs_record_stamps_page_lsn_and_gate_flushes() {
         BTreeIndex::<&'static [u8], &'static [u8]>::create(pool.clone(), wal.clone()).unwrap();
 
     // `create` logs nothing, so the LSN counter starts at 1 (LSN 0 reserved).
-    assert_eq!(wal.lock().unwrap().next_lsn, 1);
+    assert_eq!(wal.next_lsn(), 1);
 
     // Two in-place inserts on the same leaf → two Insert records (LSN 1, 2).
     index.insert(&(&b"a"[..]), &(&b"1"[..]), &auto()).unwrap();
     index.insert(&(&b"b"[..]), &(&b"2"[..]), &auto()).unwrap();
-    assert_eq!(
-        wal.lock().unwrap().next_lsn,
-        3,
-        "each insert appends a record"
-    );
+    assert_eq!(wal.next_lsn(), 3, "each insert appends a record");
 
     // The leaf page must carry the latest insert's LSN (set_lsn under the latch).
     let leaf = pool.fetch_page(root).unwrap();
@@ -695,11 +691,7 @@ fn insert_logs_record_stamps_page_lsn_and_gate_flushes() {
     // Flushing the dirty leaf must drive the WAL durable through that page LSN
     // (the WAL-before-page gate firing on a real, non-zero LSN).
     pool.flush_all_pages().unwrap();
-    assert_eq!(
-        wal.lock().unwrap().flushed_lsn,
-        Some(2),
-        "gate flushed WAL to page LSN"
-    );
+    assert_eq!(wal.flushed_lsn(), Some(2), "gate flushed WAL to page LSN");
 }
 
 #[test]
@@ -717,13 +709,10 @@ fn delete_emits_one_setxmax() {
     let val: &[u8] = b"1";
     index.insert(&key, &val, &auto()).unwrap();
 
-    let n = wal.lock().unwrap().next_lsn;
+    let n = wal.next_lsn();
     assert_eq!(n, 2);
     index.delete(&key, &txn).unwrap();
-    assert!(
-        wal.lock().unwrap().next_lsn == n + 1,
-        "delete appends one record"
-    );
+    assert!(wal.next_lsn() == n + 1, "delete appends one record");
 
     // The leaf page must carry the latest delete's LSN (set_lsn under the latch).
     let leaf = pool.fetch_page(root).unwrap();
@@ -733,7 +722,7 @@ fn delete_emits_one_setxmax() {
     // Flushing the dirty leaf must drive the WAL durable through that page LSN
     // (the WAL-before-page gate firing on a real, non-zero LSN).
     pool.flush_all_pages().unwrap();
-    let mut it = WalIterator::new(dir.path().join("wal.log")).unwrap();
+    let mut it = WalIterator::new(dir.path().join("wal")).unwrap();
     it.next_record();
     let rec = it.next_record().unwrap().unwrap();
     assert!(rec.entry_type == WalRecordType::SetXMax);
@@ -761,14 +750,11 @@ fn update_emits_setxmax_then_insert_in_lsn_order() {
     let new_val: &[u8] = b"2";
     index.insert(&key, &val, &auto()).unwrap();
 
-    let n = wal.lock().unwrap().next_lsn;
+    let n = wal.next_lsn();
     assert_eq!(n, 2);
 
     index.update(&key, &new_val, &txn).unwrap();
-    assert!(
-        wal.lock().unwrap().next_lsn == n + 2,
-        "update appends two records"
-    );
+    assert!(wal.next_lsn() == n + 2, "update appends two records");
 
     // The leaf page must carry the latest delete's LSN (set_lsn under the latch).
     let leaf = pool.fetch_page(root).unwrap();
@@ -776,7 +762,7 @@ fn update_emits_setxmax_then_insert_in_lsn_order() {
     drop(leaf);
 
     pool.flush_all_pages().unwrap();
-    let mut it = WalIterator::new(dir.path().join("wal.log")).unwrap();
+    let mut it = WalIterator::new(dir.path().join("wal")).unwrap();
     it.next_record();
 
     let rec = it.next_record().unwrap().unwrap(); // SetXmax (LSN 2)
