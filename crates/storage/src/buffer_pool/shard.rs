@@ -330,23 +330,22 @@ impl BufferPoolShard {
                 let meta = &inner.metadata[frame_id];
                 (meta.page_id, meta.is_dirty)
             };
-            if is_dirty && pid != INVALID_FRAME_ID {
-                if self.flush_page_without_sync(pid)? {
-                    written_pages.push(pid);
-                }
+            if is_dirty && pid != INVALID_FRAME_ID && self.flush_page_without_sync(pid)? {
+                written_pages.push(pid);
             }
         }
-        if !written_pages.is_empty() {
-            if let Err(e) = self.disk_manager.sync_data() {
-                let mut inner = self.inner.lock().unwrap();
-                for pid in written_pages {
-                    if let Some(&frame_id) = inner.page_table.get(&pid) {
-                        inner.metadata[frame_id].is_dirty = true;
-                    }
+        if !written_pages.is_empty()
+            && let Err(e) = self.disk_manager.sync_data()
+        {
+            let mut inner = self.inner.lock().unwrap();
+            for pid in written_pages {
+                if let Some(&frame_id) = inner.page_table.get(&pid) {
+                    inner.metadata[frame_id].is_dirty = true;
                 }
-                return Err(e.into());
             }
+            return Err(e.into());
         }
+
         Ok(())
     }
 
