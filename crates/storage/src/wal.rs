@@ -1654,6 +1654,15 @@ mod tests {
         // Exactly the right number of LSNs were handed out.
         assert_eq!(all_lsns.len(), total, "wrong number of LSNs collected");
 
+        all_lsns.dedup();
+        assert_eq!(
+            all_lsns.len(),
+            total,
+            "Duplicate LSNs detected! Atomic implementation is broken."
+        );
+
+        assert_eq!(wal.next_lsn(), (total + 1) as u64);
+
         Ok(())
     }
 }
