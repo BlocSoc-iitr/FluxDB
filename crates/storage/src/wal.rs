@@ -58,7 +58,7 @@ use std::io::{self, BufRead, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::sync::atomic::{AtomicU64,Ordering};//
+use std::sync::atomic::{AtomicU64,Ordering};
 
 use crate::disk::DiskManager;
 use crate::page::{Lsn, PAGE_SIZE, PageId};
@@ -187,7 +187,8 @@ struct WalShared {
     flush_requested: Condvar,
     durable: Condvar,
     segment_size: u64,
-    next_lsn: AtomicU64,//
+    buffer_capacity: usize,
+    next_lsn: AtomicU64,
 }
 
 /// Write-ahead log manager for one WAL segment directory.
@@ -772,7 +773,7 @@ impl Wal {
 
         let shared = Arc::new(WalShared {
             state: Mutex::new(WalState {
-                buffer: WalBuffer::with_capacity(buffer_capacity),//
+                buffer: WalBuffer::with_capacity(buffer_capacity),
                 flushed_lsn,
                 flush_error: None,
                 shutdown: false,
@@ -780,6 +781,7 @@ impl Wal {
             flush_requested: Condvar::new(),
             durable: Condvar::new(),
             segment_size,
+            buffer_capacity,
             next_lsn: AtomicU64::new(next_lsn),
         });
 
@@ -1008,6 +1010,9 @@ impl Wal {
         let record_size = 8 + 4 + 1 + 1 + 8 + 2 + blocks_size + main_data_size + 4;
 
         let segment_limit = self.shared.segment_size as usize;
+        let buffer_limit = self.shared.buffer_capacity;
+        let max_allowed_size = segment_limit.min(buffer_limit);
+
         if record_size > segment_limit {
             return Err(WalError::RecordTooLarge {
                 lsn: 0,
@@ -1015,11 +1020,14 @@ impl Wal {
                 capacity: segment_limit,
             });
         }
+        if record_size > max_allowed_size {
+            return Err(WalError::RecordTooLarge {
+                lsn: self.shared.next_lsn.load(Ordering::Relaxed),
+                record_len: record_size,
+                capacity: max_allowed_size,
+             });
+        }
 
-        // let mut state = self.shared.state.lock().unwrap();
-        // if let Some(err) = state.flush_error.as_ref() {
-        //     return Err(WalError::FlushFailed(err.clone()));
-        // }
 
         let lsn = self.shared.next_lsn.fetch_add(1,Ordering::Relaxed);
 
@@ -1322,6 +1330,7 @@ mod tests {
 
         let wal = Wal::new_with_buffer_capacity(&wal_dir, 27)?;
         let result = wal.append(WalRecordType::Commit, 1, &[], None);
+        println!("LSN right after creation: {}", wal.next_lsn());
 
         assert!(matches!(
             result,
@@ -1608,4 +1617,6 @@ mod tests {
 
         Ok(())
     }
+
 }
+
