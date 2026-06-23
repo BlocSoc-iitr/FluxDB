@@ -473,4 +473,29 @@ mod tests {
         // other.txn_id != txn.txn_id, other is active → invisible
         assert!(!txn.is_visible(other.txn_id, 0));
     }
+    #[test]
+    fn vacuumable_after_committed_deleter_clog_entry_truncated() {
+        let tm = Arc::new(TransactionManager::new());
+
+        // Begin a transaction that will act as the deleter (xmax).
+        let deleter = make_txn(&tm);
+        let deleter_id = deleter.txn_id;
+
+        // Commit the deleter — its entry is now in the CLOG as Committed.
+        tm.mark_committed(deleter_id);
+
+        // --- Simulate CLOG truncation ---
+        // Begin a new transaction so global_xmin advances past the deleter.
+        let _newer_txn = tm.begin();
+
+        // Truncate the CLOG up to global_xmin, dropping the deleter's entry.
+        let horizon = tm.global_xmin();
+        tm.truncate_clog(horizon);
+
+        // The row: created by some committed transaction
+        let xmin = 1;
+        let xmax = deleter_id;
+
+        assert!(is_vacuumable(xmin, xmax, horizon, &tm));
+    }
 }

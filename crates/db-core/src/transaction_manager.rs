@@ -259,7 +259,7 @@ impl TransactionManager {
             TransactionStatus::Committed
         } else if self.is_aborted(txn_id) {
             TransactionStatus::Aborted
-        } else if txn_id < self.global_xmin(){
+        } else if txn_id < self.global_xmin() {
             TransactionStatus::Committed
         } else {
             TransactionStatus::Active
