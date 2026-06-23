@@ -101,10 +101,10 @@ impl TransactionManager {
     }
 
     /// Truncates the CLOG, removing entries older than `horizon`.
-    /// 
-    /// Note: We ONLY remove `Committed` entries. `Aborted` entries must be retained forever 
-    /// (or until a physical vacuum confirms their records are gone) because dropping an `Aborted` 
-    /// entry before its dirty records are vacuumed would cause our presumed-commit logic to 
+    ///
+    /// Note: We ONLY remove `Committed` entries. `Aborted` entries must be retained forever
+    /// (or until a physical vacuum confirms their records are gone) because dropping an `Aborted`
+    /// entry before its dirty records are vacuumed would cause our presumed-commit logic to
     /// suddenly treat those aborted records as visible `Committed` records, breaking isolation.
     pub fn truncate_clog(&self, horizon: u64) {
         let mut clog = self.clog.write().unwrap();
@@ -526,8 +526,14 @@ mod tests {
         // Committed should be dropped
         assert!(!clog.contains_key(&txn_commit.txn_id));
         // Aborted should be retained to prevent visible-aborted-data bug
-        assert_eq!(clog.get(&txn_abort.txn_id), Some(&TransactionStatus::Aborted));
+        assert_eq!(
+            clog.get(&txn_abort.txn_id),
+            Some(&TransactionStatus::Aborted)
+        );
         // Active is retained automatically because it's active
-        assert_eq!(clog.get(&txn_active.txn_id), Some(&TransactionStatus::Active));
+        assert_eq!(
+            clog.get(&txn_active.txn_id),
+            Some(&TransactionStatus::Active)
+        );
     }
 }

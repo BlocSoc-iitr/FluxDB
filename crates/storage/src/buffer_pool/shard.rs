@@ -263,6 +263,11 @@ impl BufferPoolShard {
     }
     /// Flushes a specific page to disk if it is dirty.
     ///
+    /// This public shard path is used by explicit single-page flushes, so it
+    /// syncs the data file before returning. Batch callers use
+    /// [`Self::flush_page_without_sync`] and issue one shared sync after all
+    /// page writes complete.
+    ///
     /// # Errors
     ///
     /// * Returns [`BufferPoolError::InternalError`] if a disk I/O error occurs.
@@ -270,6 +275,10 @@ impl BufferPoolShard {
         self.flush_page_inner(page_id, true)
     }
 
+    /// Writes a dirty page without syncing the data file.
+    ///
+    /// WAL-before-page is still enforced inside `write_frame_to_disk`; only the
+    /// data-file sync is deferred so `flush_all_pages` can batch it.
     pub fn flush_page_without_sync(&self, page_id: u64) -> Result<bool> {
         self.flush_page_inner(page_id, false)
     }
@@ -358,9 +367,11 @@ impl BufferPoolShard {
         // (`?` converts WalError → BufferPoolError via `#[from]`.)
         self.wal.flush_up_to(page_lsn)?;
 
-        // Stamp the CRC32 on the outgoing copy so corruption is detectable on the next load
+        // Stamp the CRC32 on the outgoing copy so corruption is detectable on the next load.
         crate::page::stamp_checksum(&mut buf);
 
+        // Only write bytes here. The caller decides whether to sync immediately
+        // (`flush_page`) or after a group of writes (`flush_all_pages`).
         self.disk_manager.write_page(page_id, &buf)?;
         Ok(())
     }

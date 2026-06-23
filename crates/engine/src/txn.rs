@@ -33,7 +33,7 @@ where
             self.transaction_manager.mark_committed(txn.txn_id);
             return Ok(());
         }
-        
+
         let lsn_res = self.wal.log_commit(txn.txn_id);
         if let Ok(lsn) = lsn_res {
             if let Err(e) = self.wal.flush_up_to(lsn) {
