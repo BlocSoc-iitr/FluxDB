@@ -873,17 +873,17 @@ mod proptests {
         let acc = InternalPageAccessor::<K>::new(page);
         let n = acc.num_keys() as usize;
 
-        // Make sure keys are sorted
+        // Make sure keys are sorted (allow duplicates for MVCC)
         for i in 0..n.saturating_sub(1) {
             let k1 = acc.key_at(i);
             let k2 = acc.key_at(i + 1);
             if <K as Key>::compare(
                 <K as common::Value>::as_bytes(&k1).as_ref(),
                 <K as common::Value>::as_bytes(&k2).as_ref(),
-            ) != Ordering::Less
+            ) == Ordering::Greater
             {
                 return Err(format!(
-                    "keys_not_sorted: key[{}] ({:?}) >= key[{}] ({:?})",
+                    "keys_not_sorted: key[{}] ({:?}) > key[{}] ({:?})",
                     i,
                     k1,
                     i + 1,
@@ -897,7 +897,7 @@ mod proptests {
             for i in 0..n {
                 let k = acc.key_at(i);
                 if <K as Key>::compare(<K as common::Value>::as_bytes(&k).as_ref(), hk)
-                    != Ordering::Less
+                    == Ordering::Greater
                 {
                     return Err(format!(
                         "key_exceeds_high_key: key[{}] ({:?}) >= high_key ({:?})",
@@ -921,9 +921,14 @@ mod proptests {
 
     type K = &'static [u8];
 
-    /// Generate random keys (same as leaf page tests)
+    /// Generate random keys (same as lea`f page tests)
     fn key_strategy() -> impl Strategy<Value = Vec<u8>> {
-        prop::collection::vec(any::<u8>(), 1..=16usize)
+        prop_oneof![
+            // 80% chance: small pool of keys (length 1-2, values 0-3) to ensure duplicates
+            80 => prop::collection::vec(0u8..4u8, 1..=2usize),
+            // 20% chance: completely random keys up to 16 bytes
+            20 => prop::collection::vec(any::<u8>(), 1..=16usize),
+        ]
     }
 
     /// Operations we can do on internal pages
@@ -945,10 +950,9 @@ mod proptests {
         ]
     }
 
-    /// Sort and deduplicate keys, returning sorted unique keys.
-    fn sort_dedup_keys(mut keys: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    /// Sort keys, returning sorted keys (allowing duplicates).
+    fn sort_keys(mut keys: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
         keys.sort();
-        keys.dedup();
         keys
     }
 
@@ -963,7 +967,7 @@ mod proptests {
             keys in prop::collection::vec(key_strategy(), 1..20),
             first_child in 1u64..1000,
         ) {
-            let sorted = sort_dedup_keys(keys);
+            let sorted = sort_keys(keys);
             let mut buf = PageBuffer::new();
             let mut builder = InternalPageBuilder::<K>::new(1, buf.memory_mut());
             builder.push_first_child(first_child);
@@ -993,7 +997,7 @@ mod proptests {
             keys in prop::collection::vec(key_strategy(), 1..15),
             first_child in 1u64..1000,
         ) {
-            let sorted = sort_dedup_keys(keys);
+            let sorted = sort_keys(keys);
             let mut buf = PageBuffer::new();
 
             let high_key = vec![0xFF; 17]; // larger than any 16-byte key
@@ -1057,18 +1061,6 @@ mod proptests {
                                 hi = mid;
                             } else {
                                 lo = mid + 1;
-                            }
-                        }
-
-                        // Skip if key already exists at this position
-                        if lo > 0 {
-                            let existing = acc.key_at(lo - 1);
-                            if <K as Key>::compare(
-                                <K as common::Value>::as_bytes(&existing).as_ref(),
-                                key.as_slice(),
-                            ) == Ordering::Equal
-                            {
-                                continue;
                             }
                         }
 
