@@ -21,7 +21,7 @@
 //! by an active transaction, the current transaction loses (returns
 //! `WriteConflict`). The first transaction to set `xmax` wins.
 
-use crate::transaction_manager::TransactionManager;
+use crate::transaction_manager::{TransactionManager, TransactionStatus};
 use std::sync::Arc;
 
 /// A transaction's identity and its point-in-time view of the database.
@@ -217,12 +217,12 @@ pub fn is_visible(rec_xmin: u64, rec_xmax: u64, snap: &Snapshot, tm: &Transactio
 ///    - AND older than the global horizon (no active txn can see the old state).
 pub fn is_vacuumable(xmin: u64, xmax: u64, horizon: u64, tm: &TransactionManager) -> bool {
     // 1. Aborted records are always dead.
-    if tm.is_aborted(xmin) {
+    if tm.settled_status(xmin) == TransactionStatus::Aborted {
         return true;
     }
 
     // 2. If not deleted (xmax=0) or the deleter hasn't committed yet, it's live.
-    if xmax == 0 || !tm.is_committed(xmax) {
+    if xmax == 0 || tm.settled_status(xmax) != TransactionStatus::Committed {
         return false;
     }
 
@@ -472,5 +472,30 @@ mod tests {
         let txn = make_txn(&tm);
         // other.txn_id != txn.txn_id, other is active → invisible
         assert!(!txn.is_visible(other.txn_id, 0));
+    }
+    #[test]
+    fn vacuumable_after_committed_deleter_clog_entry_truncated() {
+        let tm = Arc::new(TransactionManager::new());
+
+        // Begin a transaction that will act as the deleter (xmax).
+        let deleter = make_txn(&tm);
+        let deleter_id = deleter.txn_id;
+
+        // Commit the deleter — its entry is now in the CLOG as Committed.
+        tm.mark_committed(deleter_id);
+
+        // --- Simulate CLOG truncation ---
+        // Begin a new transaction so global_xmin advances past the deleter.
+        let _newer_txn = tm.begin();
+
+        // Truncate the CLOG up to global_xmin, dropping the deleter's entry.
+        let horizon = tm.global_xmin();
+        tm.truncate_clog(horizon);
+
+        // The row: created by some committed transaction
+        let xmin = 1;
+        let xmax = deleter_id;
+
+        assert!(is_vacuumable(xmin, xmax, horizon, &tm));
     }
 }

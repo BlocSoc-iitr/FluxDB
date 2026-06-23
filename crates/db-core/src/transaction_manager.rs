@@ -253,6 +253,18 @@ impl TransactionManager {
             active: active.iter().cloned().collect(),
         }
     }
+
+    pub fn settled_status(&self, txn_id: u64) -> TransactionStatus {
+        if self.is_committed(txn_id) {
+            TransactionStatus::Committed
+        } else if self.is_aborted(txn_id) {
+            TransactionStatus::Aborted
+        } else if txn_id < self.global_xmin() {
+            TransactionStatus::Committed
+        } else {
+            TransactionStatus::Active
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
