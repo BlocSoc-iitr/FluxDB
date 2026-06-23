@@ -196,8 +196,6 @@ where
         }
     }
 
-
-
     pub fn begin(&self) -> TxnHandle<'_, K, V> {
         TxnHandle {
             engine: self,
