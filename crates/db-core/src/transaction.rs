@@ -21,7 +21,7 @@
 //! by an active transaction, the current transaction loses (returns
 //! `WriteConflict`). The first transaction to set `xmax` wins.
 
-use crate::transaction_manager::TransactionManager;
+use crate::transaction_manager::{TransactionManager, TransactionStatus};
 use std::sync::Arc;
 
 /// A transaction's identity and its point-in-time view of the database.
@@ -217,12 +217,12 @@ pub fn is_visible(rec_xmin: u64, rec_xmax: u64, snap: &Snapshot, tm: &Transactio
 ///    - AND older than the global horizon (no active txn can see the old state).
 pub fn is_vacuumable(xmin: u64, xmax: u64, horizon: u64, tm: &TransactionManager) -> bool {
     // 1. Aborted records are always dead.
-    if tm.is_aborted(xmin) {
+    if tm.settled_status(xmin) == TransactionStatus::Aborted {
         return true;
     }
 
     // 2. If not deleted (xmax=0) or the deleter hasn't committed yet, it's live.
-    if xmax == 0 || !tm.is_committed(xmax) {
+    if xmax == 0 || tm.settled_status(xmax) != TransactionStatus::Committed {
         return false;
     }
 
