@@ -102,7 +102,11 @@ impl TransactionManager {
 
     pub fn truncate_clog(&self, horizon: u64) {
         let mut clog = self.clog.write().unwrap();
-        clog.retain(|&txn_id, status| txn_id >= horizon || *status == TransactionStatus::Active);
+        clog.retain(|&txn_id, status| {
+            txn_id >= horizon
+                || *status == TransactionStatus::Active
+                || *status == TransactionStatus::Aborted
+        });
     }
 
     /// Begins a new transaction synchronously, establishing its `Snapshot`.

@@ -57,7 +57,6 @@ use std::fs::{File, OpenOptions, create_dir_all, metadata, read_dir};
 use std::io::{self, BufRead, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread::{self, JoinHandle};
 
 use crate::disk::DiskManager;
 use crate::page::{Lsn, PAGE_SIZE, PageId};
@@ -1085,14 +1084,15 @@ impl Wal {
                 state = self.shared.durable.wait(state).unwrap();
             } else {
                 state.is_flushing = true;
-                
-                let (records, bytes_to_consume, durable_lsn) = if let Some((bytes, dur_lsn)) = state.buffer.buffered_prefix_len() {
-                    (state.buffer.copy_records(), bytes, dur_lsn)
-                } else {
-                    state.is_flushing = false;
-                    self.shared.durable.notify_all();
-                    return Ok(());
-                };
+
+                let (records, bytes_to_consume, durable_lsn) =
+                    if let Some((bytes, dur_lsn)) = state.buffer.buffered_prefix_len() {
+                        (state.buffer.copy_records(), bytes, dur_lsn)
+                    } else {
+                        state.is_flushing = false;
+                        self.shared.durable.notify_all();
+                        return Ok(());
+                    };
 
                 drop(state);
 
