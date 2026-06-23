@@ -186,6 +186,7 @@ struct WalShared {
     state: Mutex<WalState>,
     flush_requested: Condvar,
     durable: Condvar,
+    segment_size: u64,
 }
 
 /// Write-ahead log manager for one WAL segment directory.
@@ -765,6 +766,7 @@ impl Wal {
             }
         }
 
+        let segment_size = layout.segment_size;
         let writer = SegmentWriter::open(layout)?;
 
         let shared = Arc::new(WalShared {
@@ -777,6 +779,7 @@ impl Wal {
             }),
             flush_requested: Condvar::new(),
             durable: Condvar::new(),
+            segment_size,
         });
 
         let flusher = Some(Self::spawn_flush_thread(Arc::clone(&shared), writer)?);
@@ -986,15 +989,6 @@ impl Wal {
         blocks: &[Block<'_>],
         main_data: Option<&[u8]>,
     ) -> Result<Lsn> {
-        let mut state = self.shared.state.lock().unwrap();
-        if let Some(err) = state.flush_error.as_ref() {
-            return Err(WalError::FlushFailed(err.clone()));
-        }
-
-        let lsn = state.next_lsn;
-
-        let mut record = Vec::with_capacity(4096);
-
         let blocks_size = blocks
             .iter()
             .map(|block| {
@@ -1010,8 +1004,25 @@ impl Wal {
             .sum::<usize>();
 
         let main_data_size = main_data.as_ref().map_or(0, |data| data.len());
-
         let record_size = 8 + 4 + 1 + 1 + 8 + 2 + blocks_size + main_data_size + 4;
+
+        let segment_limit = self.shared.segment_size as usize;
+        if record_size > segment_limit {
+            return Err(WalError::RecordTooLarge {
+                lsn: 0,
+                record_len: record_size,
+                capacity: segment_limit,
+            });
+        }
+
+        let mut state = self.shared.state.lock().unwrap();
+        if let Some(err) = state.flush_error.as_ref() {
+            return Err(WalError::FlushFailed(err.clone()));
+        }
+
+        let lsn = state.next_lsn;
+
+        let mut record = Vec::with_capacity(record_size);
         record.reserve(record_size);
 
         record.extend_from_slice(&lsn.to_le_bytes());
@@ -1054,23 +1065,24 @@ impl Wal {
 
     /// Flushes pending WAL bytes through `lsn`.
     ///
-    /// LSN 0 is the null pageLSN, so it never needs flushing. Commit code calls
-    /// this before publishing a write transaction as committed; the buffer pool
-    /// calls it before writing a page image whose pageLSN is non-zero.
+    /// LSN 0 is the null pageLSN, so it never needs flushing. If the WAL has no
+    /// appended records yet (`next_lsn <= 1`), or the clamped target resolves to
+    /// 0, the call is a no-op — preventing a permanent park on the `durable`
+    /// condvar.
     pub fn flush_up_to(&self, lsn: Lsn) -> Result<()> {
-        if lsn == 0 {
-            return Ok(());
-        }
-
         let mut state = self.shared.state.lock().unwrap();
 
-        let Some(target_lsn) = state
+        // Guard the *clamped target*, not just the argument. When next_lsn == 1
+        // (no records appended), checked_sub(1) yields Some(0) and the flusher
+        // has nothing buffered, so parking on `durable` would hang forever.
+        let target_lsn = state
             .next_lsn
             .checked_sub(1)
-            .map(|last_lsn| lsn.min(last_lsn))
-        else {
+            .map(|last| lsn.min(last))
+            .unwrap_or(0);
+        if target_lsn == 0 {
             return Ok(());
-        };
+        }
 
         loop {
             if state
@@ -1138,6 +1150,8 @@ fn run_flush_thread(shared: Arc<WalShared>, writer: &mut SegmentWriter) {
             }
             Err(err) => {
                 state.flush_error = Some(err.to_string());
+                shared.durable.notify_all();
+                return;
             }
         }
         shared.durable.notify_all();
@@ -1495,6 +1509,96 @@ mod tests {
             "Garbage bytes were not truncated! Expected len {}, got {}",
             clean_len, new_file_len
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_flush_up_to_on_empty_wal_does_not_deadlock() -> Result<()> {
+        let dir = tempdir().map_err(WalError::Io)?;
+        let wal_dir = dir.path().join("empty-flush-wal");
+
+        let wal = Wal::new(&wal_dir)?;
+
+        // No records appended: next_lsn == 1, flushed_lsn == None.
+        // flush_up_to(5) must return Ok immediately — not park.
+        wal.flush_up_to(5)?;
+        // Also verify that flush_up_to(0) (null pageLSN) is a no-op.
+        wal.flush_up_to(0)?;
+        // And flush_up_to(1) on a WAL that hasn't had anything appended.
+        wal.flush_up_to(1)?;
+
+        Ok(())
+    }
+
+    /// Finding 2+8: after a persistent I/O error the flush thread must reach
+    /// a terminal state — record the error, wake all waiters, and stop.
+    /// Before the fix the thread hot-retried the same failing write, spinning
+    /// a core and never draining the buffer.
+    #[test]
+    fn test_flush_thread_stops_on_io_error() -> Result<()> {
+        let dir = tempdir().map_err(WalError::Io)?;
+        let wal_dir = dir.path().join("io-error-wal");
+
+        let wal = Wal::new(&wal_dir)?;
+        wal.append(WalRecordType::Commit, 1, &[], None)?;
+
+        // Remove the WAL directory to force an I/O error on the next flush.
+        std::fs::remove_dir_all(&wal_dir).map_err(WalError::Io)?;
+
+        let result = wal.flush_up_to(1);
+        assert!(
+            matches!(result, Err(WalError::FlushFailed(_))),
+            "Expected FlushFailed, got {:?}",
+            result
+        );
+
+        // Subsequent appends should also fail with FlushFailed.
+        let result = wal.append(WalRecordType::Commit, 2, &[], None);
+        assert!(
+            matches!(result, Err(WalError::FlushFailed(_))),
+            "Expected FlushFailed on subsequent append, got {:?}",
+            result
+        );
+
+        Ok(())
+    }
+
+    /// Finding 7: records that exceed the segment size must be rejected at
+    /// `append` time (before the LSN is consumed), not later on the flusher.
+    /// This prevents the scenario where append succeeds but the flusher fails
+    /// and sets `flush_error`, stranding an acknowledged record.
+    #[test]
+    fn test_segment_size_check_in_append() -> Result<()> {
+        let dir = tempdir().map_err(WalError::Io)?;
+        let wal_dir = dir.path().join("segment-limit-wal");
+
+        // buffer_capacity=4096 > segment_size=30. A minimal commit record is
+        // 28 bytes, which fits under segment_size=30. But a record with block
+        // data will exceed it.
+        let wal = Wal::new_with_options(&wal_dir, 4096, 30)?;
+
+        // A bare commit (28 bytes) should succeed — under the 30-byte limit.
+        let lsn = wal.append(WalRecordType::Commit, 1, &[], None)?;
+        assert_eq!(lsn, 1);
+
+        // A record with block data that pushes it over 30 bytes must fail
+        // synchronously with RecordTooLarge (not BufferFull), and the LSN must
+        // not be consumed.
+        let block = Block {
+            page_id: 42,
+            blk_flags: BLK_HAS_DATA,
+            fpi: None,
+            data: Some(&[1, 2, 3, 4]),
+        };
+        let result = wal.append(WalRecordType::Insert, 2, &[block], None);
+        assert!(
+            matches!(result, Err(WalError::RecordTooLarge { .. })),
+            "Expected RecordTooLarge, got {:?}",
+            result
+        );
+        // LSN must not have been consumed.
+        assert_eq!(wal.next_lsn(), 2);
 
         Ok(())
     }
