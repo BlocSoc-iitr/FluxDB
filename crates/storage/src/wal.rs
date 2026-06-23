@@ -56,9 +56,9 @@ use std::collections::VecDeque;
 use std::fs::{File, OpenOptions, create_dir_all, metadata, read_dir};
 use std::io::{self, BufRead, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::sync::atomic::{AtomicU64,Ordering};
 
 use crate::disk::DiskManager;
 use crate::page::{Lsn, PAGE_SIZE, PageId};
@@ -176,7 +176,7 @@ struct WalBuffer {
 }
 
 struct WalState {
-    buffer: WalBuffer,//
+    buffer: WalBuffer, //
     flushed_lsn: Option<Lsn>,
     flush_error: Option<String>,
     shutdown: bool,
@@ -1025,11 +1025,10 @@ impl Wal {
                 lsn: self.shared.next_lsn.load(Ordering::Relaxed),
                 record_len: record_size,
                 capacity: max_allowed_size,
-             });
+            });
         }
 
-
-        let lsn = self.shared.next_lsn.fetch_add(1,Ordering::Relaxed);
+        let lsn = self.shared.next_lsn.fetch_add(1, Ordering::Relaxed);
 
         let mut record = Vec::with_capacity(record_size);
         record.reserve(record_size);
@@ -1066,9 +1065,9 @@ impl Wal {
         let checksum = hasher.finalize();
 
         record.extend_from_slice(&checksum.to_le_bytes());
-        
+
         let mut state = self.shared.state.lock().unwrap();
-        if let Some(err) = state.flush_error.as_ref(){
+        if let Some(err) = state.flush_error.as_ref() {
             return Err(WalError::FlushFailed(err.clone()));
         }
 
@@ -1618,5 +1617,43 @@ mod tests {
         Ok(())
     }
 
-}
+    #[test]
+    fn test_atomic_lsn_isunique() -> Result<()> {
+        let dir = tempdir().map_err(WalError::Io)?;
+        let wal_dir = dir.path().join("atomic-lsn-wal");
 
+        let wal = Arc::new(Wal::new(&wal_dir)?);
+
+        let number_thread = 8;
+        let record_per_thread = 500;
+
+        let handle: Vec<_> = (0..number_thread)
+            .map(|thread_id| {
+                let wal = Arc::clone(&wal);
+                thread::spawn(move || -> Vec<Lsn> {
+                    (0..record_per_thread)
+                        .map(|i| {
+                            let tx_id = (thread_id * 100 + i) as u64;
+                            wal.log_commit(tx_id)
+                                .expect("concurrent append must not fail")
+                        })
+                        .collect()
+                })
+            })
+            .collect();
+
+        let mut all_lsns: Vec<Lsn> = handle
+            .into_iter()
+            .flat_map(|h| h.join().expect("thread panicked"))
+            .collect();
+
+        all_lsns.sort_unstable();
+
+        let total = number_thread * record_per_thread;
+
+        // Exactly the right number of LSNs were handed out.
+        assert_eq!(all_lsns.len(), total, "wrong number of LSNs collected");
+
+        Ok(())
+    }
+}
