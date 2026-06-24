@@ -44,3 +44,26 @@ fn update_survives_crash() {
     let e = TestEngine::open(dir.path()).unwrap();
     assert_eq!(e.get(&leak(b"k")).unwrap(), Some(b"v2".to_vec()));
 }
+
+#[test]
+fn double_recovery_is_idempotent() {
+    let dir = TempDir::new().unwrap();
+    
+    let e = TestEngine::create(dir.path()).unwrap();
+    for i in 0u32..300 {
+        let k = leak(&i.to_be_bytes());
+        e.insert(&k, &k).unwrap();
+    }
+     // crash
+    let e = TestEngine::open(dir.path()).unwrap();
+    for i in 0u32..300 {
+        let k = leak(&i.to_be_bytes());
+        assert_eq!(e.get(&k).unwrap().as_deref(), Some(&i.to_be_bytes()[..]));
+    }
+     // drop — no new writes
+    let e = TestEngine::open(dir.path()).unwrap();
+    for i in 0u32..300 {
+        let k = leak(&i.to_be_bytes());
+        assert_eq!(e.get(&k).unwrap().as_deref(), Some(&i.to_be_bytes()[..]));
+    }
+}
