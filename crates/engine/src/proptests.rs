@@ -1,11 +1,5 @@
 //! Property-based tests for the B+Tree, driven through the real engine API.
 //!
-//! Steps 2–4 of the proptest plan (issue #47). Behavioral correctness flows
-//! through the engine's genuine autocommit / `begin`-commit lifecycle (real WAL
-//! durable commits); the structural walker reaches the live pages via the
-//! engine's `pub(crate)` index/buffer-pool — only possible from an in-crate test
-//! module, which is why these live here rather than in `tests/`.
-//!
 //! The harness, walker, and oracle are **generic over the key/value types**, so
 //! the same machinery runs against fixed-width `u32` keys *and* variable-length
 //! `String` / `Vec<u8>` keys (varint length prefixes, variable-width page
@@ -22,7 +16,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use storage::buffer_pool::BufferPoolManager;
 use storage::index::BTreeIndex;
-use storage::page::{INTERNAL, InternalPageAccessor, LEAF, LeafPageAccessor, PageId, is_incomplete_split, meta};
+use storage::page::{
+    INTERNAL, InternalPageAccessor, LEAF, LeafPageAccessor, PageId, is_incomplete_split, meta,
+};
 use tempfile::TempDir;
 
 use crate::Engine;
@@ -76,7 +72,16 @@ fn check_invariants<K: Key, V: Value>(
     let mut reached: BTreeSet<PageId> = BTreeSet::new();
     let mut leaf_depths: Vec<usize> = Vec::new();
     let mut topdown_leaves: BTreeSet<PageId> = BTreeSet::new();
-    walk::<K, V>(pool, root, 0, None, None, &mut reached, &mut leaf_depths, &mut topdown_leaves)?;
+    walk::<K, V>(
+        pool,
+        root,
+        0,
+        None,
+        None,
+        &mut reached,
+        &mut leaf_depths,
+        &mut topdown_leaves,
+    )?;
 
     // distance from root to leaf is equal for all leaves
     // d0 is the distance of first leaf
@@ -91,7 +96,9 @@ fn check_invariants<K: Key, V: Value>(
 
     // No INCOMPLETE_SPLIT flag at a quiescent point. INCOMPLETE_SPLIT flag shouldn't be set unless a crash occured mid-way
     for &pid in &reached {
-        let page = pool.fetch_page(pid).map_err(|e| format!("fetch {pid}: {e}"))?;
+        let page = pool
+            .fetch_page(pid)
+            .map_err(|e| format!("fetch {pid}: {e}"))?;
         if is_incomplete_split(&page[..]) {
             return Err(format!("page {pid} has INCOMPLETE_SPLIT set at rest"));
         }
@@ -113,12 +120,14 @@ fn check_invariants<K: Key, V: Value>(
     let mut rev = chain.clone();
     rev.reverse();
     if pchain != rev {
-        return Err(format!("prev chain {pchain:?} != reverse of rightlink chain {rev:?}"));
+        return Err(format!(
+            "prev chain {pchain:?} != reverse of rightlink chain {rev:?}"
+        ));
     }
 
-    // When the HALF_DEAD flag / free-list are tracked, a
-    // stronger check can exist here: every non-reachable in-range page is HALF_DEAD or
-    // free (uses `pool.page_count()`).
+    // When the HALF_DEAD flag / free-list are tracked, a stronger check can exist
+    // here: every non-reachable in-range page is HALF_DEAD or free. That would
+    // need a page-count accessor on BufferPoolManager (removed for now — no caller).
 
     // Meta page-0 root agrees with the in-memory root.
     let meta_page = pool.fetch_page(0).map_err(|e| format!("fetch meta: {e}"))?;
@@ -133,7 +142,11 @@ fn check_invariants<K: Key, V: Value>(
 /// check parent's separator and child_high_key is same.
 /// expected is the separator that is passed as "high"
 /// pid is passed just for debugging
-fn check_high_key<K: Key>(stored: Option<&[u8]>, expected: Option<&[u8]>, pid: PageId) -> Result<(), String> {
+fn check_high_key<K: Key>(
+    stored: Option<&[u8]>,
+    expected: Option<&[u8]>,
+    pid: PageId,
+) -> Result<(), String> {
     match (stored, expected) {
         (None, None) => Ok(()),
         (Some(s), Some(e)) if K::compare(s, e) == Ordering::Equal => Ok(()),
@@ -164,9 +177,13 @@ fn walk<K: Key, V: Value>(
     // we've been here before — a link cycle or a page with two parents. This one
     // check covers both, immediately and by page id.
     if !reached.insert(pid) {
-        return Err(format!("page {pid} reached more than once — cycle or cross-link"));
+        return Err(format!(
+            "page {pid} reached more than once — cycle or cross-link"
+        ));
     }
-    let page = pool.fetch_page(pid).map_err(|e| format!("fetch {pid}: {e}"))?;
+    let page = pool
+        .fetch_page(pid)
+        .map_err(|e| format!("fetch {pid}: {e}"))?;
     match page[0] {
         LEAF => {
             leaf_depths.push(depth);
@@ -177,12 +194,16 @@ fn walk<K: Key, V: Value>(
                 if let Some(lo) = low
                     && K::compare(&k, lo) == Ordering::Less
                 {
-                    return Err(format!("leaf {pid}: key below inherited lower bound — misrouted"));
+                    return Err(format!(
+                        "leaf {pid}: key below inherited lower bound — misrouted"
+                    ));
                 }
                 if let Some(hi) = high
                     && K::compare(&k, hi) == Ordering::Greater
                 {
-                    return Err(format!("leaf {pid}: key above inherited upper bound — misrouted"));
+                    return Err(format!(
+                        "leaf {pid}: key above inherited upper bound — misrouted"
+                    ));
                 }
             }
             check_high_key::<K>(acc.high_key_bytes(), high, pid)
@@ -203,8 +224,16 @@ fn walk<K: Key, V: Value>(
                 }
             }
             for i in 0..=nkeys {
-                let child_low = if i == 0 { low } else { Some(seps[i - 1].as_slice()) };
-                let child_high = if i == nkeys { high } else { Some(seps[i].as_slice()) };
+                let child_low = if i == 0 {
+                    low
+                } else {
+                    Some(seps[i - 1].as_slice())
+                };
+                let child_high = if i == nkeys {
+                    high
+                } else {
+                    Some(seps[i].as_slice())
+                };
                 walk::<K, V>(
                     pool,
                     children[i],
@@ -225,7 +254,9 @@ fn walk<K: Key, V: Value>(
 fn leftmost_leaf<K: Key>(pool: &BufferPoolManager, root: PageId) -> Result<PageId, String> {
     let mut pid = root;
     loop {
-        let page = pool.fetch_page(pid).map_err(|e| format!("fetch {pid}: {e}"))?;
+        let page = pool
+            .fetch_page(pid)
+            .map_err(|e| format!("fetch {pid}: {e}"))?;
         match page[0] {
             LEAF => return Ok(pid),
             INTERNAL => {
@@ -257,18 +288,23 @@ fn tree_height<K: Key>(pool: &BufferPoolManager, root: PageId) -> usize {
 }
 
 /// Walk leaves left-to-right via rightlinks. Assert keys are non-descending.
-fn leaf_chain<K: Key, V: Value>(pool: &BufferPoolManager, root: PageId) -> Result<Vec<PageId>, String> {
+fn leaf_chain<K: Key, V: Value>(
+    pool: &BufferPoolManager,
+    root: PageId,
+) -> Result<Vec<PageId>, String> {
     let mut pid = leftmost_leaf::<K>(pool, root)?;
     let mut chain = Vec::new();
     let mut seen: BTreeSet<PageId> = BTreeSet::new();
-    // `global_last` carries the last key across leaves 
+    // `global_last` carries the last key across leaves
     let mut global_last: Option<Vec<u8>> = None;
     loop {
         if !seen.insert(pid) {
             return Err(format!("rightlink chain revisits page {pid} — link cycle"));
         }
         chain.push(pid);
-        let page = pool.fetch_page(pid).map_err(|e| format!("fetch {pid}: {e}"))?;
+        let page = pool
+            .fetch_page(pid)
+            .map_err(|e| format!("fetch {pid}: {e}"))?;
         let acc = LeafPageAccessor::<K, V>::new(&page[..]);
         let n = acc.num_pairs() as usize;
 
@@ -290,7 +326,9 @@ fn leaf_chain<K: Key, V: Value>(pool: &BufferPoolManager, root: PageId) -> Resul
         if let (Some(gl), Some(f)) = (&global_last, &first)
             && K::compare(gl, f) == Ordering::Greater
         {
-            return Err(format!("leaf {pid}: first key < previous leaf's last — order break across boundary"));
+            return Err(format!(
+                "leaf {pid}: first key < previous leaf's last — order break across boundary"
+            ));
         }
         if within_prev.is_some() {
             global_last = within_prev;
@@ -306,7 +344,10 @@ fn leaf_chain<K: Key, V: Value>(pool: &BufferPoolManager, root: PageId) -> Resul
     Ok(chain)
 }
 
-fn prev_chain<K: Key, V: Value>(pool: &BufferPoolManager, rightmost: PageId) -> Result<Vec<PageId>, String> {
+fn prev_chain<K: Key, V: Value>(
+    pool: &BufferPoolManager,
+    rightmost: PageId,
+) -> Result<Vec<PageId>, String> {
     let mut pid = rightmost;
     let mut chain = Vec::new();
     let mut seen: BTreeSet<PageId> = BTreeSet::new();
@@ -315,7 +356,9 @@ fn prev_chain<K: Key, V: Value>(pool: &BufferPoolManager, rightmost: PageId) -> 
             return Err(format!("prev chain revisits page {pid} — link cycle"));
         }
         chain.push(pid);
-        let page = pool.fetch_page(pid).map_err(|e| format!("fetch {pid}: {e}"))?;
+        let page = pool
+            .fetch_page(pid)
+            .map_err(|e| format!("fetch {pid}: {e}"))?;
         let prev = LeafPageAccessor::<K, V>::new(&page[..]).prev_page();
         drop(page);
         match prev {
@@ -534,7 +577,9 @@ where
     for (op, commit) in ops {
         match op {
             Op::Get(k) => {
-                let got = engine.get(k).map_err(|e| TestCaseError::fail(format!("get {k:?}: {e}")))?;
+                let got = engine
+                    .get(k)
+                    .map_err(|e| TestCaseError::fail(format!("get {k:?}: {e}")))?;
                 let expected = model.get(k).map(|v| V::as_bytes(v).as_ref().to_vec());
                 prop_assert_eq!(got, expected, "get {:?} disagreement", k);
             }
@@ -545,14 +590,17 @@ where
                     Entry::Occupied(_) => {
                         prop_assert!(
                             matches!(r, Err(EngineError::Index(IndexError::DuplicateKey))),
-                            "insert dup {:?}: expected DuplicateKey, got {:?}", k, r
+                            "insert dup {:?}: expected DuplicateKey, got {:?}",
+                            k,
+                            r
                         );
                         t.abort();
                     }
                     Entry::Vacant(slot) => {
                         prop_assert!(r.is_ok(), "insert {:?}: expected Ok, got {:?}", k, r);
                         if *commit {
-                            t.commit().map_err(|e| TestCaseError::fail(format!("commit: {e}")))?;
+                            t.commit()
+                                .map_err(|e| TestCaseError::fail(format!("commit: {e}")))?;
                             slot.insert(v.clone());
                         } else {
                             t.abort();
@@ -567,7 +615,8 @@ where
                     Entry::Occupied(slot) => {
                         prop_assert!(r.is_ok(), "delete {:?}: expected Ok, got {:?}", k, r);
                         if *commit {
-                            t.commit().map_err(|e| TestCaseError::fail(format!("commit: {e}")))?;
+                            t.commit()
+                                .map_err(|e| TestCaseError::fail(format!("commit: {e}")))?;
                             slot.remove();
                         } else {
                             t.abort();
@@ -576,7 +625,9 @@ where
                     Entry::Vacant(_) => {
                         prop_assert!(
                             matches!(r, Err(EngineError::Index(IndexError::KeyNotFound))),
-                            "delete missing {:?}: expected KeyNotFound, got {:?}", k, r
+                            "delete missing {:?}: expected KeyNotFound, got {:?}",
+                            k,
+                            r
                         );
                         t.abort();
                     }
@@ -589,7 +640,8 @@ where
                     Entry::Occupied(mut slot) => {
                         prop_assert!(r.is_ok(), "update {:?}: expected Ok, got {:?}", k, r);
                         if *commit {
-                            t.commit().map_err(|e| TestCaseError::fail(format!("commit: {e}")))?;
+                            t.commit()
+                                .map_err(|e| TestCaseError::fail(format!("commit: {e}")))?;
                             slot.insert(v.clone());
                         } else {
                             t.abort();
@@ -598,7 +650,9 @@ where
                     Entry::Vacant(_) => {
                         prop_assert!(
                             matches!(r, Err(EngineError::Index(IndexError::KeyNotFound))),
-                            "update missing {:?}: expected KeyNotFound, got {:?}", k, r
+                            "update missing {:?}: expected KeyNotFound, got {:?}",
+                            k,
+                            r
                         );
                         t.abort();
                     }
@@ -770,9 +824,21 @@ fn snapshot_isolation_observed_keys() {
     engine.insert(&3, &30).unwrap(); // insert a key r1 observed as absent
 
     // r1 must STILL see its original snapshot for every observed key.
-    assert_eq!(decode(r1.get(&1).unwrap()), Some(10), "SI: update leaked to old reader");
-    assert_eq!(decode(r1.get(&2).unwrap()), Some(20), "SI: delete leaked to old reader");
-    assert_eq!(decode(r1.get(&3).unwrap()), None, "SI: insert leaked to old reader");
+    assert_eq!(
+        decode(r1.get(&1).unwrap()),
+        Some(10),
+        "SI: update leaked to old reader"
+    );
+    assert_eq!(
+        decode(r1.get(&2).unwrap()),
+        Some(20),
+        "SI: delete leaked to old reader"
+    );
+    assert_eq!(
+        decode(r1.get(&3).unwrap()),
+        None,
+        "SI: insert leaked to old reader"
+    );
     r1.commit().unwrap();
 
     // A fresh reader sees the new committed state.
@@ -806,15 +872,25 @@ fn single_key_version_chain_spans_pages() {
 
     // Non-vacuous: the chain must actually have split across pages.
     let h = tree_height::<u32>(&engine.buffer_pool, engine.index.root_page_id());
-    assert!(h >= 1, "expected the version chain to split into multiple leaves, height={h}");
+    assert!(
+        h >= 1,
+        "expected the version chain to split into multiple leaves, height={h}"
+    );
 
     check_invariants(&engine.index, &engine.buffer_pool).unwrap();
 
     let mut r = engine.begin();
-    let got = r.get(&7).unwrap().map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let got = r
+        .get(&7)
+        .unwrap()
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()));
     assert_eq!(got, Some(300), "latest version must be visible");
     r.commit().unwrap();
-    assert_eq!(scan_forward(&engine).unwrap(), vec![(7u32, 300u32)], "exactly one visible key+value");
+    assert_eq!(
+        scan_forward(&engine).unwrap(),
+        vec![(7u32, 300u32)],
+        "exactly one visible key+value"
+    );
 
     keeper.abort();
 }
@@ -840,13 +916,18 @@ fn deep_tree_internal_splits() {
         let (_dir, engine) = tmp_engine::<u32, u32>();
         let mut w = engine.begin();
         for &k in &order {
-            w.insert(&k, &k).unwrap_or_else(|e| panic!("{name}: insert {k}: {e}"));
+            w.insert(&k, &k)
+                .unwrap_or_else(|e| panic!("{name}: insert {k}: {e}"));
         }
         w.commit().unwrap_or_else(|e| panic!("{name}: commit: {e}"));
 
         let height = tree_height::<u32>(&engine.buffer_pool, engine.index.root_page_id());
-        assert!(height >= 2, "{name}: expected 3-level tree, got height {height}");
-        check_invariants(&engine.index, &engine.buffer_pool).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(
+            height >= 2,
+            "{name}: expected 3-level tree, got height {height}"
+        );
+        check_invariants(&engine.index, &engine.buffer_pool)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
 
         let expected: Vec<(u32, u32)> = (0..N).map(|k| (k, k)).collect();
         let fwd = scan_forward(&engine).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -877,15 +958,35 @@ fn read_your_own_writes() {
     w.delete(&3u32).unwrap(); // insert + delete within the same txn
 
     // The writer sees its own uncommitted effects.
-    assert_eq!(decode(w.get(&2u32).unwrap()), Some(20), "RYOW: own insert not visible");
-    assert_eq!(decode(w.get(&1u32).unwrap()), Some(11), "RYOW: own update not visible");
-    assert_eq!(decode(w.get(&3u32).unwrap()), None, "RYOW: own delete not applied");
+    assert_eq!(
+        decode(w.get(&2u32).unwrap()),
+        Some(20),
+        "RYOW: own insert not visible"
+    );
+    assert_eq!(
+        decode(w.get(&1u32).unwrap()),
+        Some(11),
+        "RYOW: own update not visible"
+    );
+    assert_eq!(
+        decode(w.get(&3u32).unwrap()),
+        None,
+        "RYOW: own delete not applied"
+    );
 
     // A concurrent reader (snapshot taken now) sees only the committed baseline.
     {
         let mut r = engine.begin();
-        assert_eq!(decode(r.get(&1u32).unwrap()), Some(10), "isolation: saw uncommitted update");
-        assert_eq!(decode(r.get(&2u32).unwrap()), None, "isolation: saw uncommitted insert");
+        assert_eq!(
+            decode(r.get(&1u32).unwrap()),
+            Some(10),
+            "isolation: saw uncommitted update"
+        );
+        assert_eq!(
+            decode(r.get(&2u32).unwrap()),
+            None,
+            "isolation: saw uncommitted insert"
+        );
         r.commit().unwrap();
     }
 
@@ -1011,7 +1112,10 @@ fn known_bug_txn_does_not_see_own_modify_of_committed_row() {
     );
     // ...and a re-insert is therefore rejected as a duplicate (should be Ok).
     assert!(
-        matches!(t.insert(&1u32, &20), Err(EngineError::Index(IndexError::DuplicateKey))),
+        matches!(
+            t.insert(&1u32, &20),
+            Err(EngineError::Index(IndexError::DuplicateKey))
+        ),
         "current behavior: reinsert after own-delete returns DuplicateKey"
     );
     t.commit().unwrap();
@@ -1019,7 +1123,11 @@ fn known_bug_txn_does_not_see_own_modify_of_committed_row() {
     // Post-commit the delete DID take effect (only within-txn visibility was
     // wrong) and the reinsert never happened, so the row is gone.
     let mut r = engine.begin();
-    assert_eq!(decode(r.get(&1u32).unwrap()), None, "post-commit: row is deleted");
+    assert_eq!(
+        decode(r.get(&1u32).unwrap()),
+        None,
+        "post-commit: row is deleted"
+    );
     r.commit().unwrap();
 }
 
@@ -1083,5 +1191,3 @@ proptest! {
         prop_assert_eq!(gotb, expected_rev, "backward range {:?}", bounds);
     }
 }
-
-

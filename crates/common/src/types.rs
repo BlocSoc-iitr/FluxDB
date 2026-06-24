@@ -941,12 +941,6 @@ mod proptests {
         Ok(())
     }
 
-    // from_bytes(as_bytes(view)) == view for borrowed-SelfType types (&str, &[u8],
-    // &[u8; N], and borrowed-element containers). The caller owns the backing data and
-    // passes a borrowed view; `decoded` borrows the serialized bytes, so the two sides
-    // have different lifetimes. That needs a cross-lifetime PartialEq bound, and
-    // prop_assert! (which only borrows) rather than prop_assert_eq! (which would move
-    // `view` while `bytes` still borrows it).
     fn check_roundtrip_ref<T>(view: T::SelfType<'_>) -> Result<(), TestCaseError>
     where
         T: Value,

@@ -1,7 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc e829999d6bea4a4879f03a1f04e6780b99c7af6988098c3be979bf8225ba29c3 # shrinks to setup = {12: 0}, batch = [(12, 0, 2), (12, 0, 0)], commit = false

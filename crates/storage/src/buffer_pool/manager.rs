@@ -45,13 +45,6 @@ impl BufferPoolManager {
         }
     }
 
-    /// Total number of pages ever allocated (the allocator's high-water mark).
-    /// Page ids are dense in `0..page_count()` pre-free-list, so any id in that
-    /// range unreachable from the root is a leaked page.
-    pub fn page_count(&self) -> u64 {
-        *self.next_page_id.lock().unwrap()
-    }
-
     /// Creates a new page in the buffer pool.
     ///
     /// This will allocate a new `PageId`, find a free frame (potentially evicting
