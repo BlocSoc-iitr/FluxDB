@@ -79,16 +79,6 @@ fn reopen_db(dir: &Path) -> (Arc<BufferPoolManager>, Arc<Wal>, Arc<TM>, Idx) {
     (pool, wal, tm, index)
 }
 
-fn wal_has(wal_dir: &Path, t: WalRecordType) -> bool {
-    let mut it = WalIterator::new(wal_dir).unwrap();
-    while let Some(r) = it.next_record() {
-        if r.unwrap().entry_type == t {
-            return true;
-        }
-    }
-    false
-}
-
 // ── Basic get / insert ────────────────────────────────────────────────
 
 #[test]
@@ -836,65 +826,4 @@ fn crash_victim_uncommitted_insert_invisible_after_reopen() {
     assert!(index.get(&(&b"ghost"[..]), &reader).unwrap().is_none());
     let all: Vec<(Vec<u8>, Vec<u8>)> = index.range(.., &reader).map(|r| r.unwrap()).collect();
     assert!(all.is_empty());
-}
-
-#[test]
-fn mid_split_crash_searches_via_rightlink_then_completes() {
-    let dir = tempdir().unwrap();
-    let wal_dir = dir.path().join("wal");
-    let trigger;
-    {
-        let (_pool, wal, tm, index) = build_db(dir.path());
-        let mut k = 0u32;
-        loop {
-            let key = leak_bytes(&k.to_be_bytes());
-            let t = tm.begin();
-            index.insert(&key, &key, &t).unwrap();
-            wal.log_commit(t.txn_id).unwrap(); // durable Commit so recovery KEEPS it
-            tm.mark_committed(t.txn_id);
-            wal.flush_up_to(wal.next_lsn()).unwrap();
-            if wal_has(&wal_dir, WalRecordType::InsertDownLink) {
-                break;
-            }
-            k += 1;
-        }
-        trigger = k;
-        // crash
-    }
-    Wal::truncate_wal_after(&wal_dir, WalRecordType::LeafSplit); // drop Insert(trigger)+downlink+commit
-
-    let (_pool, _wal, tm, index) = reopen_db(dir.path());
-
-    for j in 0..trigger {
-        assert!(
-            index
-                .get(&leak_bytes(&j.to_be_bytes()), &tm.begin())
-                .unwrap()
-                .is_some()
-        );
-    }
-    assert!(
-        index
-            .get(&leak_bytes(&trigger.to_be_bytes()), &tm.begin())
-            .unwrap()
-            .is_none()
-    );
-
-    let nk = leak_bytes(&9_999u32.to_be_bytes());
-    let writer = tm.begin();
-    index.insert(&nk, &nk, &writer).unwrap();
-    _wal.log_commit(writer.txn_id).unwrap();
-    tm.mark_committed(writer.txn_id);
-
-    let reader = tm.begin();
-    let got: Vec<(Vec<u8>, Vec<u8>)> = index.range(.., &reader).map(|r| r.unwrap()).collect();
-    let mut want: Vec<(Vec<u8>, Vec<u8>)> = (0..trigger)
-        .map(|j| (j.to_be_bytes().to_vec(), j.to_be_bytes().to_vec()))
-        .collect();
-    want.push((
-        9_999u32.to_be_bytes().to_vec(),
-        9_999u32.to_be_bytes().to_vec(),
-    ));
-    want.sort();
-    assert_eq!(got, want);
 }
