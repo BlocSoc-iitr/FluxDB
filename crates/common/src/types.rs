@@ -715,6 +715,46 @@ impl<T: Value> Value for Vec<T> {
     }
 }
 
+impl<T: Key> Key for Vec<T> {
+    fn compare(data1: &[u8], data2: &[u8]) -> Ordering {
+        // Lexicographic: compare element-by-element, shorter-as-prefix is Less.
+        // The byte layout is not order-preserving, so decode rather than memcmp.
+        let mut offset1 = 0;
+        let mut offset2 = 0;
+        let count1 = decode_usize_varint(data1, &mut offset1);
+        let count2 = decode_usize_varint(data2, &mut offset2);
+        let common = count1.min(count2);
+
+        if let Some(fixed) = T::fixed_width() {
+            for _ in 0..common {
+                let end1 = offset1 + fixed;
+                let end2 = offset2 + fixed;
+                let comparison = T::compare(&data1[offset1..end1], &data2[offset2..end2]);
+                if !comparison.is_eq() {
+                    return comparison;
+                }
+                offset1 = end1;
+                offset2 = end2;
+            }
+        } else {
+            for _ in 0..common {
+                let len1 = decode_usize_varint(data1, &mut offset1);
+                let len2 = decode_usize_varint(data2, &mut offset2);
+                let end1 = offset1 + len1;
+                let end2 = offset2 + len2;
+                let comparison = T::compare(&data1[offset1..end1], &data2[offset2..end2]);
+                if !comparison.is_eq() {
+                    return comparison;
+                }
+                offset1 = end1;
+                offset2 = end2;
+            }
+        }
+
+        count1.cmp(&count2)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -876,5 +916,174 @@ mod tests {
         assert_key::<String>();
         assert_key::<Option<&str>>();
         assert_key::<&[u8; 8]>();
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    // from_bytes(as_bytes(x)) == x for owned-SelfType types.
+    // Restricted to types whose SelfType<'a> is the type itself (the owned set:
+    // scalars, Option<scalar>, Vec<scalar>) so the decoded value borrows nothing.
+    fn check_roundtrip<T>(value: T) -> Result<(), TestCaseError>
+    where
+        T: Value + PartialEq + Debug,
+        for<'a> T: Value<SelfType<'a> = T>,
+    {
+        // Scope `bytes` so its borrow of `value` ends before the assert moves `value`.
+        let decoded = {
+            let bytes = T::as_bytes(&value);
+            T::from_bytes(bytes.as_ref())
+        };
+        prop_assert_eq!(decoded, value);
+        Ok(())
+    }
+
+    fn check_roundtrip_ref<T>(view: T::SelfType<'_>) -> Result<(), TestCaseError>
+    where
+        T: Value,
+        for<'a> T::SelfType<'a>: Debug,
+        for<'a, 'b> T::SelfType<'a>: PartialEq<T::SelfType<'b>>,
+    {
+        let bytes = T::as_bytes(&view);
+        let decoded = T::from_bytes(bytes.as_ref());
+        prop_assert!(
+            decoded == view,
+            "roundtrip mismatch: {:?} != {:?}",
+            decoded,
+            view
+        );
+        Ok(())
+    }
+
+    // K::compare(as_bytes(a), as_bytes(b)) == a.cmp(&b) for owned-SelfType keys.
+    // The byte-level compare must agree with the type's native Ord.
+    fn check_order<T>(a: T, b: T) -> Result<(), TestCaseError>
+    where
+        T: Key + Ord + Debug,
+        for<'a> T: Value<SelfType<'a> = T>,
+    {
+        let expected = a.cmp(&b);
+        let actual = {
+            let bytes_a = T::as_bytes(&a);
+            let bytes_b = T::as_bytes(&b);
+            T::compare(bytes_a.as_ref(), bytes_b.as_ref())
+        };
+        prop_assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    proptest! {
+        // --- Group A: owned-SelfType types (same helper as the integer scalars) ---
+        #[test]
+        fn bool_roundtrip(x in any::<bool>()) { check_roundtrip::<bool>(x)?; }
+        #[test]
+        fn char_roundtrip(x in any::<char>()) { check_roundtrip::<char>(x)?; }
+        #[test]
+        fn unit_roundtrip(x in any::<()>()) { check_roundtrip::<()>(x)?; }
+        #[test]
+        fn string_roundtrip(x in any::<String>()) { check_roundtrip::<String>(x)?; }
+        #[test]
+        fn array_u32_roundtrip(x in any::<[u32; 3]>()) { check_roundtrip::<[u32; 3]>(x)?; }
+        #[test]
+        fn option_i64_roundtrip(x in any::<Option<i64>>()) { check_roundtrip::<Option<i64>>(x)?; }
+        #[test]
+        fn vec_i64_roundtrip(x in any::<Vec<i64>>()) { check_roundtrip::<Vec<i64>>(x)?; }
+
+        // --- Group B: borrowed-SelfType types (own the data, pass a view) ---
+        #[test]
+        fn str_roundtrip(s in any::<String>()) {
+            check_roundtrip_ref::<&str>(s.as_str())?;
+        }
+        #[test]
+        fn bytes_roundtrip(v in any::<Vec<u8>>()) {
+            check_roundtrip_ref::<&[u8]>(v.as_slice())?;
+        }
+        #[test]
+        fn byte_array_ref_roundtrip(a in any::<[u8; 8]>()) {
+            check_roundtrip_ref::<&[u8; 8]>(&a)?;
+        }
+        // Option has no cross-lifetime PartialEq impl, so the generic ref helper can't
+        // type it; written concretely instead, where variance lets the lifetimes unify.
+        #[test]
+        fn option_str_roundtrip(s in any::<Option<String>>()) {
+            let view: Option<&str> = s.as_deref();
+            let bytes = <Option<&str> as Value>::as_bytes(&view);
+            let decoded = <Option<&str> as Value>::from_bytes(bytes.as_ref());
+            prop_assert_eq!(decoded, view);
+        }
+        #[test]
+        fn vec_str_roundtrip(strings in any::<Vec<String>>()) {
+            let views: Vec<&str> = strings.iter().map(String::as_str).collect();
+            check_roundtrip_ref::<Vec<&str>>(views)?;
+        }
+
+        #[test]
+        fn u8_roundtrip(x in any::<u8>()) { check_roundtrip::<u8>(x)?; }
+        #[test]
+        fn u16_roundtrip(x in any::<u16>()) { check_roundtrip::<u16>(x)?; }
+        #[test]
+        fn u32_roundtrip(x in any::<u32>()) { check_roundtrip::<u32>(x)?; }
+        #[test]
+        fn u64_roundtrip(x in any::<u64>()) { check_roundtrip::<u64>(x)?; }
+        #[test]
+        fn u128_roundtrip(x in any::<u128>()) { check_roundtrip::<u128>(x)?; }
+        #[test]
+        fn i8_roundtrip(x in any::<i8>()) { check_roundtrip::<i8>(x)?; }
+        #[test]
+        fn i16_roundtrip(x in any::<i16>()) { check_roundtrip::<i16>(x)?; }
+        #[test]
+        fn i32_roundtrip(x in any::<i32>()) { check_roundtrip::<i32>(x)?; }
+        #[test]
+        fn i64_roundtrip(x in any::<i64>()) { check_roundtrip::<i64>(x)?; }
+        #[test]
+        fn i128_roundtrip(x in any::<i128>()) { check_roundtrip::<i128>(x)?; }
+        #[test]
+        fn option_u32_roundtrip(x in any::<Option<u32>>()) {
+            check_roundtrip::<Option<u32>>(x)?;
+        }
+        #[test]
+        fn vec_u32_roundtrip(x in any::<Vec<u32>>()) {
+            check_roundtrip::<Vec<u32>>(x)?;
+        }
+
+        // --- Order-preserving: K::compare agrees with native Ord ---
+        // i64: regression-lock (compare = deserialize + native cmp).
+        #[test]
+        fn i64_order(a in any::<i64>(), b in any::<i64>()) {
+            check_order::<i64>(a, b)?;
+        }
+        // Option<u32>: exercises the None/Some discriminant branches.
+        #[test]
+        fn option_u32_order(a in any::<Option<u32>>(), b in any::<Option<u32>>()) {
+            check_order::<Option<u32>>(a, b)?;
+        }
+        // [u32; 3]: fixed-width array short-circuit. Small element domain so the
+        // arrays frequently share a prefix and differ at element 1 or 2.
+        #[test]
+        fn array_u32_order(
+            a in prop::array::uniform3(0u32..4),
+            b in prop::array::uniform3(0u32..4),
+        ) {
+            check_order::<[u32; 3]>(a, b)?;
+        }
+        // Vec<u32>: fixed-width Vec compare + length tiebreak ([1] < [1, 2]).
+        #[test]
+        fn vec_u32_order(
+            a in prop::collection::vec(0u32..4, 0..6),
+            b in prop::collection::vec(0u32..4, 0..6),
+        ) {
+            check_order::<Vec<u32>>(a, b)?;
+        }
+        // Vec<String>: variable-width Vec compare (per-element varints) + tiebreak.
+        #[test]
+        fn vec_string_order(
+            a in prop::collection::vec("[a-c]{0,3}", 0..5),
+            b in prop::collection::vec("[a-c]{0,3}", 0..5),
+        ) {
+            check_order::<Vec<String>>(a, b)?;
+        }
     }
 }
