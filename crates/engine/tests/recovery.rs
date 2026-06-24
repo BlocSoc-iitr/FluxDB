@@ -21,3 +21,14 @@ fn split_sized_survival() {
     }
 }
 
+#[test]
+fn delete_survives_crash() {
+    let dir = TempDir::new().unwrap();
+    {
+        let e = TestEngine::create(dir.path()).unwrap();
+        e.insert(&leak(b"k"), &leak(b"v")).unwrap();
+        e.delete(&leak(b"k")).unwrap();
+    } // crash
+    let e = TestEngine::open(dir.path()).unwrap();
+    assert_eq!(e.get(&leak(b"k")).unwrap(), None);
+}
