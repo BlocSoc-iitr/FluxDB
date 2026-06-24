@@ -32,3 +32,15 @@ fn delete_survives_crash() {
     let e = TestEngine::open(dir.path()).unwrap();
     assert_eq!(e.get(&leak(b"k")).unwrap(), None);
 }
+
+#[test]
+fn update_survives_crash() {
+    let dir = TempDir::new().unwrap();
+    {
+        let e = TestEngine::create(dir.path()).unwrap();
+        e.insert(&leak(b"k"), &leak(b"v1")).unwrap();
+        e.update(&leak(b"k"), &leak(b"v2")).unwrap();
+    } // crash
+    let e = TestEngine::open(dir.path()).unwrap();
+    assert_eq!(e.get(&leak(b"k")).unwrap(), Some(b"v2".to_vec()));
+}
