@@ -1329,7 +1329,6 @@ mod tests {
 
         let wal = Wal::new_with_buffer_capacity(&wal_dir, 27)?;
         let result = wal.append(WalRecordType::Commit, 1, &[], None);
-        println!("LSN right after creation: {}", wal.next_lsn());
 
         assert!(matches!(
             result,
