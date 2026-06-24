@@ -100,9 +100,19 @@ impl TransactionManager {
             .unwrap_or_else(|| self.next_txn_id.load(Acquire))
     }
 
+    /// Truncates the CLOG, removing entries older than `horizon`.
+    ///
+    /// Note: We ONLY remove `Committed` entries. `Aborted` entries must be retained forever
+    /// (or until a physical vacuum confirms their records are gone) because dropping an `Aborted`
+    /// entry before its dirty records are vacuumed would cause our presumed-commit logic to
+    /// suddenly treat those aborted records as visible `Committed` records, breaking isolation.
     pub fn truncate_clog(&self, horizon: u64) {
         let mut clog = self.clog.write().unwrap();
-        clog.retain(|&txn_id, status| txn_id >= horizon || *status == TransactionStatus::Active);
+        clog.retain(|&txn_id, status| {
+            txn_id >= horizon
+                || *status == TransactionStatus::Active
+                || *status == TransactionStatus::Aborted
+        });
     }
 
     /// Begins a new transaction synchronously, establishing its `Snapshot`.
@@ -496,5 +506,34 @@ mod tests {
 
         // Entry must be removed from the map after settle — no memory leak.
         assert!(!tm.waiters.lock().unwrap().contains_key(&blocker_id));
+    }
+
+    #[test]
+    fn test_truncate_clog_retains_aborted() {
+        let tm = std::sync::Arc::new(TransactionManager::new());
+        let txn_commit = tm.begin();
+        let txn_abort = tm.begin();
+        let txn_active = tm.begin();
+
+        tm.mark_committed(txn_commit.txn_id);
+        tm.mark_aborted(txn_abort.txn_id);
+
+        // Truncate past all of them
+        let horizon = txn_active.txn_id + 1;
+        tm.truncate_clog(horizon);
+
+        let clog = tm.clog.read().unwrap();
+        // Committed should be dropped
+        assert!(!clog.contains_key(&txn_commit.txn_id));
+        // Aborted should be retained to prevent visible-aborted-data bug
+        assert_eq!(
+            clog.get(&txn_abort.txn_id),
+            Some(&TransactionStatus::Aborted)
+        );
+        // Active is retained automatically because it's active
+        assert_eq!(
+            clog.get(&txn_active.txn_id),
+            Some(&TransactionStatus::Active)
+        );
     }
 }
