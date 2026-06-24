@@ -1039,3 +1039,619 @@ mod tests {
         assert_eq!(LeafPageAccessor::<K, V>::new(buf.memory()).num_pairs(), 1);
     }
 }
+
+// ── Property-based tests ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use crate::page::PageBuffer;
+    use db_core::transaction_manager::TransactionManager;
+    use proptest::prelude::*;
+    use std::cmp::Ordering;
+
+    // Helper functions to check if the page is valid
+    // These read the raw bytes directly instead of using LeafPageAccessor
+    // because we want to test if the accessor itself is working correctly
+
+    /// Check all the structural invariants for a leaf page
+    /// Returns Ok(()) if everything is good, Err with a message if something is wrong
+    fn check_leaf_structural_invariants(page: &[u8]) -> Result<(), String> {
+        // First check: make sure this is actually a leaf page
+        let page_type = read_u8(page, OFF_PAGE_TYPE);
+        if page_type != LEAF {
+            return Err(format!(
+                "page_type: expected {} (LEAF), got {}",
+                LEAF, page_type
+            ));
+        }
+
+        // Read the important fields from the page header
+        // We need these to check if the page layout is correct
+        let slot_count = read_u16(page, OFF_LEAF_SLOT_COUNT) as usize;
+        let free_start = read_u16(page, OFF_LEAF_FREE_START) as usize;
+        let free_end = read_u16(page, OFF_LEAF_FREE_END) as usize;
+        let high_key_len = read_u16(page, OFF_LEAF_HIGH_KEY_LEN) as usize;
+
+        // Check that free space pointers make sense
+        // free_start is where the slot directory ends
+        // free_end is where the record data starts
+        // So free_start should be <= free_end
+        if free_start > free_end {
+            return Err(format!(
+                "space_accounting: free_start ({}) > free_end ({})",
+                free_start, free_end
+            ));
+        }
+        // Also make sure free_end doesn't go past the end of the page
+        if free_end > PAGE_SIZE {
+            return Err(format!(
+                "space_accounting: free_end ({}) > PAGE_SIZE ({})",
+                free_end, PAGE_SIZE
+            ));
+        }
+
+        // Check if free_start is at the right position
+        // It should be at: header + high_key + (number of slots * 4 bytes per slot)
+        let expected_free_start = slot_base(high_key_len) + slot_count * SLOT_SIZE;
+        if free_start != expected_free_start {
+            return Err(format!(
+                "slot_directory_size: free_start ({}) != slot_base({}) + {} * {} = {}",
+                free_start, high_key_len, slot_count, SLOT_SIZE, expected_free_start
+            ));
+        }
+
+        // Now check each individual slot to make sure it's valid
+        // We'll collect all the slot ranges so we can check for overlaps later
+        let mut slot_ranges: Vec<(usize, usize, usize)> = Vec::with_capacity(slot_count);
+        for i in 0..slot_count {
+            // Calculate where this slot's data is stored
+            let slot_off = slot_offset_at(high_key_len, i);
+            let rec_base = read_u16(page, slot_off) as usize;
+            let rec_size = read_u16(page, slot_off + 2) as usize;
+
+            // Make sure the record starts at or after free_end
+            // (records grow downward from the end of the page)
+            if rec_base < free_end {
+                return Err(format!(
+                    "slot_{}_offset: rec_base ({}) < free_end ({})",
+                    i, rec_base, free_end
+                ));
+            }
+
+            // Make sure the record doesn't go past the end of the page
+            if rec_base + rec_size > PAGE_SIZE {
+                return Err(format!(
+                    "slot_{}_bounds: rec_base ({}) + rec_size ({}) = {} > PAGE_SIZE ({})",
+                    i,
+                    rec_base,
+                    rec_size,
+                    rec_base + rec_size,
+                    PAGE_SIZE
+                ));
+            }
+
+            // Every record needs at least the header bytes
+            if rec_size < REC_HEADER_SIZE {
+                return Err(format!(
+                    "slot_{}_size: rec_size ({}) < REC_HEADER_SIZE ({})",
+                    i, rec_size, REC_HEADER_SIZE
+                ));
+            }
+
+            // Check that the key and value lengths match what the slot says
+            // This catches bugs where the record header has wrong sizes
+            let key_len = read_u16(page, rec_base + REC_OFF_KEY_LEN) as usize;
+            let val_len = read_u16(page, rec_base + REC_OFF_VAL_LEN) as usize;
+            let expected_rec_size = rec_total_size(key_len, val_len);
+            if rec_size != expected_rec_size {
+                return Err(format!(
+                    "slot_{}_consistency: rec_size ({}) != rec_total_size(key_len={}, val_len={}) = {}",
+                    i, rec_size, key_len, val_len, expected_rec_size
+                ));
+            }
+
+            // Save this slot's info so we can check for overlaps later
+            slot_ranges.push((i, rec_base, rec_size));
+        }
+
+        // Check that no two slots point to overlapping memory regions
+        // This would mean two records are overwriting each other's data
+        for a in 0..slot_ranges.len() {
+            let (ia, base_a, size_a) = slot_ranges[a];
+            for b in (a + 1)..slot_ranges.len() {
+                let (ib, base_b, size_b) = slot_ranges[b];
+                let end_a = base_a + size_a;
+                let end_b = base_b + size_b;
+                // Check if ranges overlap
+                // Two ranges overlap if: base_a < end_b AND base_b < end_a
+                if base_a < end_b && base_b < end_a {
+                    return Err(format!(
+                        "slot_overlap: slot {} [{}, {}) overlaps slot {} [{}, {})",
+                        ia, base_a, end_a, ib, base_b, end_b
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check that keys are in the right order
+    /// This uses LeafPageAccessor which is okay because we're just checking
+    /// the logical ordering, not the low-level structure
+    fn check_leaf_key_ordering(page: &[u8]) -> Result<(), String> {
+        type K = &'static [u8];
+        type V = &'static [u8];
+
+        let acc = LeafPageAccessor::<K, V>::new(page);
+        let n = acc.num_pairs() as usize;
+
+        // 1. Keys sorted ascending (allow duplicates for MVCC)
+        for i in 0..n.saturating_sub(1) {
+            let k1 = acc.get_key(i);
+            let k2 = acc.get_key(i + 1);
+            if <K as Key>::compare(
+                <K as Value>::as_bytes(&k1).as_ref(),
+                <K as Value>::as_bytes(&k2).as_ref(),
+            ) == Ordering::Greater
+            {
+                return Err(format!(
+                    "keys_not_sorted: key[{}] ({:?}) > key[{}] ({:?})",
+                    i,
+                    k1,
+                    i + 1,
+                    k2
+                ));
+            }
+        }
+
+        // Also check that all keys are less than the high_key if one exists
+        // (high_key is the upper bound for keys on this page)
+        if let Some(hk) = acc.high_key_bytes() {
+            for i in 0..n {
+                let k = acc.get_key(i);
+                if <K as Key>::compare(<K as Value>::as_bytes(&k).as_ref(), hk) == Ordering::Greater
+                {
+                    return Err(format!(
+                        "key_exceeds_high_key: key[{}] ({:?}) >= high_key ({:?})",
+                        i, k, hk
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Main checker function - calls both structural and ordering checks
+    /// Use this after every operation in tests
+    fn check_leaf_all_invariants(page: &[u8]) -> Result<(), String> {
+        check_leaf_structural_invariants(page)?;
+        check_leaf_key_ordering(page)?;
+        Ok(())
+    }
+
+    /// After running a bunch of operations, read all the keys back
+    /// and make sure they're still sorted and readable
+    /// This catches corruption bugs that the other checkers might miss
+    fn verify_leaf_readable_and_sorted(page: &[u8]) -> Result<(), String> {
+        type K = &'static [u8];
+        type V = &'static [u8];
+
+        let acc = LeafPageAccessor::<K, V>::new(page);
+        let n = acc.num_pairs() as usize;
+
+        // Keep track of the previous key to compare with the next one
+        let mut prev_key: Option<Vec<u8>> = None;
+        for i in 0..n {
+            let key = acc.get_key(i);
+            let _val = acc.get_value(i);
+            let key_bytes: Vec<u8> = <K as Value>::as_bytes(&key).as_ref().to_vec();
+
+            // Make sure this key is >= the previous one (allowing duplicates)
+            if let Some(ref pk) = prev_key {
+                if <K as Key>::compare(pk.as_slice(), key_bytes.as_slice()) == Ordering::Greater {
+                    return Err(format!(
+                        "readback_not_sorted: key[{}] ({:?}) >= key[{}] ({:?})",
+                        i - 1,
+                        pk,
+                        i,
+                        key_bytes
+                    ));
+                }
+            }
+            prev_key = Some(key_bytes);
+        }
+
+        Ok(())
+    }
+
+    // ── Test data generators ───────────────────────────────────────────────────
+
+    /// Generate random key bytes
+    /// We use a mix of small key spaces (to encourage duplicates for MVCC testing)
+    /// and larger random keys.
+    fn key_strategy() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            // 80% chance: small pool of keys (length 1-2, values 0-3) to ensure duplicates
+            80 => prop::collection::vec(0u8..4u8, 1..=2usize),
+            // 20% chance: completely random keys up to 16 bytes
+            20 => prop::collection::vec(any::<u8>(), 1..=16usize),
+        ]
+    }
+
+    /// Generate small random values (1-32 bytes)
+    /// Used for sequence tests where we want lots of operations
+    fn small_value_strategy() -> impl Strategy<Value = Vec<u8>> {
+        prop::collection::vec(any::<u8>(), 1..=32usize)
+    }
+
+    /// Generate larger random values (1-256 bytes)
+    /// Used to test space accounting with bigger records
+    fn large_value_strategy() -> impl Strategy<Value = Vec<u8>> {
+        prop::collection::vec(any::<u8>(), 1..=256usize)
+    }
+
+    /// Different operations we can do on a leaf page
+    /// We'll generate random sequences of these to test
+    #[derive(Debug, Clone)]
+    enum LeafOp {
+        Insert { key: Vec<u8>, value: Vec<u8> },
+        Remove { slot_index: usize }, // we clamp this to valid range when applying
+        SetXmax { slot_index: usize, xmax: u64 }, // mark record as deleted
+        Compact { horizon: u64 },     // clean up dead records
+    }
+
+    /// Generate random operations with different probabilities
+    /// More inserts (50%) because we need to build up state first
+    /// Then removes, setxmax, and compact are less frequent
+    fn leaf_op_strategy() -> impl Strategy<Value = LeafOp> {
+        prop_oneof![
+            50 => (key_strategy(), small_value_strategy())
+                .prop_map(|(k, v)| LeafOp::Insert { key: k, value: v }),
+            20 => (0usize..100)
+                .prop_map(|idx| LeafOp::Remove { slot_index: idx }),
+            15 => ((0usize..100), (1u64..200))
+                .prop_map(|(idx, xmax)| LeafOp::SetXmax { slot_index: idx, xmax }),
+            15 => (1u64..200)
+                .prop_map(|h| LeafOp::Compact { horizon: h }),
+        ]
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    type K = &'static [u8];
+    type V = &'static [u8];
+
+    /// Build a valid leaf page from sorted key-value pairs (allows duplicates for MVCC).
+    /// Returns the number of pairs that actually fit.
+    fn build_leaf_from_sorted(
+        buf: &mut PageBuffer,
+        page_id: u64,
+        pairs: &[(Vec<u8>, Vec<u8>)],
+    ) -> usize {
+        LeafPageBuilder::<K, V>::new(page_id, buf.memory_mut()).finish();
+
+        let mut count = 0;
+        for (k, v) in pairs {
+            let mut m = LeafPageMutator::<K, V>::new(buf.memory_mut());
+            if !m.as_accessor().can_fit_direct(k.len(), v.len()) {
+                break;
+            }
+            let (pos, _found) = m.as_accessor().position(&k.as_slice());
+            m.insert(pos, &k.as_slice(), &v.as_slice()).unwrap();
+            m.set_xmin(pos, 1); // dummy txn id
+            count += 1;
+        }
+        count
+    }
+
+    /// Sort a list of (key, value) pairs by key, allowing duplicates.
+    fn sort_pairs(mut pairs: Vec<(Vec<u8>, Vec<u8>)>) -> Vec<(Vec<u8>, Vec<u8>)> {
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        pairs
+    }
+
+    // ── Property tests for single operations ──────────────────────────────────
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// Test that building a page from random entries always creates a valid page
+        /// We sort the entries (allowing duplicates), then build the page
+        #[test]
+        fn prop_builder_produces_valid_page(
+            entries in prop::collection::vec(
+                (key_strategy(), small_value_strategy()),
+                0..30
+            )
+        ) {
+            let sorted = sort_pairs(entries);
+            let mut buf = PageBuffer::new();
+            build_leaf_from_sorted(&mut buf, 1, &sorted);
+            // Check that all invariants are satisfied
+            check_leaf_all_invariants(buf.memory())
+                .map_err(|e| TestCaseError::fail(format!("after build: {}", e)))?;
+        }
+
+        /// Test that inserting one key into a page keeps it valid
+        /// Start with a page that has some entries, add one more, check invariants
+        #[test]
+        fn prop_insert_maintains_invariants(
+            initial in prop::collection::vec(
+                (key_strategy(), small_value_strategy()),
+                0..15
+            ),
+            new_key in key_strategy(),
+            new_val in large_value_strategy(),
+        ) {
+            // Build the initial page
+            let sorted = sort_pairs(initial);
+            let mut buf = PageBuffer::new();
+            build_leaf_from_sorted(&mut buf, 1, &sorted);
+
+            // Try to insert the new key
+            let mut m = LeafPageMutator::<K, V>::new(buf.memory_mut());
+            let acc = m.as_accessor();
+            if acc.can_fit_direct(new_key.len(), new_val.len()) {
+                let (pos, _found) = acc.position(&new_key.as_slice());
+                drop(acc);
+                m.insert(pos, &new_key.as_slice(), &new_val.as_slice()).unwrap();
+                m.set_xmin(pos, 1);
+            }
+
+            check_leaf_all_invariants(buf.memory())
+                .map_err(|e| TestCaseError::fail(format!("after insert: {}", e)))?;
+        }
+
+        /// A single remove from a valid page preserves all invariants.
+        #[test]
+        fn prop_remove_maintains_invariants(
+            initial in prop::collection::vec(
+                (key_strategy(), small_value_strategy()),
+                1..20
+            ),
+            remove_idx in 0usize..100,
+        ) {
+            let sorted = sort_pairs(initial);
+            let mut buf = PageBuffer::new();
+            let count = build_leaf_from_sorted(&mut buf, 1, &sorted);
+
+            if count > 0 {
+                let pos = remove_idx.min(count - 1);
+                LeafPageMutator::<K, V>::new(buf.memory_mut()).remove(pos);
+            }
+
+            check_leaf_all_invariants(buf.memory())
+                .map_err(|e| TestCaseError::fail(format!("after remove: {}", e)))?;
+        }
+
+        /// Building with a high key set produces a valid page where all keys < high_key.
+        #[test]
+        fn prop_builder_with_high_key_valid(
+            entries in prop::collection::vec(
+                (key_strategy(), small_value_strategy()),
+                0..20
+            ),
+        ) {
+            let sorted = sort_pairs(entries);
+            let mut buf = PageBuffer::new();
+
+            // Use a high key that's larger than all generated keys
+            let high_key = vec![0xFF; 17]; // 17 bytes > max key of 16
+
+            let mut builder = LeafPageBuilder::<K, V>::new(1, buf.memory_mut());
+            builder.set_high_key(&high_key);
+            builder.finish();
+
+            for (k, v) in &sorted {
+                let mut m = LeafPageMutator::<K, V>::new(buf.memory_mut());
+                if !m.as_accessor().can_fit_direct(k.len(), v.len()) {
+                    break;
+                }
+                let (pos, _found) = m.as_accessor().position(&k.as_slice());
+                m.insert(pos, &k.as_slice(), &v.as_slice()).unwrap();
+            }
+
+            check_leaf_all_invariants(buf.memory())
+                .map_err(|e| TestCaseError::fail(format!("after build with high key: {}", e)))?;
+        }
+    }
+
+    // ── Step 5: Operation sequence property tests ─────────────────────────────
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Arbitrary operation sequences on a leaf page always preserve invariants.
+        #[test]
+        fn prop_leaf_op_sequence_maintains_invariants(
+            ops in prop::collection::vec(leaf_op_strategy(), 1..30)
+        ) {
+            let mut buf = PageBuffer::new();
+            LeafPageBuilder::<K, V>::new(1, buf.memory_mut()).finish();
+
+            let tm = TransactionManager::new();
+            let mut next_txn: u64 = 1;
+
+            for (i, op) in ops.iter().enumerate() {
+                match op {
+                    LeafOp::Insert { key, value } => {
+                        let mut m = LeafPageMutator::<K, V>::new(buf.memory_mut());
+                        let acc = m.as_accessor();
+                        if !acc.can_fit_direct(key.len(), value.len()) {
+                            continue;
+                        }
+                        let (pos, _found) = acc.position(&key.as_slice());
+                        drop(acc);
+                        m.insert(pos, &key.as_slice(), &value.as_slice()).unwrap();
+                        m.set_xmin(pos, next_txn);
+                        tm.mark_committed(next_txn);
+                        next_txn += 1;
+                    }
+                    LeafOp::Remove { slot_index } => {
+                        let n =
+                            LeafPageAccessor::<K, V>::new(buf.memory()).num_pairs() as usize;
+                        if n == 0 {
+                            continue;
+                        }
+                        let pos = (*slot_index).min(n - 1);
+                        LeafPageMutator::<K, V>::new(buf.memory_mut()).remove(pos);
+                    }
+                    LeafOp::SetXmax { slot_index, xmax } => {
+                        let n =
+                            LeafPageAccessor::<K, V>::new(buf.memory()).num_pairs() as usize;
+                        if n == 0 {
+                            continue;
+                        }
+                        let pos = (*slot_index).min(n - 1);
+                        LeafPageMutator::<K, V>::new(buf.memory_mut()).set_xmax(pos, *xmax);
+                    }
+                    LeafOp::Compact { horizon } => {
+                        LeafPageMutator::<K, V>::compact(1, buf.memory_mut(), *horizon, &tm);
+                    }
+                }
+
+                // Check structural invariants after EVERY operation
+                check_leaf_all_invariants(buf.memory()).map_err(|e| {
+                    TestCaseError::fail(format!(
+                        "Invariant violated after op #{} ({:?}): {}",
+                        i, op, e
+                    ))
+                })?;
+            }
+
+            // Final read-back: verify all keys are readable and sorted (allows duplicates)
+            verify_leaf_readable_and_sorted(buf.memory()).map_err(|e| {
+                TestCaseError::fail(format!("Post-sequence read-back failed: {}", e))
+            })?;
+        }
+    }
+
+    // ── Step 6: Split-at-page-level property tests ────────────────────────────
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Splitting a page at an arbitrary point produces two valid halves
+        /// with correct high keys and no data loss.
+        #[test]
+        fn prop_split_produces_valid_halves(
+            entries in prop::collection::vec(
+                (key_strategy(), small_value_strategy()),
+                5..40
+            ),
+            split_frac_pct in 20u32..80,
+        ) {
+            // 1. Build a source page with sorted entries (allowing duplicates)
+            let sorted = sort_pairs(entries);
+            if sorted.len() < 3 {
+                return Ok(()); // need at least 3 entries to split meaningfully
+            }
+            let mut src = PageBuffer::new();
+            let count = build_leaf_from_sorted(&mut src, 1, &sorted);
+            if count < 3 {
+                return Ok(());
+            }
+
+            // 2. Pick split point
+            let mid =
+                ((count as u32 * split_frac_pct) / 100).max(1).min(count as u32 - 1) as usize;
+
+            // 3. Snapshot all entries from the source page
+            let acc = LeafPageAccessor::<K, V>::new(src.memory());
+            let n = acc.num_pairs() as usize;
+            let entries_snap: Vec<(Vec<u8>, Vec<u8>, u64, u64)> = (0..n)
+                .map(|i| {
+                    let k = <K as Value>::as_bytes(&acc.get_key(i)).as_ref().to_vec();
+                    let v = <V as Value>::as_bytes(&acc.get_value(i)).as_ref().to_vec();
+                    (k, v, acc.get_xmin(i), acc.get_xmax(i))
+                })
+                .collect();
+
+            let separator = entries_snap[mid].0.clone();
+
+            // 4. Build left page: entries[..mid], high_key = separator
+            let mut left = PageBuffer::new();
+            {
+                let mut builder = LeafPageBuilder::<K, V>::new(1, left.memory_mut());
+                builder.set_high_key(&separator);
+                builder.set_rightlink(Some(2));
+                for (k, v, xmin, xmax) in &entries_snap[..mid] {
+                    builder.push_with_mvcc(
+                        &<K as Value>::from_bytes(k),
+                        &<V as Value>::from_bytes(v),
+                        *xmin,
+                        *xmax,
+                    );
+                }
+                builder.finish();
+            }
+
+            // 5. Build right page: entries[mid..], high_key = +∞ (rightmost)
+            let mut right = PageBuffer::new();
+            {
+                let mut builder = LeafPageBuilder::<K, V>::new(2, right.memory_mut());
+                builder.set_prev_page(Some(1));
+                for (k, v, xmin, xmax) in &entries_snap[mid..] {
+                    builder.push_with_mvcc(
+                        &<K as Value>::from_bytes(k),
+                        &<V as Value>::from_bytes(v),
+                        *xmin,
+                        *xmax,
+                    );
+                }
+                builder.finish();
+            }
+
+            // 6. Check invariants on both pages
+            check_leaf_all_invariants(left.memory())
+                .map_err(|e| TestCaseError::fail(format!("left half: {}", e)))?;
+            check_leaf_all_invariants(right.memory())
+                .map_err(|e| TestCaseError::fail(format!("right half: {}", e)))?;
+
+            // 7. Verify all keys in left <= separator (allow duplicates for MVCC)
+            let left_acc = LeafPageAccessor::<K, V>::new(left.memory());
+            for i in 0..left_acc.num_pairs() as usize {
+                let k = left_acc.get_key(i);
+                let kb = <K as Value>::as_bytes(&k);
+                if <K as Key>::compare(kb.as_ref(), &separator) == Ordering::Greater {
+                    return Err(TestCaseError::fail(format!(
+                        "left key[{}] ({:?}) > separator ({:?})",
+                        i,
+                        kb.as_ref(),
+                        separator
+                    )));
+                }
+            }
+
+            // 8. Verify all keys in right >= separator
+            let right_acc = LeafPageAccessor::<K, V>::new(right.memory());
+            for i in 0..right_acc.num_pairs() as usize {
+                let k = right_acc.get_key(i);
+                let kb = <K as Value>::as_bytes(&k);
+                if <K as Key>::compare(kb.as_ref(), &separator) == Ordering::Less {
+                    return Err(TestCaseError::fail(format!(
+                        "right key[{}] ({:?}) < separator ({:?})",
+                        i,
+                        kb.as_ref(),
+                        separator
+                    )));
+                }
+            }
+
+            // 9. Total records = left + right
+            let total = left_acc.num_pairs() as usize + right_acc.num_pairs() as usize;
+            if total != n {
+                return Err(TestCaseError::fail(format!(
+                    "data_loss: left ({}) + right ({}) = {} != source ({})",
+                    left_acc.num_pairs(),
+                    right_acc.num_pairs(),
+                    total,
+                    n
+                )));
+            }
+        }
+    }
+}
