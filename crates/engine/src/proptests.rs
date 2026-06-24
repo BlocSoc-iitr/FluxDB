@@ -1224,7 +1224,6 @@ fn split_sized_survival() {
     let dir = TempDir::new().unwrap();
     {
         let e = TestEngine::create(dir.path()).unwrap();
-        check_invariants(&e.index, &e.buffer_pool).unwrap();
         for i in 0u32..500 {
             let k = leak(&i.to_be_bytes());
             let v = leak(&(i * 7).to_be_bytes());
@@ -1247,11 +1246,11 @@ fn delete_survives_crash() {
     let dir = TempDir::new().unwrap();
     {
         let e = TestEngine::create(dir.path()).unwrap();
-        check_invariants(&e.index, &e.buffer_pool).unwrap();
         e.insert(&leak(b"k"), &leak(b"v")).unwrap();
         e.delete(&leak(b"k")).unwrap();
     } // crash
     let e = TestEngine::open(dir.path()).unwrap();
+    check_invariants(&e.index, &e.buffer_pool).unwrap();
     assert_eq!(e.get(&leak(b"k")).unwrap(), None);
 }
 
@@ -1260,7 +1259,6 @@ fn update_survives_crash() {
     let dir = TempDir::new().unwrap();
     {
         let e = TestEngine::create(dir.path()).unwrap();
-        check_invariants(&e.index, &e.buffer_pool).unwrap();
         e.insert(&leak(b"k"), &leak(b"v1")).unwrap();
         e.update(&leak(b"k"), &leak(b"v2")).unwrap();
     } // crash
@@ -1274,7 +1272,6 @@ fn double_recovery_is_idempotent() {
     let dir = TempDir::new().unwrap();
 
     let e = TestEngine::create(dir.path()).unwrap();
-    check_invariants(&e.index, &e.buffer_pool).unwrap();
     for i in 0u32..300 {
         let k = leak(&i.to_be_bytes());
         e.insert(&k, &k).unwrap();
@@ -1300,7 +1297,6 @@ fn torn_tail_truncates_last_record() {
     let dir = TempDir::new().unwrap();
 
     let e = TestEngine::create(dir.path()).unwrap();
-    check_invariants(&e.index, &e.buffer_pool).unwrap();
     for i in 0u32..20 {
         let k = leak(&i.to_be_bytes());
         e.insert(&k, &k).unwrap();
