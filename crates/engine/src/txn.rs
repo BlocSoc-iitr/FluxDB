@@ -33,12 +33,22 @@ where
             self.transaction_manager.mark_committed(txn.txn_id);
             return Ok(());
         }
-        {
-            let lsn = self.wal.log_commit(txn.txn_id)?;
-            self.wal.flush_up_to(lsn)?;
+
+        let lsn_res = self.wal.log_commit(txn.txn_id);
+        if let Ok(lsn) = lsn_res {
+            if let Err(e) = self.wal.flush_up_to(lsn) {
+                // If flush fails (e.g. disk full), the transaction record wasn't durably written.
+                // We MUST abort it to prevent the txn_id from permanently pinning global_xmin.
+                self.transaction_manager.mark_aborted(txn.txn_id);
+                return Err(e.into());
+            }
             self.transaction_manager.mark_committed(txn.txn_id);
+            Ok(())
+        } else {
+            // Similarly, if appending the commit record fails, abort it.
+            self.transaction_manager.mark_aborted(txn.txn_id);
+            Err(lsn_res.unwrap_err().into())
         }
-        Ok(())
     }
 
     /// Aborts a transaction.

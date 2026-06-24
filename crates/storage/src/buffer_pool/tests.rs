@@ -2,7 +2,7 @@ use crate::buffer_pool::manager::BufferPoolManager;
 use crate::buffer_pool::replacer::ClockReplacer;
 use crate::disk::DiskManager;
 use crate::wal::Wal;
-use common::{MAX_FRAMES, MAX_PAGE_SIZE};
+use common::{MAX_FRAMES, MAX_PAGE_SIZE, NUM_SHARDS};
 use std::sync::Arc;
 use tempfile::{TempDir, tempdir};
 
@@ -105,6 +105,44 @@ fn test_buffer_pool_manager_full_lifecycle() {
         let page = bpm.fetch_page(page_ids[i]).unwrap();
         assert_eq!(page[0], (i + 10) as u8);
     }
+}
+
+#[test]
+fn test_flush_all_pages_batches_data_sync_per_shard() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("batch_sync.db");
+    let disk_manager = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
+    let bpm = make_bpm(disk_manager.clone(), &dir);
+
+    let same_shard_pages = [0, NUM_SHARDS as u64, (NUM_SHARDS * 2) as u64];
+    for (idx, page_id) in same_shard_pages.into_iter().enumerate() {
+        let mut page = bpm.ensure_page(page_id).unwrap();
+        page[0] = crate::page::LEAF;
+        page[100] = idx as u8;
+    }
+
+    let before_batch = disk_manager.sync_data_call_count();
+    bpm.flush_all_pages().unwrap();
+    assert_eq!(
+        disk_manager.sync_data_call_count(),
+        before_batch + 1,
+        "same-shard flush_all_pages should batch dirty pages behind one data sync"
+    );
+
+    for (idx, page_id) in same_shard_pages.into_iter().enumerate() {
+        let mut page = bpm.fetch_page_mut(page_id).unwrap();
+        page[100] = (idx + 10) as u8;
+    }
+
+    let before_single_page_flushes = disk_manager.sync_data_call_count();
+    for page_id in same_shard_pages {
+        bpm.flush_page(page_id).unwrap();
+    }
+    assert_eq!(
+        disk_manager.sync_data_call_count(),
+        before_single_page_flushes + same_shard_pages.len(),
+        "explicit flush_page remains a per-page durability boundary"
+    );
 }
 
 #[test]

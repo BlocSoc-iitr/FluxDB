@@ -189,14 +189,22 @@ impl BufferPoolManager {
 
     /// Flushes a specific page to disk if it is dirty.
     ///
+    /// This is an explicit durability boundary for one page: the target shard
+    /// writes the page and syncs the data file before returning.
+    ///
     /// # Errors
     ///
     /// * Returns [`BufferPoolError::InternalError`] if a disk I/O error occurs.
     pub fn flush_page(&self, page_id: u64) -> Result<()> {
-        self.get_shard(page_id).flush_page(page_id)
+        self.get_shard(page_id).flush_page(page_id)?;
+        Ok(())
     }
 
     /// Flushes all dirty pages in the buffer pool to disk.
+    ///
+    /// Each shard writes its dirty pages first, then performs one data-file
+    /// sync for that shard. This preserves WAL-before-page while avoiding an
+    /// `fdatasync` per dirty page.
     ///
     /// # Errors
     ///

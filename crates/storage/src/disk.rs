@@ -9,6 +9,8 @@ use std::{
 
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use common::DiskError;
 
@@ -25,6 +27,8 @@ pub struct DiskManager {
     _db_path: PathBuf,
     file: File,
     page_size: usize,
+    #[cfg(test)]
+    sync_data_calls: AtomicUsize,
 }
 
 impl DiskManager {
@@ -42,6 +46,8 @@ impl DiskManager {
             _db_path: path.as_ref().to_path_buf(),
             file,
             page_size,
+            #[cfg(test)]
+            sync_data_calls: AtomicUsize::new(0),
         })
     }
 
@@ -113,8 +119,15 @@ impl DiskManager {
 
     /// Flushes file data to disk (equivalent to `fdatasync`).
     pub fn sync_data(&self) -> Result<()> {
+        #[cfg(test)]
+        self.sync_data_calls.fetch_add(1, Ordering::Relaxed);
         self.file.sync_data()?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn sync_data_call_count(&self) -> usize {
+        self.sync_data_calls.load(Ordering::Relaxed)
     }
 
     /// Performs an atomic write for small "whole file" updates, such as catalogs or manifests.
