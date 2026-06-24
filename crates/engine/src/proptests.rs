@@ -17,7 +17,7 @@ use std::ops::Bound;
 use storage::buffer_pool::BufferPoolManager;
 use storage::index::BTreeIndex;
 use common::MAX_PAGE_SIZE;
-use db_core::transaction_manager::{TransactionManager, TransactionStatus};
+use db_core::transaction_manager::TransactionManager;
 use std::path::Path;
 use std::sync::Arc;
 use storage::disk::DiskManager;
