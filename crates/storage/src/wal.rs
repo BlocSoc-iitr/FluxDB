@@ -952,8 +952,13 @@ impl Wal {
         blocks.push(child_block);
         self.append(WalRecordType::InsertDownLink, txn_id, &blocks, None)
     }
-    pub fn log_new_root(&self, txn_id: u64, new_root: (PageId, &[u8; PAGE_SIZE])) -> Result<Lsn> {
-        let mut blocks = Vec::with_capacity(2);
+    pub fn log_new_root(
+        &self,
+        txn_id: u64,
+        new_root: (PageId, &[u8; PAGE_SIZE]),
+        left_child: PageId,
+    ) -> Result<Lsn> {
+        let mut blocks = Vec::with_capacity(3);
         let new_root_block = Block {
             page_id: new_root.0,
             blk_flags: BLK_HAS_FPI,
@@ -969,6 +974,13 @@ impl Wal {
             data: Some(&root_bytes),
         };
         blocks.push(meta_block);
+        let left_child_block = Block {
+            page_id: left_child,
+            blk_flags: 0,
+            fpi: None,
+            data: None,
+        };
+        blocks.push(left_child_block);
         self.append(WalRecordType::NewRoot, txn_id, &blocks, None)
     }
 
