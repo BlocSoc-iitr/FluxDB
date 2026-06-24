@@ -1,6 +1,7 @@
 use super::*;
 use crate::buffer_pool::manager::BufferPoolManager;
 use crate::disk::DiskManager;
+use crate::recovery::RecoveryManager;
 use crate::wal::Wal;
 use crate::wal::{WalIterator, WalRecordType};
 use common::MAX_PAGE_SIZE;
@@ -9,6 +10,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, OnceLock};
 use tempfile::tempdir;
+
+type TM = db_core::transaction_manager::TransactionManager;
+type Idx = BTreeIndex<&'static [u8], &'static [u8]>;
 
 /// Open a throwaway WAL under `dir`. The index and pool must share one WAL,
 /// so callers build it once here and clone the `Arc` to both.
@@ -49,6 +53,40 @@ fn auto() -> Transaction {
 
 fn leak_bytes(b: &[u8]) -> &'static [u8] {
     Box::leak(b.to_vec().into_boxed_slice())
+}
+
+// `make_wal(dir)` opens dir/"wal" (segment dir); data lives at dir/"test.db".
+fn build_db(dir: &Path) -> (Arc<BufferPoolManager>, Arc<Wal>, Arc<TM>, Idx) {
+    let disk = Arc::new(DiskManager::new(dir.join("test.db"), MAX_PAGE_SIZE).unwrap());
+    let wal = make_wal(dir);
+    let pool = make_pool(disk, wal.clone());
+    let tm = Arc::new(TM::new());
+    let (index, _root) = BTreeIndex::create(pool.clone(), wal.clone()).unwrap();
+    (pool, wal, tm, index)
+}
+
+/// Reopen = recover. Caller must drop the previous tuple first; only durable
+/// (committed / flushed) records survive the drop.
+fn reopen_db(dir: &Path) -> (Arc<BufferPoolManager>, Arc<Wal>, Arc<TM>, Idx) {
+    let disk = Arc::new(DiskManager::new(dir.join("test.db"), MAX_PAGE_SIZE).unwrap());
+    let wal = make_wal(dir);
+    let pool = make_pool(disk, wal.clone());
+    let tm = Arc::new(TM::new());
+    RecoveryManager::new(pool.clone(), dir.join("wal"), tm.clone())
+        .recover::<&[u8], &[u8]>()
+        .unwrap();
+    let index = BTreeIndex::open(pool.clone(), wal.clone()).unwrap();
+    (pool, wal, tm, index)
+}
+
+fn wal_has(wal_dir: &Path, t: WalRecordType) -> bool {
+    let mut it = WalIterator::new(wal_dir).unwrap();
+    while let Some(r) = it.next_record() {
+        if r.unwrap().entry_type == t {
+            return true;
+        }
+    }
+    false
 }
 
 // ── Basic get / insert ────────────────────────────────────────────────
@@ -778,4 +816,24 @@ fn update_emits_setxmax_then_insert_in_lsn_order() {
         xmax_lsn < ins_lsn,
         "SetXmax must be logged before the new Insert"
     );
+}
+
+// ── Crash Harness Recovery ──────────────────────────────────────
+#[test]
+fn crash_victim_uncommitted_insert_invisible_after_reopen() {
+    let dir = tempdir().unwrap();
+    {
+        let (pool, _wal, tm, index) = build_db(dir.path());
+        let victim = tm.begin();
+        index
+            .insert(&(&b"ghost"[..]), &(&b"boo"[..]), &victim)
+            .unwrap();
+        pool.flush_all_pages().unwrap();
+        // crash: tuple drops; victim's Insert already durable via the gate, but no Commit record
+    }
+    let (_pool, _wal, tm, index) = reopen_db(dir.path());
+    let reader = tm.begin();
+    assert!(index.get(&(&b"ghost"[..]), &reader).unwrap().is_none());
+    let all: Vec<(Vec<u8>, Vec<u8>)> = index.range(.., &reader).map(|r| r.unwrap()).collect();
+    assert!(all.is_empty());
 }
