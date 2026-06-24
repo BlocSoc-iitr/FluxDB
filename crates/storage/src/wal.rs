@@ -898,21 +898,23 @@ impl Wal {
         blocks.push(right_block);
         self.append(WalRecordType::InternalSPlit, txn_id, &blocks, None)
     }
-    pub fn truncate_wal_after(wal_path: &Path, stop_after: WalRecordType) {
-        let mut iter = WalIterator::new(wal_path).unwrap();
+
+    pub fn truncate_wal_after(wal_dir: &Path, stop_after: WalRecordType) {
+        let mut iter = WalIterator::new(wal_dir).unwrap();      // dir → all segments
         let (mut offset, mut cut) = (0u64, None);
         while let Some(rec) = iter.next_record() {
             let rec = rec.unwrap();
-            offset += rec.rec_len as u64;          // rec_len includes the CRC32
-            if rec.entry_type == stop_after {
-                cut = Some(offset);                 // keep updating → last occurrence
-            }
+            offset += rec.rec_len as u64;                        // rec_len includes the CRC32
+            if rec.entry_type == stop_after { cut = Some(offset); } // last occurrence
         }
         let cut = cut.expect("no record of the requested type in the WAL");
-        let f = OpenOptions::new().write(true).open(wal_path).unwrap();
+        // small tests have exactly one segment; truncate that file (NOT the dir).
+        let seg = list_segments(wal_dir).unwrap().pop().expect("a segment file").1;
+        let f = OpenOptions::new().write(true).open(seg).unwrap();
         f.set_len(cut).unwrap();
         f.sync_all().unwrap();
     }
+    
     pub fn log_insert_downlink(
         &self,
         txn_id: u64,
