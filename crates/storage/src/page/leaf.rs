@@ -43,10 +43,10 @@
 //! │  │ u16  │ u16  │  u32 │  u64     │  u64     │ key bytes│ │
 //! │  │k_len │v_len │ rsv  │  xmin    │  xmax    │ val bytes│ │
 //! │  └──────┴──────┴──────┴──────────┴──────────┴──────────┘ │
-//! │    2B     2B     4B      8B         8B    k_len  v_len    │
-//! │  Fixed record header = 24 bytes                           │
-//! │  xmin = creating transaction ID                           │
-//! │  xmax = deleting/replacing transaction ID (0 = live)      │
+//! │    2B     2B     4B      8B         8B    k_len  v_len   │
+//! │  Fixed record header = 24 bytes                          │
+//! │  xmin = creating transaction ID                          │
+//! │  xmax = deleting/replacing transaction ID (0 = live)     │
 //! └──────────────────────────────────────────────────────────┘
 //! ```
 

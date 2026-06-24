@@ -1,0 +1,64 @@
+//! Overflow page type for the FluxDB storage engine.
+//!
+//! ## Layout
+//!
+//! ```text
+//! Page size: 4096 bytes
+//!
+//! ┌─────────────────────────────────────────────────────────┐
+//! │ FIXED HEADER — 48 bytes (fully 8-byte aligned)          │
+//! ├────────┬───────────┬─────────────────────────────────── ┤
+//! │ Off  0 │ u8        │ page_type  (= OVERFLOW = 4)        │
+//! │ Off  1 │ u8        │ _reserved  (0, never set_incomplete_split) │
+//! │ Off  2 │ [6 bytes] │ _padding                           │
+//! ├────────┼───────────┼─────────────────────────────────── ┤
+//! │ Off  8 │ u64       │ page_id          [8-byte aligned]  │
+//! │ Off 16 │ u64       │ lsn              [8-byte aligned]  │
+//! │ Off 24 │ u64       │ next_page_id     [8-byte aligned]  │
+//! │        │           │  (0 = end of chain)                │
+//! │ Off 32 │ u16       │ chunk_len  (bytes used in payload) │
+//! │ Off 34 │ [10 bytes]│ _padding                           │
+//! │ Off 44 │ u32       │ checksum (CRC32)                   │
+//! └────────┴───────────┴─────────────────────────────────── ┘
+//!
+//! ┌──────────────────────────────────────────────────────────┐
+//! │ DATA PAYLOAD  [offset 48 .. PAGE_SIZE]                   │
+//! │  Up to 4048 bytes of raw value chunk per page.           │
+//! │  Filled from offset 48 upward; only chunk_len bytes      │
+//! │  are valid. The rest is zeroed.                          │
+//! └──────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! Overflow pages form a singly-linked chain. The last page in the
+//! chain has `next_page_id = 0`. `chunk_len` records how many bytes
+//! of the payload region are actually populated on this page.
+//!
+//! These pages have no slot directory and never participate in B+Tree
+//! splits — `_reserved` (offset 1) must never be touched by the
+//! `set_incomplete_split` helper.
+
+use common::{Key, Value};
+use db_core::{transaction, transaction_manager::TransactionManager};
+use std::cmp::Ordering;
+
+use super::{
+    OVERFLOW, Lsn, OFF_LSN, OFF_PAGE_ID, OFF_PAGE_TYPE, PAGE_SIZE, PageError, PageId, read_u8,
+    read_u16, read_u64, write_u8, write_u16, write_u32, write_u64,
+};
+
+// ── Overflow-page-specific header offsets ────────────────────────────────────────
+const OFF_OVERFLOW_NEXT_PAGE_ID : usize = 24;
+const OFF_OVERFLOW_CHUNK_LEN : u16 = 32;
+
+pub struct OverflowPageAccessor<'a>{
+    data: &'a [u8],
+}
+pub struct OverflowPageMutator<'a> {
+    data: &'a mut [u8],
+
+}
+pub struct OverflowPageBuilder<'a>{
+    data: &'a mut [u8],
+}
+
+ 
