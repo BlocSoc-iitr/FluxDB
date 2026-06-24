@@ -56,6 +56,7 @@ use std::collections::VecDeque;
 use std::fs::{File, OpenOptions, create_dir_all, metadata, read_dir};
 use std::io::{self, BufRead, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::disk::DiskManager;
@@ -174,8 +175,7 @@ struct WalBuffer {
 }
 
 struct WalState {
-    buffer: WalBuffer,
-    next_lsn: Lsn,
+    buffer: WalBuffer, //
     flushed_lsn: Option<Lsn>,
     is_flushing: bool,
     flush_error: Option<String>,
@@ -186,6 +186,8 @@ struct WalShared {
     writer: Mutex<SegmentWriter>,
     durable: Condvar,
     segment_size: u64,
+    buffer_capacity: usize,
+    next_lsn: AtomicU64,
 }
 
 /// Write-ahead log manager for one WAL segment directory.
@@ -769,7 +771,6 @@ impl Wal {
         let shared = Arc::new(WalShared {
             state: Mutex::new(WalState {
                 buffer: WalBuffer::with_capacity(buffer_capacity),
-                next_lsn,
                 flushed_lsn,
                 is_flushing: false,
                 flush_error: None,
@@ -777,13 +778,15 @@ impl Wal {
             writer: Mutex::new(writer),
             durable: Condvar::new(),
             segment_size,
+            buffer_capacity,
+            next_lsn: AtomicU64::new(next_lsn),
         });
 
         Ok(Wal { shared })
     }
 
     pub fn next_lsn(&self) -> Lsn {
-        self.shared.state.lock().unwrap().next_lsn
+        self.shared.next_lsn.load(Ordering::Relaxed)
     }
 
     pub fn flushed_lsn(&self) -> Option<Lsn> {
@@ -992,6 +995,9 @@ impl Wal {
         let record_size = 8 + 4 + 1 + 1 + 8 + 2 + blocks_size + main_data_size + 4;
 
         let segment_limit = self.shared.segment_size as usize;
+        let buffer_limit = self.shared.buffer_capacity;
+        let max_allowed_size = segment_limit.min(buffer_limit);
+
         if record_size > segment_limit {
             return Err(WalError::RecordTooLarge {
                 lsn: 0,
@@ -999,13 +1005,15 @@ impl Wal {
                 capacity: segment_limit,
             });
         }
-
-        let mut state = self.shared.state.lock().unwrap();
-        if let Some(err) = state.flush_error.as_ref() {
-            return Err(WalError::FlushFailed(err.clone()));
+        if record_size > max_allowed_size {
+            return Err(WalError::RecordTooLarge {
+                lsn: self.shared.next_lsn.load(Ordering::Relaxed),
+                record_len: record_size,
+                capacity: max_allowed_size,
+            });
         }
 
-        let lsn = state.next_lsn;
+        let lsn = self.shared.next_lsn.fetch_add(1, Ordering::Relaxed);
 
         let mut record = Vec::with_capacity(record_size);
         record.reserve(record_size);
@@ -1042,8 +1050,13 @@ impl Wal {
         let checksum = hasher.finalize();
 
         record.extend_from_slice(&checksum.to_le_bytes());
+
+        let mut state = self.shared.state.lock().unwrap();
+        if let Some(err) = state.flush_error.as_ref() {
+            return Err(WalError::FlushFailed(err.clone()));
+        }
+
         state.buffer.push_record(lsn, &record)?;
-        state.next_lsn += 1;
 
         Ok(lsn)
     }
@@ -1055,13 +1068,12 @@ impl Wal {
     /// 0, the call is a no-op — preventing a permanent park on the `durable`
     /// condvar.
     pub fn flush_up_to(&self, lsn: Lsn) -> Result<()> {
-        let mut state = self.shared.state.lock().unwrap();
+        let current_next_lsn = self.shared.next_lsn.load(Ordering::Relaxed);
 
         // Guard the *clamped target*, not just the argument. When next_lsn == 1
         // (no records appended), checked_sub(1) yields Some(0) and the flusher
         // has nothing buffered, so parking on `durable` would hang forever.
-        let target_lsn = state
-            .next_lsn
+        let target_lsn = current_next_lsn
             .checked_sub(1)
             .map(|last| lsn.min(last))
             .unwrap_or(0);
@@ -1069,6 +1081,7 @@ impl Wal {
             return Ok(());
         }
 
+        let mut state = self.shared.state.lock().unwrap();
         loop {
             if state
                 .flushed_lsn
@@ -1564,6 +1577,55 @@ mod tests {
         );
         // LSN must not have been consumed.
         assert_eq!(wal.next_lsn(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_atomic_lsn_isunique() -> Result<()> {
+        let dir = tempdir().map_err(WalError::Io)?;
+        let wal_dir = dir.path().join("atomic-lsn-wal");
+
+        let wal = Arc::new(Wal::new(&wal_dir)?);
+
+        let number_thread = 8;
+        let record_per_thread = 500;
+
+        let handle: Vec<_> = (0..number_thread)
+            .map(|thread_id| {
+                let wal = Arc::clone(&wal);
+                thread::spawn(move || -> Vec<Lsn> {
+                    (0..record_per_thread)
+                        .map(|i| {
+                            let tx_id = (thread_id * 100 + i) as u64;
+                            wal.log_commit(tx_id)
+                                .expect("concurrent append must not fail")
+                        })
+                        .collect()
+                })
+            })
+            .collect();
+
+        let mut all_lsns: Vec<Lsn> = handle
+            .into_iter()
+            .flat_map(|h| h.join().expect("thread panicked"))
+            .collect();
+
+        all_lsns.sort_unstable();
+
+        let total = number_thread * record_per_thread;
+
+        // Exactly the right number of LSNs were handed out.
+        assert_eq!(all_lsns.len(), total, "wrong number of LSNs collected");
+
+        all_lsns.dedup();
+        assert_eq!(
+            all_lsns.len(),
+            total,
+            "Duplicate LSNs detected! Atomic implementation is broken."
+        );
+
+        assert_eq!(wal.next_lsn(), (total + 1) as u64);
 
         Ok(())
     }
