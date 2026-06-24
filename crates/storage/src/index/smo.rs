@@ -283,9 +283,11 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
 
                 // NewRoot: new-root FPI + page-0 pointer in one atomic record.
                 let new_root_fpi = <&[u8; PAGE_SIZE]>::try_from(&new_root_guard[..]).unwrap();
-                let lsn = self
-                .wal
-                .log_new_root(SYSTEM_TXN_ID, (new_root_pid, new_root_fpi), left_child)?;
+                let lsn = self.wal.log_new_root(
+                    SYSTEM_TXN_ID,
+                    (new_root_pid, new_root_fpi),
+                    left_child,
+                )?;
                 InternalPageMutator::<K>::new(&mut new_root_guard[..]).set_lsn(lsn);
                 crate::page::meta::set_lsn(&mut meta_guard[..], lsn);
                 drop(new_root_guard);

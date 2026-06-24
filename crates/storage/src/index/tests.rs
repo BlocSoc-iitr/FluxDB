@@ -1,11 +1,11 @@
 use super::*;
-use db_core::transaction_manager::TransactionStatus;
 use crate::buffer_pool::manager::BufferPoolManager;
 use crate::disk::DiskManager;
 use crate::recovery::RecoveryManager;
 use crate::wal::Wal;
 use crate::wal::{WalIterator, WalRecordType};
 use common::MAX_PAGE_SIZE;
+use db_core::transaction_manager::TransactionStatus;
 use std::mem::forget;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -838,19 +838,19 @@ fn clog_reconstructed_after_crash() {
     {
         let (pool, wal, tm, index) = build_db(dir.path());
 
-        let c = tm.begin();                       // (1) committed — durable Commit
+        let c = tm.begin(); // (1) committed — durable Commit
         committed_id = c.txn_id;
         index.insert(&(&b"c"[..]), &(&b"1"[..]), &c).unwrap();
         wal.log_commit(c.txn_id).unwrap();
         tm.mark_committed(c.txn_id);
 
-        let a = tm.begin();                       // (2) explicitly aborted — durable Abort
+        let a = tm.begin(); // (2) explicitly aborted — durable Abort
         aborted_id = a.txn_id;
         index.insert(&(&b"a"[..]), &(&b"2"[..]), &a).unwrap();
         wal.log_abort(a.txn_id).unwrap();
         tm.mark_aborted(a.txn_id);
 
-        let v = tm.begin();                       // (3) in-flight victim — Insert only
+        let v = tm.begin(); // (3) in-flight victim — Insert only
         inflight_id = v.txn_id;
         index.insert(&(&b"v"[..]), &(&b"3"[..]), &v).unwrap();
 
@@ -863,11 +863,14 @@ fn clog_reconstructed_after_crash() {
 
     assert!(tm.is_committed(committed_id));
     assert!(tm.is_aborted(aborted_id));
-    assert!(tm.is_aborted(inflight_id));          // in-flight presumed aborted
+    assert!(tm.is_aborted(inflight_id)); // in-flight presumed aborted
     assert!(!tm.is_committed(inflight_id));
 
     // presumed-commit: active set empty post-recovery, so every recovered id is below
     // global_xmin — not-explicitly-aborted ⇒ Committed; did-work-but-unsettled ⇒ Aborted.
-    assert_eq!(tm.settled_status(committed_id), TransactionStatus::Committed);
+    assert_eq!(
+        tm.settled_status(committed_id),
+        TransactionStatus::Committed
+    );
     assert_eq!(tm.settled_status(inflight_id), TransactionStatus::Aborted);
 }

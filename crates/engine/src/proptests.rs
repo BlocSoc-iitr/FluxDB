@@ -7,25 +7,25 @@
 //! (`for<'a> K: Value<SelfType<'a> = K>`) so generated values can be passed and
 //! stored directly — true of `u32`, `String`, and `Vec<u8>`.
 
+use common::MAX_PAGE_SIZE;
 use common::{EngineError, IndexError, Key, Value};
+use db_core::transaction_manager::TransactionManager;
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 use std::cmp::Ordering;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
-use storage::buffer_pool::BufferPoolManager;
-use storage::index::BTreeIndex;
-use common::MAX_PAGE_SIZE;
-use db_core::transaction_manager::TransactionManager;
 use std::path::Path;
 use std::sync::Arc;
+use storage::buffer_pool::BufferPoolManager;
 use storage::disk::DiskManager;
-use storage::recovery::RecoveryManager;
-use storage::wal::{Wal, WalIterator, WalRecordType};
+use storage::index::BTreeIndex;
 use storage::page::{
     INTERNAL, InternalPageAccessor, LEAF, LeafPageAccessor, PageId, is_incomplete_split, meta,
 };
+use storage::recovery::RecoveryManager;
+use storage::wal::{Wal, WalIterator, WalRecordType};
 use tempfile::{TempDir, tempdir};
 
 use crate::Engine;
@@ -1337,14 +1337,16 @@ fn crash_victim_uncommitted_insert_invisible_after_reopen() {
         let (pool, _wal, tm, index) = raw_build_db(dir.path());
         let victim = tm.begin();
         victim_id = victim.txn_id;
-        index.insert(&(&b"ghost"[..]), &(&b"boo"[..]), &victim).unwrap();
+        index
+            .insert(&(&b"ghost"[..]), &(&b"boo"[..]), &victim)
+            .unwrap();
         pool.flush_all_pages().unwrap();
         // crash: victim's Insert is durable via the WAL-before-page gate, no Commit
     }
     let (pool, _wal, tm, index) = raw_reopen_db(dir.path());
 
-    check_invariants(&index, &pool).unwrap();           // structure intact
-    assert!(tm.is_aborted(victim_id));                  // in-flight → crash victim → Aborted
+    check_invariants(&index, &pool).unwrap(); // structure intact
+    assert!(tm.is_aborted(victim_id)); // in-flight → crash victim → Aborted
 
     let reader = tm.begin();
     assert!(index.get(&(&b"ghost"[..]), &reader).unwrap().is_none());
