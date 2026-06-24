@@ -1012,10 +1012,7 @@ proptest! {
     /// `DuplicateKey`). After commit/abort the committed state must equal `model`.
     ///
     /// The batch operates on keys (100..116) **disjoint** from `setup` (0..16),
-    /// so every key it touches is created within the txn. That deliberately
-    /// avoids modifying a pre-existing committed key inside the txn — which trips
-    /// the known own-delete/own-update RYOW bug pinned by
-    /// `known_bug_txn_does_not_see_own_modify_of_committed_row`.
+    /// so every key it touches is created within the txn.
     #[test]
     fn multi_write_txn_atomic(
         setup in prop::collection::hash_map(0u32..16, any::<u32>(), 0..12),
@@ -1078,24 +1075,11 @@ proptest! {
     }
 }
 
-/// KNOWN BUG — pinned, not fixed (reported separately).
-///
-/// A transaction does NOT observe its own DELETE (or UPDATE) of a row created by
-/// an earlier *committed* transaction. Standard MVCC read-your-own-writes
-/// requires the deleting txn to stop seeing the row, but the own-write shortcut
-/// in `Transaction::is_visible` (db-core/transaction.rs:57) only covers rows the
-/// txn itself created (`rec_xmin == txn_id`). A committed row deleted by the
-/// current txn (`rec_xmin = committed`, `rec_xmax = self`) falls through to the
-/// snapshot path, which sees the deleter as "not committed" and so reports the
-/// row as still visible. Surfaced by `multi_write_txn_atomic` (delete-then-
-/// reinsert of a committed key in one txn returned `DuplicateKey`).
-///
-/// This test locks the CURRENT (buggy) behavior so the eventual fix
-/// (`if rec_xmax == self.txn_id { return false }` in `Transaction::is_visible`)
-/// makes it fail and prompts an update. Note: only *within-txn* visibility is
-/// wrong — the delete still takes effect for readers after commit.
+/// Regression: a transaction must observe its own DELETE of a row created by an
+/// earlier committed transaction, then allow a replacement insert in the same
+/// transaction.
 #[test]
-fn known_bug_txn_does_not_see_own_modify_of_committed_row() {
+fn txn_sees_own_modify_of_committed_row() {
     let (_dir, engine) = tmp_engine::<u32, u32>();
     let decode = |o: Option<Vec<u8>>| o.map(|b| u32::from_le_bytes(b.try_into().unwrap()));
 
@@ -1104,29 +1088,20 @@ fn known_bug_txn_does_not_see_own_modify_of_committed_row() {
     let mut t = engine.begin();
     t.delete(&1u32).unwrap(); // delete it inside a new txn
 
-    // BUG: the txn still sees the committed row it just deleted (should be None).
     assert_eq!(
         decode(t.get(&1u32).unwrap()),
-        Some(10),
-        "current behavior: own delete of a committed row is not observed within the txn"
+        None,
+        "own delete of a committed row must be visible within the txn"
     );
-    // ...and a re-insert is therefore rejected as a duplicate (should be Ok).
-    assert!(
-        matches!(
-            t.insert(&1u32, &20),
-            Err(EngineError::Index(IndexError::DuplicateKey))
-        ),
-        "current behavior: reinsert after own-delete returns DuplicateKey"
-    );
+    t.insert(&1u32, &20).unwrap();
+    assert_eq!(decode(t.get(&1u32).unwrap()), Some(20));
     t.commit().unwrap();
 
-    // Post-commit the delete DID take effect (only within-txn visibility was
-    // wrong) and the reinsert never happened, so the row is gone.
     let mut r = engine.begin();
     assert_eq!(
         decode(r.get(&1u32).unwrap()),
-        None,
-        "post-commit: row is deleted"
+        Some(20),
+        "post-commit: replacement row is visible"
     );
     r.commit().unwrap();
 }
