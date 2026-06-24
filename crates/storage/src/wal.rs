@@ -898,6 +898,29 @@ impl Wal {
         blocks.push(right_block);
         self.append(WalRecordType::InternalSPlit, txn_id, &blocks, None)
     }
+
+    pub fn truncate_wal_after(wal_dir: &Path, stop_after: WalRecordType) {
+        let mut iter = WalIterator::new(wal_dir).unwrap(); // dir → all segments
+        let (mut offset, mut cut) = (0u64, None);
+        while let Some(rec) = iter.next_record() {
+            let rec = rec.unwrap();
+            offset += rec.rec_len as u64; // rec_len includes the CRC32
+            if rec.entry_type == stop_after {
+                cut = Some(offset);
+            } // last occurrence
+        }
+        let cut = cut.expect("no record of the requested type in the WAL");
+        // small tests have exactly one segment; truncate that file (NOT the dir).
+        let seg = list_segments(wal_dir)
+            .unwrap()
+            .pop()
+            .expect("a segment file")
+            .1;
+        let f = OpenOptions::new().write(true).open(seg).unwrap();
+        f.set_len(cut).unwrap();
+        f.sync_all().unwrap();
+    }
+
     pub fn log_insert_downlink(
         &self,
         txn_id: u64,
@@ -929,8 +952,13 @@ impl Wal {
         blocks.push(child_block);
         self.append(WalRecordType::InsertDownLink, txn_id, &blocks, None)
     }
-    pub fn log_new_root(&self, txn_id: u64, new_root: (PageId, &[u8; PAGE_SIZE])) -> Result<Lsn> {
-        let mut blocks = Vec::with_capacity(2);
+    pub fn log_new_root(
+        &self,
+        txn_id: u64,
+        new_root: (PageId, &[u8; PAGE_SIZE]),
+        left_child: PageId,
+    ) -> Result<Lsn> {
+        let mut blocks = Vec::with_capacity(3);
         let new_root_block = Block {
             page_id: new_root.0,
             blk_flags: BLK_HAS_FPI,
@@ -946,6 +974,13 @@ impl Wal {
             data: Some(&root_bytes),
         };
         blocks.push(meta_block);
+        let left_child_block = Block {
+            page_id: left_child,
+            blk_flags: 0,
+            fpi: None,
+            data: None,
+        };
+        blocks.push(left_child_block);
         self.append(WalRecordType::NewRoot, txn_id, &blocks, None)
     }
 
