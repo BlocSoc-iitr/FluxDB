@@ -1,4 +1,5 @@
 use super::*;
+use db_core::transaction_manager::TransactionStatus;
 use crate::buffer_pool::manager::BufferPoolManager;
 use crate::disk::DiskManager;
 use crate::recovery::RecoveryManager;
@@ -826,4 +827,47 @@ fn crash_victim_uncommitted_insert_invisible_after_reopen() {
     assert!(index.get(&(&b"ghost"[..]), &reader).unwrap().is_none());
     let all: Vec<(Vec<u8>, Vec<u8>)> = index.range(.., &reader).map(|r| r.unwrap()).collect();
     assert!(all.is_empty());
+}
+
+#[test]
+fn clog_reconstructed_after_crash() {
+    let dir = tempdir().unwrap();
+    let committed_id;
+    let aborted_id;
+    let inflight_id;
+    {
+        let (pool, wal, tm, index) = build_db(dir.path());
+
+        let c = tm.begin();                       // (1) committed — durable Commit
+        committed_id = c.txn_id;
+        index.insert(&(&b"c"[..]), &(&b"1"[..]), &c).unwrap();
+        wal.log_commit(c.txn_id).unwrap();
+        tm.mark_committed(c.txn_id);
+
+        let a = tm.begin();                       // (2) explicitly aborted — durable Abort
+        aborted_id = a.txn_id;
+        index.insert(&(&b"a"[..]), &(&b"2"[..]), &a).unwrap();
+        wal.log_abort(a.txn_id).unwrap();
+        tm.mark_aborted(a.txn_id);
+
+        let v = tm.begin();                       // (3) in-flight victim — Insert only
+        inflight_id = v.txn_id;
+        index.insert(&(&b"v"[..]), &(&b"3"[..]), &v).unwrap();
+
+        wal.flush_up_to(wal.next_lsn()).unwrap();
+        pool.flush_all_pages().unwrap();
+        // crash
+    }
+
+    let (_pool, _wal, tm, _index) = reopen_db(dir.path());
+
+    assert!(tm.is_committed(committed_id));
+    assert!(tm.is_aborted(aborted_id));
+    assert!(tm.is_aborted(inflight_id));          // in-flight presumed aborted
+    assert!(!tm.is_committed(inflight_id));
+
+    // presumed-commit: active set empty post-recovery, so every recovered id is below
+    // global_xmin — not-explicitly-aborted ⇒ Committed; did-work-but-unsettled ⇒ Aborted.
+    assert_eq!(tm.settled_status(committed_id), TransactionStatus::Committed);
+    assert_eq!(tm.settled_status(inflight_id), TransactionStatus::Aborted);
 }
