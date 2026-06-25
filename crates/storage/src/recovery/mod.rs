@@ -160,6 +160,10 @@ impl RecoveryManager {
                 let root_page_id = u64::from_le_bytes(d[0..8].try_into().unwrap());
                 crate::page::meta::set_root(page, root_page_id);
             }
+            (WalRecordType::NewRoot, 2) => {
+                // left_child block: clear INCOMPLETE_SPLIT on the old root.
+                crate::page::clear_incomplete_split(page);
+            }
             _ => {
                 // No physiological apply for this (type, block). FPI blocks never reach here.
             }
