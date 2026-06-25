@@ -240,4 +240,24 @@ pub fn read_overflow_chain(
 
     Ok(result)
 }
-// pub fn free_overflow_chain(first_page_id: PageId, pool: &BufferPoolManager) -> Result<()>
+
+pub fn free_overflow_chain(
+    first_page_id: PageId,
+    pool: &BufferPoolManager,
+) -> Result<(), IndexError> {
+    let mut current_page_id = Some(first_page_id);
+
+    while let Some(pid) = current_page_id {
+        // Fetch to read next_page_id before deleting
+        let next = {
+            let guard = pool.fetch_page(pid)?;
+            let acc = OverflowPageAccessor::new(&guard[..]);
+            acc.next_page_id() 
+        }; 
+
+        pool.delete_page(pid)?; 
+        current_page_id = next;
+    }
+
+    Ok(())
+}
