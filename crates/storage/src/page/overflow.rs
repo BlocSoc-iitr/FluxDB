@@ -40,8 +40,8 @@
 use std::io::BufReader;
 
 use super::{
-    Lsn, OFF_LSN, OFF_PAGE_ID, OFF_PAGE_TYPE, OVERFLOW, PAGE_SIZE, PageError,
-    PageId, read_u8, read_u16, read_u64, write_u8, write_u16, write_u64,
+    Lsn, OFF_LSN, OFF_PAGE_ID, OFF_PAGE_TYPE, OVERFLOW, PAGE_SIZE, PageError, PageId, read_u8,
+    read_u16, read_u64, write_u8, write_u16, write_u64,
 };
 
 // ── Overflow-page-specific header offsets ────────────────────────────────────────
@@ -72,7 +72,10 @@ impl OverflowDescriptor {
         }
         let first_page_id = PageId::from_le_bytes(bytes[0..8].try_into().unwrap());
         let total_size = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        Some(Self { first_page_id, total_size })
+        Some(Self {
+            first_page_id,
+            total_size,
+        })
     }
 }
 pub struct OverflowPageBuilder<'a> {
@@ -198,7 +201,7 @@ pub fn write_overflow_chain(
     // Allocate all pages first so we know their IDs before linking
     let mut guards = Vec::with_capacity(chunks.len());
     for _ in &chunks {
-        guards.push(pool.new_page()?); 
+        guards.push(pool.new_page()?);
     }
 
     let first_page_id = guards[0].page_id;
@@ -214,7 +217,7 @@ pub fn write_overflow_chain(
         let page_id = guards[i].page_id;
         let mut builder = OverflowPageBuilder::new(page_id, &mut guards[i][..]);
         builder.set_next_page_id(next_page_id);
-        builder.set_chunk(chunks[i])?; 
+        builder.set_chunk(chunks[i])?;
         builder.finish();
     }
 
@@ -252,10 +255,10 @@ pub fn free_overflow_chain(
         let next = {
             let guard = pool.fetch_page(pid)?;
             let acc = OverflowPageAccessor::new(&guard[..]);
-            acc.next_page_id() 
-        }; 
+            acc.next_page_id()
+        };
 
-        pool.delete_page(pid)?; 
+        pool.delete_page(pid)?;
         current_page_id = next;
     }
 
