@@ -182,3 +182,45 @@ impl<'a> OverflowPageMutator<'a> {
         Ok(())
     }
 }
+
+use crate::buffer_pool::BufferPoolManager;
+use common::IndexError;
+
+pub fn write_overflow_chain(
+    value: &[u8],
+    pool: &BufferPoolManager,
+) -> Result<OverflowDescriptor, IndexError> {
+    let total_size = value.len() as u32;
+    let chunks: Vec<&[u8]> = value.chunks(OVERFLOW_PAYLOAD_SIZE).collect();
+
+    // Allocate all pages first so we know their IDs before linking
+    let mut guards = Vec::with_capacity(chunks.len());
+    for _ in &chunks {
+        guards.push(pool.new_page()?); 
+    }
+
+    let first_page_id = guards[0].page_id;
+
+    // Build pages back to front so next_page_id is known when we write each page
+    for i in (0..chunks.len()).rev() {
+        let next_page_id = if i + 1 < chunks.len() {
+            Some(guards[i + 1].page_id)
+        } else {
+            None
+        };
+
+        let page_id = guards[i].page_id;
+        let mut builder = OverflowPageBuilder::new(page_id, &mut guards[i][..]);
+        builder.set_next_page_id(next_page_id);
+        builder.set_chunk(chunks[i])?; 
+        builder.finish();
+    }
+
+    Ok(OverflowDescriptor {
+        first_page_id,
+        total_size,
+    })
+}
+
+// pub fn read_overflow_chain(desc: OverflowDescriptor, pool: &BufferPoolManager) -> Result<Vec<u8>>
+// pub fn free_overflow_chain(first_page_id: PageId, pool: &BufferPoolManager) -> Result<()>
