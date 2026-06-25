@@ -39,14 +39,16 @@
 //!
 //! ┌──────────────────────────────────────────────────────────┐
 //! │ RECORD DATA AREA  [grows ←]                              │
-//! │  ┌──────┬──────┬──────┬──────────┬──────────┬──────────┐ │
-//! │  │ u16  │ u16  │  u32 │  u64     │  u64     │ key bytes│ │
-//! │  │k_len │v_len │ rsv  │  xmin    │  xmax    │ val bytes│ │
-//! │  └──────┴──────┴──────┴──────────┴──────────┴──────────┘ │
-//! │    2B     2B     4B      8B         8B    k_len  v_len   │
-//! │  Fixed record header = 24 bytes                          │
-//! │  xmin = creating transaction ID                          │
-//! │  xmax = deleting/replacing transaction ID (0 = live)     │
+//! │  ┌──────┬──────┬──────┬──────┬──────┬──────────┬───────┐ │
+//! │  │ u16  │ u16  │  u8  │  u8  │  u16 │  u64     │  u64  │ │
+//! │  │k_len │v_len │r_type│ _pad │ _pad │  xmin    │  xmax │ │
+//! │  └──────┴──────┴──────┴──────┴──────┴──────────┴───────┘ │
+//! │    2B     2B     1B     1B     2B      8B         8B      │
+//! │  + key bytes (k_len) + val bytes (v_len)                  │
+//! │  Fixed record header = 24 bytes                           │
+//! │  rec_type = 0 (REC_TYPE_INLINE) or 1 (REC_TYPE_OVERFLOW)  │
+//! │  xmin = creating transaction ID                           │
+//! │  xmax = deleting/replacing transaction ID (0 = live)      │
 //! └──────────────────────────────────────────────────────────┘
 //! ```
 
@@ -78,10 +80,14 @@ const SLOT_SIZE: usize = 4; // u16 offset + u16 rec_size
 
 const REC_OFF_KEY_LEN: usize = 0; // u16
 const REC_OFF_VAL_LEN: usize = 2; // u16
-// bytes 4..8: reserved (u32, always 0)
+const REC_OFF_REC_TYPE: usize = 4; // u8 — 0 = inline value, 1 = overflow pointer
+// bytes 5..8: padding (u8 + u16, always 0)
 const REC_OFF_XMIN: usize = 8; // u64 — creating transaction ID
 const REC_OFF_XMAX: usize = 16; // u64 — deleting/replacing transaction ID (0 = live)
-const REC_HEADER_SIZE: usize = 24; // 2+2+4+8+8 = 24 bytes
+const REC_HEADER_SIZE: usize = 24; // 2+2+1+1+2+8+8 = 24 bytes
+
+pub const REC_TYPE_INLINE: u8 = 0;
+pub const REC_TYPE_OVERFLOW: u8 = 1;
 
 // ── Layout helpers ───────────────────────────────────────────────────────────
 
@@ -311,6 +317,17 @@ impl<'a, K: Key, V: Value> LeafPageAccessor<'a, K, V> {
         self.get_xmax(i) != 0
     }
 
+    /// Record type byte at slot `i`.
+    pub fn get_rec_type(&self, i: usize) -> u8 {
+        let rec_base = self.slot_rec_base(i);
+        read_u8(self.data, rec_base + REC_OFF_REC_TYPE)
+    }
+    /// Returns `true` if the value at slot `i` is stored in an overflow page
+    /// chain rather than inline.
+    pub fn is_overflow(&self, i: usize) -> bool {
+        self.get_rec_type(i) == REC_TYPE_OVERFLOW
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────────
 
     fn slot_rec_base(&self, i: usize) -> usize {
@@ -446,7 +463,7 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
 
         write_u16(self.data, rec_base + REC_OFF_KEY_LEN, key_len as u16);
         write_u16(self.data, rec_base + REC_OFF_VAL_LEN, val_len as u16);
-        write_u32(self.data, rec_base + 4, 0); // reserved
+        write_u8(self.data, rec_base + REC_OFF_REC_TYPE, REC_TYPE_INLINE); // bytes 5..8 zeroed by page fill
         write_u64(self.data, rec_base + REC_OFF_XMIN, 0);
         write_u64(self.data, rec_base + REC_OFF_XMAX, 0);
 
@@ -671,7 +688,7 @@ impl<'a, K: Key, V: Value> LeafPageBuilder<'a, K, V> {
 
         write_u16(self.data, rec_base + REC_OFF_KEY_LEN, key_len as u16);
         write_u16(self.data, rec_base + REC_OFF_VAL_LEN, val_len as u16);
-        write_u32(self.data, rec_base + 4, 0); // reserved
+        write_u8(self.data, rec_base + REC_OFF_REC_TYPE, REC_TYPE_INLINE); // bytes 5..8 zeroed by page fill
         write_u64(self.data, rec_base + REC_OFF_XMIN, xmin);
         write_u64(self.data, rec_base + REC_OFF_XMAX, xmax);
 
