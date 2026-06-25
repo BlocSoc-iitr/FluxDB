@@ -30,14 +30,13 @@ pub const INTERNAL: u8 = 2;
 /// Marker byte stored at offset 0 of metadata page
 pub const META: u8 = 3;
 /// Marker byte stored at offset 0 of every overflow page.
-pub const OVERFLOW : u8 = 4;
+pub const OVERFLOW: u8 = 4;
 // ── Page size ─────────────────────────────────────────────────────────────────
 
 /// Canonical page size used throughout the storage engine (4 KB).
 pub const PAGE_SIZE: usize = 4096;
 
 pub const OVERFLOW_THRESHHOLD: usize = 2048;
-
 
 // ── Shared header offsets (present in all three page types) ───────────────────────
 

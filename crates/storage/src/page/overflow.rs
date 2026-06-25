@@ -42,17 +42,15 @@ use db_core::{transaction, transaction_manager::TransactionManager};
 use std::{cmp::Ordering, fmt::write};
 
 use super::{
-    OFF_LSN, OFF_PAGE_ID, OFF_PAGE_TYPE, PAGE_SIZE, OVERFLOW, OVERFLOW_THRESHHOLD,
-    PageError, PageId, Lsn, 
-    read_u8, read_u16, read_u64, write_u8, write_u16, write_u32, write_u64,
+    Lsn, OFF_LSN, OFF_PAGE_ID, OFF_PAGE_TYPE, OVERFLOW, OVERFLOW_THRESHHOLD, PAGE_SIZE, PageError,
+    PageId, read_u8, read_u16, read_u64, write_u8, write_u16, write_u32, write_u64,
 };
 
 // ── Overflow-page-specific header offsets ────────────────────────────────────────
-const OFF_OVERFLOW_NEXT_PAGE_ID : usize = 24;
-const OFF_OVERFLOW_CHUNK_LEN : usize = 32;
+const OFF_OVERFLOW_NEXT_PAGE_ID: usize = 24;
+const OFF_OVERFLOW_CHUNK_LEN: usize = 32;
 const OVERFLOW_PAYLOAD_SIZE: usize = 4048;
 const OVERFLOW_HEADER_SIZE: usize = 48;
-
 
 pub const OVERFLOW_POINTER_TAG: u8 = 0xFF;
 pub const OVERFLOW_DESCRIPTOR_SIZE: usize = 13; // 1+ 8 + 4
@@ -86,25 +84,23 @@ impl OverflowDescriptor {
         })
     }
 }
-pub struct OverflowPageBuilder<'a>{
+pub struct OverflowPageBuilder<'a> {
     data: &'a mut [u8],
 }
-impl<'a> OverflowPageBuilder<'a>{
+
+impl<'a> OverflowPageBuilder<'a> {
     pub fn new(page_id: PageId, data: &'a mut [u8]) -> Self {
         data.fill(0);
         write_u8(data, OFF_PAGE_TYPE, OVERFLOW);
         write_u64(data, OFF_PAGE_ID, page_id);
-        
-        Self {
-            data,
-        }
+
+        Self { data }
     }
-    pub fn set_next_page_id (&mut self , next_page: Option<PageId>) {
+    pub fn set_next_page_id(&mut self, next_page: Option<PageId>) {
         write_u64(self.data, OFF_OVERFLOW_NEXT_PAGE_ID, next_page.unwrap_or(0));
     }
 
     pub fn set_chunk(&mut self, chunk: &[u8]) -> Result<(), PageError> {
-
         if chunk.len() > OVERFLOW_PAYLOAD_SIZE {
             return Err(PageError::InsufficientSpace {
                 needed: chunk.len(),
@@ -113,17 +109,15 @@ impl<'a> OverflowPageBuilder<'a>{
         }
 
         write_u16(self.data, OFF_OVERFLOW_CHUNK_LEN, chunk.len() as u16);
-        self.data[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + chunk.len()]
-            .copy_from_slice(chunk);
+        self.data[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + chunk.len()].copy_from_slice(chunk);
         Ok(())
-
     }
 
     pub fn finish(self) -> OverflowPageMutator<'a> {
         OverflowPageMutator::new(self.data)
     }
 }
-pub struct OverflowPageAccessor<'a>{
+pub struct OverflowPageAccessor<'a> {
     data: &'a [u8],
 }
 
@@ -134,9 +128,7 @@ impl<'a> OverflowPageAccessor<'a> {
             OVERFLOW,
             "OverflowPageAccessor: page type byte is not OVERFLOW"
         );
-        Self {
-            data,
-        }
+        Self { data }
     }
 
     pub fn page_id(&self) -> PageId {
@@ -147,8 +139,8 @@ impl<'a> OverflowPageAccessor<'a> {
         read_u64(self.data, OFF_LSN)
     }
 
-    pub fn next_page_id (&self) -> Option<PageId> {
-        match read_u64(self.data, OFF_OVERFLOW_NEXT_PAGE_ID){
+    pub fn next_page_id(&self) -> Option<PageId> {
+        match read_u64(self.data, OFF_OVERFLOW_NEXT_PAGE_ID) {
             0 => None,
             v => Some(v),
         }
@@ -166,16 +158,14 @@ pub struct OverflowPageMutator<'a> {
     data: &'a mut [u8],
 }
 
-impl<'a> OverflowPageMutator <'a> {
+impl<'a> OverflowPageMutator<'a> {
     pub fn new(data: &'a mut [u8]) -> Self {
         assert_eq!(
             read_u8(data, OFF_PAGE_TYPE),
             OVERFLOW,
             "OverflowPageAccessor: page type byte is not OVERFLOW"
         );
-        Self {
-            data,
-        }
+        Self { data }
     }
 
     pub fn set_lsn(&mut self, lsn: Lsn) {
@@ -186,12 +176,11 @@ impl<'a> OverflowPageMutator <'a> {
         OverflowPageAccessor::new(self.data)
     }
 
-    pub fn set_next_page_id (&mut self , next_page: Option<PageId>) {
+    pub fn set_next_page_id(&mut self, next_page: Option<PageId>) {
         write_u64(self.data, OFF_OVERFLOW_NEXT_PAGE_ID, next_page.unwrap_or(0));
     }
 
     pub fn set_chunk(&mut self, chunk: &[u8]) -> Result<(), PageError> {
-
         if chunk.len() > OVERFLOW_PAYLOAD_SIZE {
             return Err(PageError::InsufficientSpace {
                 needed: chunk.len(),
@@ -200,11 +189,7 @@ impl<'a> OverflowPageMutator <'a> {
         }
 
         write_u16(self.data, OFF_OVERFLOW_CHUNK_LEN, chunk.len() as u16);
-        self.data[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + chunk.len()]
-            .copy_from_slice(chunk);
+        self.data[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + chunk.len()].copy_from_slice(chunk);
         Ok(())
-
     }
 }
-
- 
