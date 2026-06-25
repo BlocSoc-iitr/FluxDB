@@ -39,7 +39,7 @@
 
 use common::{Key, Value};
 use db_core::{transaction, transaction_manager::TransactionManager};
-use std::cmp::Ordering;
+use std::{cmp::Ordering, fmt::write};
 
 use super::{
     OFF_LSN, OFF_PAGE_ID, OFF_PAGE_TYPE, PAGE_SIZE, OVERFLOW, OVERFLOW_THRESHHOLD,
@@ -50,6 +50,8 @@ use super::{
 // ── Overflow-page-specific header offsets ────────────────────────────────────────
 const OFF_OVERFLOW_NEXT_PAGE_ID : usize = 24;
 const OFF_OVERFLOW_CHUNK_LEN : usize = 32;
+const OVERFLOW_PAYLOAD_SIZE: usize = 4048;
+const OVERFLOW_HEADER_SIZE: usize = 48;
 
 
 pub const OVERFLOW_POINTER_TAG: u8 = 0xFF;
@@ -97,6 +99,29 @@ impl<'a> OverflowPageBuilder<'a>{
             data,
         }
     }
+    pub fn set_next_page_id (&mut self , next_page: Option<PageId>) {
+        write_u64(self.data, OFF_OVERFLOW_NEXT_PAGE_ID, next_page.unwrap_or(0));
+    }
+
+    pub fn set_chunk(&mut self, chunk: &[u8]) -> Result<(), PageError> {
+
+        if chunk.len() > OVERFLOW_PAYLOAD_SIZE {
+            return Err(PageError::InsufficientSpace {
+                needed: chunk.len(),
+                available: OVERFLOW_PAYLOAD_SIZE,
+            });
+        }
+        
+        write_u16(self.data, OFF_OVERFLOW_CHUNK_LEN, chunk.len() as u16);
+        self.data[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + chunk.len()]
+            .copy_from_slice(chunk);
+        Ok(())
+
+    }
+
+    // pub fn finish(self) -> OverflowPageMutator<'a> {
+    //     OverflowPageMutator::new(self.data)
+    // }
 }
 pub struct OverflowPageAccessor<'a>{
     data: &'a [u8],
