@@ -37,13 +37,9 @@
 //! splits — `_reserved` (offset 1) must never be touched by the
 //! `set_incomplete_split` helper.
 
-use common::{Key, Value};
-use db_core::{transaction, transaction_manager::TransactionManager};
-use std::{cmp::Ordering, fmt::write};
-
 use super::{
-    Lsn, OFF_LSN, OFF_PAGE_ID, OFF_PAGE_TYPE, OVERFLOW, OVERFLOW_THRESHHOLD, PAGE_SIZE, PageError,
-    PageId, read_u8, read_u16, read_u64, write_u8, write_u16, write_u32, write_u64,
+    Lsn, OFF_LSN, OFF_PAGE_ID, OFF_PAGE_TYPE, OVERFLOW, PAGE_SIZE, PageError,
+    PageId, read_u8, read_u16, read_u64, write_u8, write_u16, write_u64,
 };
 
 // ── Overflow-page-specific header offsets ────────────────────────────────────────
@@ -52,10 +48,9 @@ const OFF_OVERFLOW_CHUNK_LEN: usize = 32;
 const OVERFLOW_PAYLOAD_SIZE: usize = 4048;
 const OVERFLOW_HEADER_SIZE: usize = 48;
 
-pub const OVERFLOW_POINTER_TAG: u8 = 0xFF;
-pub const OVERFLOW_DESCRIPTOR_SIZE: usize = 13; // 1+ 8 + 4
+pub const OVERFLOW_DESCRIPTOR_SIZE: usize = 12; // page_id (8 bytes) + total_size (4 bytes)
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OverflowDescriptor {
     pub first_page_id: PageId,
     pub total_size: u32,
@@ -64,24 +59,18 @@ pub struct OverflowDescriptor {
 impl OverflowDescriptor {
     pub fn to_bytes(self) -> [u8; OVERFLOW_DESCRIPTOR_SIZE] {
         let mut buf = [0u8; OVERFLOW_DESCRIPTOR_SIZE];
-        buf[0] = OVERFLOW_POINTER_TAG;
-        buf[1..9].copy_from_slice(&self.first_page_id.to_le_bytes());
-        buf[9..13].copy_from_slice(&self.total_size.to_le_bytes());
+        buf[0..8].copy_from_slice(&self.first_page_id.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.total_size.to_le_bytes());
         buf
     }
+
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < OVERFLOW_DESCRIPTOR_SIZE {
             return None;
         }
-        if bytes[0] != OVERFLOW_POINTER_TAG {
-            return None;
-        }
-        let first_page_id = PageId::from_le_bytes(bytes[1..9].try_into().unwrap());
-        let total_size = u32::from_le_bytes(bytes[9..13].try_into().unwrap());
-        Some(Self {
-            first_page_id,
-            total_size,
-        })
+        let first_page_id = PageId::from_le_bytes(bytes[0..8].try_into().unwrap());
+        let total_size = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        Some(Self { first_page_id, total_size })
     }
 }
 pub struct OverflowPageBuilder<'a> {
