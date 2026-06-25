@@ -42,22 +42,66 @@ use db_core::{transaction, transaction_manager::TransactionManager};
 use std::cmp::Ordering;
 
 use super::{
-    OVERFLOW, Lsn, OFF_LSN, OFF_PAGE_ID, OFF_PAGE_TYPE, PAGE_SIZE, PageError, PageId, read_u8,
-    read_u16, read_u64, write_u8, write_u16, write_u32, write_u64,
+    OFF_LSN, OFF_PAGE_ID, OFF_PAGE_TYPE, PAGE_SIZE, OVERFLOW, OVERFLOW_THRESHHOLD,
+    PageError, PageId, Lsn, 
+    read_u8, read_u16, read_u64, write_u8, write_u16, write_u32, write_u64,
 };
 
 // ── Overflow-page-specific header offsets ────────────────────────────────────────
 const OFF_OVERFLOW_NEXT_PAGE_ID : usize = 24;
-const OFF_OVERFLOW_CHUNK_LEN : u16 = 32;
+const OFF_OVERFLOW_CHUNK_LEN : usize = 32;
 
+
+pub const OVERFLOW_POINTER_TAG: u8 = 0xFF;
+pub const OVERFLOW_DESCRIPTOR_SIZE: usize = 13; // 1+ 8 + 4
+
+#[derive(Debug, Clone, Copy)]
+pub struct OverflowDescriptor {
+    pub first_page_id: PageId,
+    pub total_size: u32,
+}
+
+impl OverflowDescriptor {
+    pub fn to_bytes(self) -> [u8; OVERFLOW_DESCRIPTOR_SIZE] {
+        let mut buf = [0u8; OVERFLOW_DESCRIPTOR_SIZE];
+        buf[0] = OVERFLOW_POINTER_TAG;
+        buf[1..9].copy_from_slice(&self.first_page_id.to_le_bytes());
+        buf[9..13].copy_from_slice(&self.total_size.to_le_bytes());
+        buf
+    }
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < OVERFLOW_DESCRIPTOR_SIZE {
+            return None;
+        }
+        if bytes[0] != OVERFLOW_POINTER_TAG {
+            return None;
+        }
+        let first_page_id = PageId::from_le_bytes(bytes[1..9].try_into().unwrap());
+        let total_size = u32::from_le_bytes(bytes[9..13].try_into().unwrap());
+        Some(Self {
+            first_page_id,
+            total_size,
+        })
+    }
+}
+pub struct OverflowPageBuilder<'a>{
+    data: &'a mut [u8],
+}
+impl<'a> OverflowPageBuilder<'a>{
+    pub fn new(page_id: PageId, data: &'a mut [u8]) -> Self {
+        data.fill(0);
+        write_u8(data, OFF_PAGE_TYPE, OVERFLOW);
+        write_u64(data, OFF_PAGE_ID, page_id);
+        
+        Self {
+            data,
+        }
+    }
+}
 pub struct OverflowPageAccessor<'a>{
     data: &'a [u8],
 }
 pub struct OverflowPageMutator<'a> {
-    data: &'a mut [u8],
-
-}
-pub struct OverflowPageBuilder<'a>{
     data: &'a mut [u8],
 }
 
