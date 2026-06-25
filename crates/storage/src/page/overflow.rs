@@ -111,7 +111,7 @@ impl<'a> OverflowPageBuilder<'a>{
                 available: OVERFLOW_PAYLOAD_SIZE,
             });
         }
-        
+
         write_u16(self.data, OFF_OVERFLOW_CHUNK_LEN, chunk.len() as u16);
         self.data[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + chunk.len()]
             .copy_from_slice(chunk);
@@ -125,6 +125,42 @@ impl<'a> OverflowPageBuilder<'a>{
 }
 pub struct OverflowPageAccessor<'a>{
     data: &'a [u8],
+}
+
+impl<'a> OverflowPageAccessor<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        assert_eq!(
+            read_u8(data, OFF_PAGE_TYPE),
+            OVERFLOW,
+            "OverflowPageAccessor: page type byte is not Overflow"
+        );
+        Self {
+            data,
+        }
+    }
+
+    pub fn page_id(&self) -> PageId {
+        read_u64(self.data, OFF_PAGE_ID)
+    }
+
+    pub fn lsn(&self) -> Lsn {
+        read_u64(self.data, OFF_LSN)
+    }
+
+    pub fn next_page_id (&self) -> Option<PageId> {
+        match read_u64(self.data, OFF_OVERFLOW_NEXT_PAGE_ID){
+            0 => None,
+            v => Some(v),
+        }
+    }
+
+    pub fn chunk_len(&self) -> u16 {
+        read_u16(self.data, OFF_OVERFLOW_CHUNK_LEN)
+    }
+
+    pub fn payload(&self) -> &'a [u8] {
+        &self.data[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + self.chunk_len() as usize]
+    }
 }
 pub struct OverflowPageMutator<'a> {
     data: &'a mut [u8],
