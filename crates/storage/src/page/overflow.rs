@@ -119,9 +119,9 @@ impl<'a> OverflowPageBuilder<'a>{
 
     }
 
-    // pub fn finish(self) -> OverflowPageMutator<'a> {
-    //     OverflowPageMutator::new(self.data)
-    // }
+    pub fn finish(self) -> OverflowPageMutator<'a> {
+        OverflowPageMutator::new(self.data)
+    }
 }
 pub struct OverflowPageAccessor<'a>{
     data: &'a [u8],
@@ -132,7 +132,7 @@ impl<'a> OverflowPageAccessor<'a> {
         assert_eq!(
             read_u8(data, OFF_PAGE_TYPE),
             OVERFLOW,
-            "OverflowPageAccessor: page type byte is not Overflow"
+            "OverflowPageAccessor: page type byte is not OVERFLOW"
         );
         Self {
             data,
@@ -164,6 +164,47 @@ impl<'a> OverflowPageAccessor<'a> {
 }
 pub struct OverflowPageMutator<'a> {
     data: &'a mut [u8],
+}
+
+impl<'a> OverflowPageMutator <'a> {
+    pub fn new(data: &'a mut [u8]) -> Self {
+        assert_eq!(
+            read_u8(data, OFF_PAGE_TYPE),
+            OVERFLOW,
+            "OverflowPageAccessor: page type byte is not OVERFLOW"
+        );
+        Self {
+            data,
+        }
+    }
+
+    pub fn set_lsn(&mut self, lsn: Lsn) {
+        write_u64(self.data, OFF_LSN, lsn);
+    }
+
+    pub fn as_accessor(&self) -> OverflowPageAccessor<'_> {
+        OverflowPageAccessor::new(self.data)
+    }
+
+    pub fn set_next_page_id (&mut self , next_page: Option<PageId>) {
+        write_u64(self.data, OFF_OVERFLOW_NEXT_PAGE_ID, next_page.unwrap_or(0));
+    }
+
+    pub fn set_chunk(&mut self, chunk: &[u8]) -> Result<(), PageError> {
+
+        if chunk.len() > OVERFLOW_PAYLOAD_SIZE {
+            return Err(PageError::InsufficientSpace {
+                needed: chunk.len(),
+                available: OVERFLOW_PAYLOAD_SIZE,
+            });
+        }
+
+        write_u16(self.data, OFF_OVERFLOW_CHUNK_LEN, chunk.len() as u16);
+        self.data[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + chunk.len()]
+            .copy_from_slice(chunk);
+        Ok(())
+
+    }
 }
 
  
