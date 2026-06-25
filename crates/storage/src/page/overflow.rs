@@ -37,6 +37,8 @@
 //! splits — `_reserved` (offset 1) must never be touched by the
 //! `set_incomplete_split` helper.
 
+use std::io::BufReader;
+
 use super::{
     Lsn, OFF_LSN, OFF_PAGE_ID, OFF_PAGE_TYPE, OVERFLOW, PAGE_SIZE, PageError,
     PageId, read_u8, read_u16, read_u64, write_u8, write_u16, write_u64,
@@ -222,5 +224,20 @@ pub fn write_overflow_chain(
     })
 }
 
-// pub fn read_overflow_chain(desc: OverflowDescriptor, pool: &BufferPoolManager) -> Result<Vec<u8>>
+pub fn read_overflow_chain(
+    desc: OverflowDescriptor,
+    pool: &BufferPoolManager,
+) -> Result<Vec<u8>, IndexError> {
+    let mut result = Vec::with_capacity(desc.total_size as usize);
+    let mut current_page_id = Some(desc.first_page_id);
+
+    while let Some(pid) = current_page_id {
+        let guard = pool.fetch_page(pid)?;
+        let acc = OverflowPageAccessor::new(&guard[..]);
+        result.extend_from_slice(acc.payload());
+        current_page_id = acc.next_page_id();
+    }
+
+    Ok(result)
+}
 // pub fn free_overflow_chain(first_page_id: PageId, pool: &BufferPoolManager) -> Result<()>
