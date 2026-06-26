@@ -203,4 +203,10 @@ where
             poisoned: false,
         }
     }
+
+    /// Triggers a full vacuum sweep on demand. On a sweep that reaches the last
+    /// leaf this advances `vacuum_horizon`; a failed sweep publishes nothing.
+    pub fn vacuum(&self) -> Result<usize, EngineError> {
+        Ok(self.index.vacuum(&self.transaction_manager)?)
+    }
 }
