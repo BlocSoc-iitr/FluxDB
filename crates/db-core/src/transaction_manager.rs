@@ -115,17 +115,19 @@ impl TransactionManager {
     }
 
     /// Truncates the CLOG, removing entries older than `horizon`.
-    ///
-    /// Note: We ONLY remove `Committed` entries. `Aborted` entries must be retained forever
-    /// (or until a physical vacuum confirms their records are gone) because dropping an `Aborted`
-    /// entry before its dirty records are vacuumed would cause our presumed-commit logic to
-    /// suddenly treat those aborted records as visible `Committed` records, breaking isolation.
-    pub fn truncate_clog(&self, horizon: u64) {
+    /// Now the removal of entries has been made two-tier, such that the entries that are 
+    /// committed and their txn_id lying below committed_horizon are deleted directly because
+    /// they have already been committed into the tree. However, the transactions that aborted are removed
+    /// once a successful sweep returns a vacuum_horizon value that can be used to check if the rows 
+    /// concerning that aborted entry in the CLOG have been deleted or not. This physical vacuum confirms 
+    /// that the records of aborted transactions are gone, allowing the truncation of aborted entries in CLOG. 
+    pub fn truncate_clog(&self, committed_horizon: u64) {
+        let aborted_horizon = self.vacuum_horizon();
         let mut clog = self.clog.write().unwrap();
-        clog.retain(|&txn_id, status| {
-            txn_id >= horizon
-                || *status == TransactionStatus::Active
-                || *status == TransactionStatus::Aborted
+        clog.retain(|&txn_id, status| match status {
+            TransactionStatus::Active => true,
+            TransactionStatus::Committed => txn_id >= committed_horizon,
+            TransactionStatus::Aborted => txn_id >= aborted_horizon,
         });
     }
 
