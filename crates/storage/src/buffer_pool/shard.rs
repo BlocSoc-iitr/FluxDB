@@ -12,6 +12,7 @@ use common::{INVALID_FRAME_ID, MAX_PAGE_SIZE};
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::atomic::{AtomicU64,Ordering};
 
 type Result<T> = std::result::Result<T, BufferPoolError>;
 
@@ -118,6 +119,7 @@ pub struct FrameMetadata {
     pub pin_count: u64,
     pub is_dirty: bool,
     pub loading: bool, // true while a load is in flight; frame not usable yet
+    pub rec_lsn: Option<u64>, // Added a recovery lsn for each lsn, the lowest rec_lsn among all dirty page is selected for new redo point
 }
 
 /// Internal state of a buffer pool shard, protected by a mutex.
@@ -135,6 +137,7 @@ pub struct BufferPoolShard {
     pub inner: Mutex<ShardInner>,
     pub load_done: Condvar, // singalled when any load finishes(success or fail)
     pub wal: Arc<Wal>,
+    pub last_checkpoint_redo_point: AtomicU64, // it contains the last checkpoint redo point
 }
 
 impl BufferPoolShard {
@@ -148,6 +151,7 @@ impl BufferPoolShard {
                 pin_count: 0,
                 is_dirty: false,
                 loading: false,
+                rec_lsn: None,
             });
             free_list.push(size - 1 - frame_id);
         }
@@ -163,6 +167,8 @@ impl BufferPoolShard {
             }),
             load_done: Condvar::new(),
             wal,
+            last_checkpoint_redo_point: AtomicU64::new(0), //lsn 0 is null pageLsn
+
         }
     }
 
@@ -422,4 +428,5 @@ impl BufferPoolShard {
             return Ok(());
         }
     }
+    
 }
