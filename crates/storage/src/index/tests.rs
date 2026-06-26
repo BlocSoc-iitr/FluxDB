@@ -1,14 +1,19 @@
 use super::*;
 use crate::buffer_pool::manager::BufferPoolManager;
 use crate::disk::DiskManager;
+use crate::recovery::RecoveryManager;
 use crate::wal::Wal;
 use crate::wal::{WalIterator, WalRecordType};
 use common::MAX_PAGE_SIZE;
+use db_core::transaction_manager::TransactionStatus;
 use std::mem::forget;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, OnceLock};
 use tempfile::tempdir;
+
+type TM = db_core::transaction_manager::TransactionManager;
+type Idx = BTreeIndex<&'static [u8], &'static [u8]>;
 
 /// Open a throwaway WAL under `dir`. The index and pool must share one WAL,
 /// so callers build it once here and clone the `Arc` to both.
@@ -49,6 +54,30 @@ fn auto() -> Transaction {
 
 fn leak_bytes(b: &[u8]) -> &'static [u8] {
     Box::leak(b.to_vec().into_boxed_slice())
+}
+
+// `make_wal(dir)` opens dir/"wal" (segment dir); data lives at dir/"test.db".
+fn build_db(dir: &Path) -> (Arc<BufferPoolManager>, Arc<Wal>, Arc<TM>, Idx) {
+    let disk = Arc::new(DiskManager::new(dir.join("test.db"), MAX_PAGE_SIZE).unwrap());
+    let wal = make_wal(dir);
+    let pool = make_pool(disk, wal.clone());
+    let tm = Arc::new(TM::new());
+    let (index, _root) = BTreeIndex::create(pool.clone(), wal.clone()).unwrap();
+    (pool, wal, tm, index)
+}
+
+/// Reopen = recover. Caller must drop the previous tuple first; only durable
+/// (committed / flushed) records survive the drop.
+fn reopen_db(dir: &Path) -> (Arc<BufferPoolManager>, Arc<Wal>, Arc<TM>, Idx) {
+    let disk = Arc::new(DiskManager::new(dir.join("test.db"), MAX_PAGE_SIZE).unwrap());
+    let wal = make_wal(dir);
+    let pool = make_pool(disk, wal.clone());
+    let tm = Arc::new(TM::new());
+    RecoveryManager::new(pool.clone(), dir.join("wal"), tm.clone())
+        .recover::<&[u8], &[u8]>()
+        .unwrap();
+    let index = BTreeIndex::open(pool.clone(), wal.clone()).unwrap();
+    (pool, wal, tm, index)
 }
 
 // ── Basic get / insert ────────────────────────────────────────────────
@@ -591,9 +620,19 @@ fn vacuum_reclaims_space() {
         tm.mark_committed(txn.txn_id);
     }
 
+    // vacuum_horizon is 0 until the first sweep completes.
+    assert_eq!(tm.vacuum_horizon(), 0);
+
+    // Capture the horizon the sweep will observe at its start.
+    // No txns are active (all committed), so this equals next_txn_id.
+    let expected_horizon = tm.global_xmin();
+
     // 3. Run vacuum. Since all transactions committed, it should reclaim 50 records.
     let removed = idx.vacuum(&tm).unwrap();
     assert_eq!(removed, 50);
+
+    // A completed sweep publishes the start-of-sweep global_xmin.
+    assert_eq!(tm.vacuum_horizon(), expected_horizon);
 
     // 4. Verify data is still visible for the 50 live keys.
     let results: Vec<_> = idx
@@ -778,4 +817,70 @@ fn update_emits_setxmax_then_insert_in_lsn_order() {
         xmax_lsn < ins_lsn,
         "SetXmax must be logged before the new Insert"
     );
+}
+
+// ── Crash Harness Recovery ──────────────────────────────────────
+#[test]
+fn crash_victim_uncommitted_insert_invisible_after_reopen() {
+    let dir = tempdir().unwrap();
+    {
+        let (pool, _wal, tm, index) = build_db(dir.path());
+        let victim = tm.begin();
+        index
+            .insert(&(&b"ghost"[..]), &(&b"boo"[..]), &victim)
+            .unwrap();
+        pool.flush_all_pages().unwrap();
+        // crash: tuple drops; victim's Insert already durable via the gate, but no Commit record
+    }
+    let (_pool, _wal, tm, index) = reopen_db(dir.path());
+    let reader = tm.begin();
+    assert!(index.get(&(&b"ghost"[..]), &reader).unwrap().is_none());
+    let all: Vec<(Vec<u8>, Vec<u8>)> = index.range(.., &reader).map(|r| r.unwrap()).collect();
+    assert!(all.is_empty());
+}
+
+#[test]
+fn clog_reconstructed_after_crash() {
+    let dir = tempdir().unwrap();
+    let committed_id;
+    let aborted_id;
+    let inflight_id;
+    {
+        let (pool, wal, tm, index) = build_db(dir.path());
+
+        let c = tm.begin(); // (1) committed — durable Commit
+        committed_id = c.txn_id;
+        index.insert(&(&b"c"[..]), &(&b"1"[..]), &c).unwrap();
+        wal.log_commit(c.txn_id).unwrap();
+        tm.mark_committed(c.txn_id);
+
+        let a = tm.begin(); // (2) explicitly aborted — durable Abort
+        aborted_id = a.txn_id;
+        index.insert(&(&b"a"[..]), &(&b"2"[..]), &a).unwrap();
+        wal.log_abort(a.txn_id).unwrap();
+        tm.mark_aborted(a.txn_id);
+
+        let v = tm.begin(); // (3) in-flight victim — Insert only
+        inflight_id = v.txn_id;
+        index.insert(&(&b"v"[..]), &(&b"3"[..]), &v).unwrap();
+
+        wal.flush_up_to(wal.next_lsn()).unwrap();
+        pool.flush_all_pages().unwrap();
+        // crash
+    }
+
+    let (_pool, _wal, tm, _index) = reopen_db(dir.path());
+
+    assert!(tm.is_committed(committed_id));
+    assert!(tm.is_aborted(aborted_id));
+    assert!(tm.is_aborted(inflight_id)); // in-flight presumed aborted
+    assert!(!tm.is_committed(inflight_id));
+
+    // presumed-commit: active set empty post-recovery, so every recovered id is below
+    // global_xmin — not-explicitly-aborted ⇒ Committed; did-work-but-unsettled ⇒ Aborted.
+    assert_eq!(
+        tm.settled_status(committed_id),
+        TransactionStatus::Committed
+    );
+    assert_eq!(tm.settled_status(inflight_id), TransactionStatus::Aborted);
 }

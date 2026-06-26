@@ -7,19 +7,26 @@
 //! (`for<'a> K: Value<SelfType<'a> = K>`) so generated values can be passed and
 //! stored directly — true of `u32`, `String`, and `Vec<u8>`.
 
+use common::MAX_PAGE_SIZE;
 use common::{EngineError, IndexError, Key, Value};
+use db_core::transaction_manager::TransactionManager;
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 use std::cmp::Ordering;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
+use std::path::Path;
+use std::sync::Arc;
 use storage::buffer_pool::BufferPoolManager;
+use storage::disk::DiskManager;
 use storage::index::BTreeIndex;
 use storage::page::{
     INTERNAL, InternalPageAccessor, LEAF, LeafPageAccessor, PageId, is_incomplete_split, meta,
 };
-use tempfile::TempDir;
+use storage::recovery::RecoveryManager;
+use storage::wal::{Wal, WalIterator, WalRecordType};
+use tempfile::{TempDir, tempdir};
 
 use crate::Engine;
 
@@ -1012,10 +1019,7 @@ proptest! {
     /// `DuplicateKey`). After commit/abort the committed state must equal `model`.
     ///
     /// The batch operates on keys (100..116) **disjoint** from `setup` (0..16),
-    /// so every key it touches is created within the txn. That deliberately
-    /// avoids modifying a pre-existing committed key inside the txn — which trips
-    /// the known own-delete/own-update RYOW bug pinned by
-    /// `known_bug_txn_does_not_see_own_modify_of_committed_row`.
+    /// so every key it touches is created within the txn.
     #[test]
     fn multi_write_txn_atomic(
         setup in prop::collection::hash_map(0u32..16, any::<u32>(), 0..12),
@@ -1078,24 +1082,11 @@ proptest! {
     }
 }
 
-/// KNOWN BUG — pinned, not fixed (reported separately).
-///
-/// A transaction does NOT observe its own DELETE (or UPDATE) of a row created by
-/// an earlier *committed* transaction. Standard MVCC read-your-own-writes
-/// requires the deleting txn to stop seeing the row, but the own-write shortcut
-/// in `Transaction::is_visible` (db-core/transaction.rs:57) only covers rows the
-/// txn itself created (`rec_xmin == txn_id`). A committed row deleted by the
-/// current txn (`rec_xmin = committed`, `rec_xmax = self`) falls through to the
-/// snapshot path, which sees the deleter as "not committed" and so reports the
-/// row as still visible. Surfaced by `multi_write_txn_atomic` (delete-then-
-/// reinsert of a committed key in one txn returned `DuplicateKey`).
-///
-/// This test locks the CURRENT (buggy) behavior so the eventual fix
-/// (`if rec_xmax == self.txn_id { return false }` in `Transaction::is_visible`)
-/// makes it fail and prompts an update. Note: only *within-txn* visibility is
-/// wrong — the delete still takes effect for readers after commit.
+/// Regression: a transaction must observe its own DELETE of a row created by an
+/// earlier committed transaction, then allow a replacement insert in the same
+/// transaction.
 #[test]
-fn known_bug_txn_does_not_see_own_modify_of_committed_row() {
+fn txn_sees_own_modify_of_committed_row() {
     let (_dir, engine) = tmp_engine::<u32, u32>();
     let decode = |o: Option<Vec<u8>>| o.map(|b| u32::from_le_bytes(b.try_into().unwrap()));
 
@@ -1104,29 +1095,20 @@ fn known_bug_txn_does_not_see_own_modify_of_committed_row() {
     let mut t = engine.begin();
     t.delete(&1u32).unwrap(); // delete it inside a new txn
 
-    // BUG: the txn still sees the committed row it just deleted (should be None).
     assert_eq!(
         decode(t.get(&1u32).unwrap()),
-        Some(10),
-        "current behavior: own delete of a committed row is not observed within the txn"
+        None,
+        "own delete of a committed row must be visible within the txn"
     );
-    // ...and a re-insert is therefore rejected as a duplicate (should be Ok).
-    assert!(
-        matches!(
-            t.insert(&1u32, &20),
-            Err(EngineError::Index(IndexError::DuplicateKey))
-        ),
-        "current behavior: reinsert after own-delete returns DuplicateKey"
-    );
+    t.insert(&1u32, &20).unwrap();
+    assert_eq!(decode(t.get(&1u32).unwrap()), Some(20));
     t.commit().unwrap();
 
-    // Post-commit the delete DID take effect (only within-txn visibility was
-    // wrong) and the reinsert never happened, so the row is gone.
     let mut r = engine.begin();
     assert_eq!(
         decode(r.get(&1u32).unwrap()),
-        None,
-        "post-commit: row is deleted"
+        Some(20),
+        "post-commit: replacement row is visible"
     );
     r.commit().unwrap();
 }
@@ -1190,4 +1172,270 @@ proptest! {
         prop_assert_eq!(got, expected, "forward range {:?}", bounds);
         prop_assert_eq!(gotb, expected_rev, "backward range {:?}", bounds);
     }
+}
+
+// ── #5 Crash recovery tests ────────────────────────────────────────────────────
+
+type TestEngine = Engine<&'static [u8], &'static [u8]>;
+fn leak(b: &[u8]) -> &'static [u8] {
+    Box::leak(b.to_vec().into_boxed_slice())
+}
+
+type RawTM = TransactionManager;
+type RawIdx = BTreeIndex<&'static [u8], &'static [u8]>;
+
+fn leak_bytes(b: &[u8]) -> &'static [u8] {
+    Box::leak(b.to_vec().into_boxed_slice())
+}
+
+fn raw_build_db(dir: &Path) -> (Arc<BufferPoolManager>, Arc<Wal>, Arc<RawTM>, RawIdx) {
+    let disk = Arc::new(DiskManager::new(dir.join("test.db"), MAX_PAGE_SIZE).unwrap());
+    let wal = Arc::new(Wal::new(dir.join("wal")).unwrap());
+    let pool = Arc::new(BufferPoolManager::new(disk, wal.clone()));
+    let tm = Arc::new(RawTM::new());
+    let (index, _root) = BTreeIndex::create(pool.clone(), wal.clone()).unwrap();
+    (pool, wal, tm, index)
+}
+
+fn raw_reopen_db(dir: &Path) -> (Arc<BufferPoolManager>, Arc<Wal>, Arc<RawTM>, RawIdx) {
+    let disk = Arc::new(DiskManager::new(dir.join("test.db"), MAX_PAGE_SIZE).unwrap());
+    let wal = Arc::new(Wal::new(dir.join("wal")).unwrap());
+    let pool = Arc::new(BufferPoolManager::new(disk, wal.clone()));
+    let tm = Arc::new(RawTM::new());
+    RecoveryManager::new(pool.clone(), dir.join("wal"), tm.clone())
+        .recover::<&[u8], &[u8]>()
+        .unwrap();
+    let index = BTreeIndex::open(pool.clone(), wal.clone()).unwrap();
+    (pool, wal, tm, index)
+}
+
+fn raw_wal_has(wal_dir: &Path, t: WalRecordType) -> bool {
+    let mut it = WalIterator::new(wal_dir).unwrap();
+    while let Some(r) = it.next_record() {
+        if r.unwrap().entry_type == t {
+            return true;
+        }
+    }
+    false
+}
+
+#[test]
+fn split_sized_survival() {
+    let dir = TempDir::new().unwrap();
+    {
+        let e = TestEngine::create(dir.path()).unwrap();
+        for i in 0u32..500 {
+            let k = leak(&i.to_be_bytes());
+            let v = leak(&(i * 7).to_be_bytes());
+            e.insert(&k, &v).unwrap();
+        }
+    } // crash: drop the engine
+    let e = TestEngine::open(dir.path()).unwrap();
+    check_invariants(&e.index, &e.buffer_pool).unwrap();
+    for i in 0u32..500 {
+        let k = leak(&i.to_be_bytes());
+        assert_eq!(
+            e.get(&k).unwrap().as_deref(),
+            Some(&(i * 7).to_be_bytes()[..])
+        );
+    }
+}
+
+#[test]
+fn delete_survives_crash() {
+    let dir = TempDir::new().unwrap();
+    {
+        let e = TestEngine::create(dir.path()).unwrap();
+        e.insert(&leak(b"k"), &leak(b"v")).unwrap();
+        e.delete(&leak(b"k")).unwrap();
+    } // crash
+    let e = TestEngine::open(dir.path()).unwrap();
+    check_invariants(&e.index, &e.buffer_pool).unwrap();
+    assert_eq!(e.get(&leak(b"k")).unwrap(), None);
+}
+
+#[test]
+fn update_survives_crash() {
+    let dir = TempDir::new().unwrap();
+    {
+        let e = TestEngine::create(dir.path()).unwrap();
+        e.insert(&leak(b"k"), &leak(b"v1")).unwrap();
+        e.update(&leak(b"k"), &leak(b"v2")).unwrap();
+    } // crash
+    let e = TestEngine::open(dir.path()).unwrap();
+    check_invariants(&e.index, &e.buffer_pool).unwrap();
+    assert_eq!(e.get(&leak(b"k")).unwrap(), Some(b"v2".to_vec()));
+}
+
+#[test]
+fn double_recovery_is_idempotent() {
+    let dir = TempDir::new().unwrap();
+
+    let e = TestEngine::create(dir.path()).unwrap();
+    for i in 0u32..300 {
+        let k = leak(&i.to_be_bytes());
+        e.insert(&k, &k).unwrap();
+    }
+    // crash
+    let e = TestEngine::open(dir.path()).unwrap();
+    check_invariants(&e.index, &e.buffer_pool).unwrap();
+    for i in 0u32..300 {
+        let k = leak(&i.to_be_bytes());
+        assert_eq!(e.get(&k).unwrap().as_deref(), Some(&i.to_be_bytes()[..]));
+    }
+    // drop — no new writes
+    let e = TestEngine::open(dir.path()).unwrap();
+    check_invariants(&e.index, &e.buffer_pool).unwrap();
+    for i in 0u32..300 {
+        let k = leak(&i.to_be_bytes());
+        assert_eq!(e.get(&k).unwrap().as_deref(), Some(&i.to_be_bytes()[..]));
+    }
+}
+
+#[test]
+fn torn_tail_truncates_last_record() {
+    let dir = TempDir::new().unwrap();
+
+    let e = TestEngine::create(dir.path()).unwrap();
+    for i in 0u32..20 {
+        let k = leak(&i.to_be_bytes());
+        e.insert(&k, &k).unwrap();
+    } // crash
+
+    let seg = std::fs::read_dir(dir.path().join("wal"))
+        .unwrap()
+        .filter_map(|e| {
+            let p = e.unwrap().path();
+            p.is_file().then_some(p)
+        })
+        .max()
+        .unwrap();
+    let f = std::fs::OpenOptions::new().write(true).open(&seg).unwrap();
+    let len = f.metadata().unwrap().len();
+    f.set_len(len - 1).unwrap();
+    f.sync_all().unwrap();
+
+    // reopen: Wal::new truncates the torn tail; recovery sees Insert(19) but no Commit ⇒ aborts it.
+    let e = TestEngine::open(dir.path()).unwrap();
+    check_invariants(&e.index, &e.buffer_pool).unwrap();
+    for i in 0u32..19 {
+        let k = leak(&i.to_be_bytes());
+        assert!(e.get(&k).unwrap().is_some());
+    }
+    assert!(e.get(&leak(&19u32.to_be_bytes())).unwrap().is_none()); // last record truncated
+}
+
+#[test]
+fn crash_victim_uncommitted_insert_invisible_after_reopen() {
+    let dir = TempDir::new().unwrap();
+    let victim_id;
+    {
+        let (pool, _wal, tm, index) = raw_build_db(dir.path());
+        let victim = tm.begin();
+        victim_id = victim.txn_id;
+        index
+            .insert(&(&b"ghost"[..]), &(&b"boo"[..]), &victim)
+            .unwrap();
+        pool.flush_all_pages().unwrap();
+        // crash: victim's Insert is durable via the WAL-before-page gate, no Commit
+    }
+    let (pool, _wal, tm, index) = raw_reopen_db(dir.path());
+
+    check_invariants(&index, &pool).unwrap(); // structure intact
+    assert!(tm.is_aborted(victim_id)); // in-flight → crash victim → Aborted
+
+    let reader = tm.begin();
+    assert!(index.get(&(&b"ghost"[..]), &reader).unwrap().is_none());
+    let all: Vec<(Vec<u8>, Vec<u8>)> = index.range(.., &reader).map(|r| r.unwrap()).collect();
+    assert!(all.is_empty());
+}
+
+#[test]
+fn mid_split_crash_searches_via_rightlink_then_completes() {
+    let dir = tempdir().unwrap();
+    let wal_dir = dir.path().join("wal");
+    let trigger;
+    {
+        let (_pool, wal, tm, index) = raw_build_db(dir.path());
+        let mut k = 0u32;
+        loop {
+            let key = leak_bytes(&k.to_be_bytes());
+            let t = tm.begin();
+            index.insert(&key, &key, &t).unwrap();
+            wal.log_commit(t.txn_id).unwrap(); // durable Commit so recovery KEEPS it
+            tm.mark_committed(t.txn_id);
+            wal.flush_up_to(wal.next_lsn()).unwrap();
+            if raw_wal_has(&wal_dir, WalRecordType::InsertDownLink) {
+                break;
+            }
+            k += 1;
+        }
+        trigger = k;
+        // crash
+    }
+    Wal::truncate_wal_after(&wal_dir, WalRecordType::LeafSplit); // drop Insert(trigger)+downlink+commit
+
+    let (_pool, _wal, tm, index) = raw_reopen_db(dir.path());
+
+    for j in 0..trigger {
+        assert!(
+            index
+                .get(&leak_bytes(&j.to_be_bytes()), &tm.begin())
+                .unwrap()
+                .is_some()
+        );
+    }
+    assert!(
+        index
+            .get(&leak_bytes(&trigger.to_be_bytes()), &tm.begin())
+            .unwrap()
+            .is_none()
+    );
+
+    let nk = leak_bytes(&9_999u32.to_be_bytes());
+    let writer = tm.begin();
+    index.insert(&nk, &nk, &writer).unwrap();
+    _wal.log_commit(writer.txn_id).unwrap();
+    tm.mark_committed(writer.txn_id);
+
+    check_invariants(&index, &_pool).unwrap(); //added check_invariant
+
+    let reader = tm.begin();
+    let got: Vec<(Vec<u8>, Vec<u8>)> = index.range(.., &reader).map(|r| r.unwrap()).collect();
+    let mut want: Vec<(Vec<u8>, Vec<u8>)> = (0..trigger)
+        .map(|j| (j.to_be_bytes().to_vec(), j.to_be_bytes().to_vec()))
+        .collect();
+    want.push((
+        9_999u32.to_be_bytes().to_vec(),
+        9_999u32.to_be_bytes().to_vec(),
+    ));
+    want.sort();
+    assert_eq!(got, want);
+}
+
+// ── Engine::vacuum advances vacuum_horizon ────────────────────────────────────
+
+#[test]
+fn engine_vacuum_advances_horizon() {
+    let (_dir, engine) = tmp_engine::<u32, u32>();
+
+    assert_eq!(engine.transaction_manager.vacuum_horizon(), 0);
+
+    // Insert 100 keys (each insert begins + commits its own txn).
+    for i in 0u32..100 {
+        engine.insert(&i, &i).unwrap();
+    }
+
+    // Delete 50, producing dead versions for vacuum to reclaim.
+    for i in 0u32..50 {
+        engine.delete(&i).unwrap();
+    }
+
+    // A completed sweep returns Ok and publishes the start-of-sweep global_xmin.
+    let removed = engine.vacuum().unwrap();
+    assert_eq!(removed, 50);
+    assert!(
+        engine.transaction_manager.vacuum_horizon() > 0,
+        "completed sweep must advance vacuum_horizon past 0",
+    );
 }
