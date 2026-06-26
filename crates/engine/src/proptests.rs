@@ -1425,7 +1425,7 @@ fn engine_vacuum_advances_horizon() {
     for i in 0u32..100 {
         engine.insert(&i, &i).unwrap();
     }
-    
+
     // Delete 50, producing dead versions for vacuum to reclaim.
     for i in 0u32..50 {
         engine.delete(&i).unwrap();

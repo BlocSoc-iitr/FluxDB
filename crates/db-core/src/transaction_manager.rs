@@ -107,7 +107,7 @@ impl TransactionManager {
     pub fn publish_vacuum_horizon(&self, horizon: u64) {
         self.vacuum_horizon.fetch_max(horizon, AcqRel);
     }
-    
+
     /// The oldest-active-txn-id captured at the start of the most recent
     /// completed full sweep (0 until the first post-restart sweep completes).
     pub fn vacuum_horizon(&self) -> u64 {

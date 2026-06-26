@@ -620,7 +620,7 @@ fn vacuum_reclaims_space() {
         tm.mark_committed(txn.txn_id);
     }
 
-        // vacuum_horizon is 0 until the first sweep completes.
+    // vacuum_horizon is 0 until the first sweep completes.
     assert_eq!(tm.vacuum_horizon(), 0);
 
     // Capture the horizon the sweep will observe at its start.
