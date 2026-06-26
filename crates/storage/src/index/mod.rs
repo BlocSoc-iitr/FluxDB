@@ -98,6 +98,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             }
         }
 
+        tm.publish_vacuum_horizon(global_xmin);
         Ok(total_dead)
     }
 
