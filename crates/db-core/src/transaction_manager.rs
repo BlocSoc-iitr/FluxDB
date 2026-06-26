@@ -587,4 +587,26 @@ mod tests {
         // And settled_status is unchanged for it, that is it did not flip to committed. 
         assert_eq!(tm.settled_status(tx_abort.txn_id), TransactionStatus::Aborted);
     }
+
+    #[test]
+    fn test_truncate_clog_drops_aborted_below_vacuum_horizon() {
+        let tm = std::sync::Arc::new(TransactionManager::new());
+
+        let tx_abort = tm.begin();
+        tm.mark_aborted(tx_abort.txn_id);
+
+        let txc1 = tm.begin();
+        tm.mark_committed(txc1.txn_id);
+        let _txc2 = tm.begin();
+
+        tm.publish_vacuum_horizon(txc1.txn_id);
+        let committed_horizon = tm.global_xmin();
+        tm.truncate_clog(committed_horizon);
+
+        assert_eq!(
+            tm.clog.read().unwrap().get(&tx_abort.txn_id),
+            None,
+            "aborted entry below vacuum_horizon must not survive",
+        );
+    }
 }
