@@ -1412,3 +1412,30 @@ fn mid_split_crash_searches_via_rightlink_then_completes() {
     want.sort();
     assert_eq!(got, want);
 }
+
+// ── Engine::vacuum advances vacuum_horizon ────────────────────────────────────
+
+#[test]
+fn engine_vacuum_advances_horizon() {
+    let (_dir, engine) = tmp_engine::<u32, u32>();
+
+    assert_eq!(engine.transaction_manager.vacuum_horizon(), 0);
+
+    // Insert 100 keys (each insert begins + commits its own txn).
+    for i in 0u32..100 {
+        engine.insert(&i, &i).unwrap();
+    }
+    
+    // Delete 50, producing dead versions for vacuum to reclaim.
+    for i in 0u32..50 {
+        engine.delete(&i).unwrap();
+    }
+
+    // A completed sweep returns Ok and publishes the start-of-sweep global_xmin.
+    let removed = engine.vacuum().unwrap();
+    assert_eq!(removed, 50);
+    assert!(
+        engine.transaction_manager.vacuum_horizon() > 0,
+        "completed sweep must advance vacuum_horizon past 0",
+    );
+}
