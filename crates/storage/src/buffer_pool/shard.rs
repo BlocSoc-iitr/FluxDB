@@ -7,6 +7,7 @@
 use crate::buffer_pool::replacer::ClockReplacer;
 use crate::disk::DiskManager;
 use crate::wal::Wal;
+use crate::page::Lsn;
 use common::BufferPoolError;
 use common::{INVALID_FRAME_ID, MAX_PAGE_SIZE};
 use std::collections::HashMap;
@@ -429,4 +430,23 @@ impl BufferPoolShard {
         }
     }
     
+    /// returns 'true' if the FPI is to be attached with WAL record
+    /// page_lsn_before <= redo_point ensures that this is the first change in page after the last checkpoint
+    pub fn mark_dirty(&self, page_id:u64 ,lsn:Lsn,page_lsn_before: Lsn) -> bool{
+        let redo_point = self.last_checkpoint_redo_point.load(Ordering::Relaxed);
+        let mut inner = self.inner.lock().unwrap() ;
+
+        if let Some(&frame_id) = inner.page_table.get(&page_id){
+            let meta = &mut inner.metadata[frame_id];
+            let was_clean = meta.is_dirty;
+            meta.is_dirty = true;
+
+            if was_clean{
+                meta.rec_lsn = Some(lsn);
+                return page_lsn_before<= redo_point;
+            }
+
+        }
+        false
+    }
 }
