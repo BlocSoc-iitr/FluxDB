@@ -620,9 +620,19 @@ fn vacuum_reclaims_space() {
         tm.mark_committed(txn.txn_id);
     }
 
+        // vacuum_horizon is 0 until the first sweep completes.
+    assert_eq!(tm.vacuum_horizon(), 0);
+
+    // Capture the horizon the sweep will observe at its start.
+    // No txns are active (all committed), so this equals next_txn_id.
+    let expected_horizon = tm.global_xmin();
+
     // 3. Run vacuum. Since all transactions committed, it should reclaim 50 records.
     let removed = idx.vacuum(&tm).unwrap();
     assert_eq!(removed, 50);
+
+    // A completed sweep publishes the start-of-sweep global_xmin.
+    assert_eq!(tm.vacuum_horizon(), expected_horizon);
 
     // 4. Verify data is still visible for the 50 live keys.
     let results: Vec<_> = idx
