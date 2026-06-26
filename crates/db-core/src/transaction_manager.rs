@@ -64,6 +64,7 @@ type WaiterEntry = Arc<(Mutex<bool>, Condvar)>;
 pub struct TransactionManager {
     pub next_txn_id: AtomicU64,
     pub clog: RwLock<HashMap<u64, TransactionStatus>>,
+    pub vacuum_horizon: AtomicU64,
     pub active_txns: RwLock<HashSet<u64>>,
     waiters: Mutex<HashMap<u64, WaiterEntry>>,
 }
@@ -80,6 +81,7 @@ impl TransactionManager {
         Self {
             next_txn_id: AtomicU64::new(1),
             clog: RwLock::new(HashMap::new()),
+            vacuum_horizon: AtomicU64::new(0),
             active_txns: RwLock::new(HashSet::new()),
             waiters: Mutex::new(HashMap::new()),
         }
@@ -98,6 +100,18 @@ impl TransactionManager {
             .min()
             .copied()
             .unwrap_or_else(|| self.next_txn_id.load(Acquire))
+    }
+
+    /// Publishes the horizon of a COMPLETED full vacuum sweep. `fetch_max` so a
+    /// slower concurrent sweep can never move the horizon backward. (DESIGN §8.4)
+    pub fn publish_vacuum_horizon(&self, horizon: u64) {
+        self.vacuum_horizon.fetch_max(horizon, AcqRel);
+    }
+    
+    /// The oldest-active-txn-id captured at the start of the most recent
+    /// completed full sweep (0 until the first post-restart sweep completes).
+    pub fn vacuum_horizon(&self) -> u64 {
+        self.vacuum_horizon.load(Acquire)
     }
 
     /// Truncates the CLOG, removing entries older than `horizon`.
