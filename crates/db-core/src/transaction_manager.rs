@@ -552,4 +552,39 @@ mod tests {
             Some(&TransactionStatus::Active)
         );
     }
+
+    #[test]
+    fn test_truncate_clog_retains_aborted_above_vacuum_horizon() {
+        let tm = std::sync::Arc::new(TransactionManager::new());
+        
+        //make a dummy entry into the database, followed by an aborted entry 
+        //and then a dummy entry again to mark global_xmin > aborted_txn.txn_id
+
+        //txc2 was not committed - which means global_xmin will set to it's txn_id
+        //when a sweep runs 
+        let txc1 = tm.begin();
+        let tx_abort = tm.begin();
+        let _txc2 = tm.begin();
+
+        tm.mark_committed(txc1.txn_id);
+        tm.mark_aborted(tx_abort.txn_id);
+
+        //now, we run a full sweep
+        tm.publish_vacuum_horizon(tx_abort.txn_id-1); // so that the horizon is below the aborted txn's id 
+
+        let committed_horizon = tm.global_xmin();
+        assert!(tx_abort.txn_id < committed_horizon);
+        assert!(tm.vacuum_horizon() < tx_abort.txn_id);
+
+        tm.truncate_clog(committed_horizon);
+
+        //Now the mandatory asserts - the transaction is still present in the map 
+        assert_eq!(
+           tm.clog.read().unwrap().get(&tx_abort.txn_id),
+           Some(&TransactionStatus::Aborted),
+           "aborted entry below global_xmin but above vacuum_horizon must survive",
+        );
+        // And settled_status is unchanged for it, that is it did not flip to committed. 
+        assert_eq!(tm.settled_status(tx_abort.txn_id), TransactionStatus::Aborted);
+    }
 }
