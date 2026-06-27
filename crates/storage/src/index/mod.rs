@@ -11,7 +11,7 @@ use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 use std::sync::{Arc, Mutex};
 
-use common::{Key, MAX_KEY_SIZE, MAX_VALUE_SIZE, Value};
+use common::{Key, MAX_KEY_SIZE, Value};
 use db_core::transaction_manager::TransactionManager;
 
 use crate::buffer_pool::{BufferPoolManager, PageReadGuard, PageWriteGuard};
@@ -180,8 +180,9 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 {
                     let acc = LeafPageAccessor::<K, V>::new(&page[..]);
                     if let Some(slot) = self.find_visible_slot(&acc, key, txn) {
-                        let val = acc.get_value(slot);
-                        return Ok(Some(V::as_bytes(&val).as_ref().to_vec()));
+                        // Overflow records store a descriptor in-line; reify_value
+                        // walks the page chain to reconstruct the full value.
+                        return Ok(Some(self.reify_value(&acc, slot)?));
                     }
                 }
                 let (chain_continues, prev) = {
@@ -222,8 +223,8 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
     ///
     /// Values up to [`OVERFLOW_THRESHHOLD`] are stored inline. Larger values
     /// are written to a freshly allocated overflow page chain and the record
-    /// stores a serialized [`OverflowDescriptor`] instead. 
-    #[allow(dead_code)]
+    /// stores a serialized [`OverflowDescriptor`] instead. Returns the bytes to
+    /// place in the record together with the record-type byte.
     fn materialize_value(&self, val_bytes: &[u8]) -> Result<(Vec<u8>, u8)> {
         if val_bytes.len() <= OVERFLOW_THRESHHOLD {
             Ok((val_bytes.to_vec(), REC_TYPE_INLINE))
@@ -237,7 +238,6 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
     ///
     /// For inline records this copies the record bytes; for overflow records it
     /// walks the page chain referenced by the record's descriptor.
-    #[allow(dead_code)]
     fn reify_value(&self, acc: &LeafPageAccessor<K, V>, slot: usize) -> Result<Vec<u8>> {
         if acc.is_overflow(slot) {
             let desc = acc
@@ -267,15 +267,6 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             });
         }
 
-        let val_bytes_check = V::as_bytes(value);
-        let val_len = val_bytes_check.as_ref().len();
-        if val_len > MAX_VALUE_SIZE {
-            return Err(IndexError::ValueTooLarge {
-                size: val_len,
-                max: MAX_VALUE_SIZE,
-            });
-        }
-        
         let root_pid = *self.root.lock().unwrap();
         let mut stack = BTStack::new();
         let mut pid = root_pid;
@@ -358,7 +349,16 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 }
             }
 
-            let result = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).insert(slot, key, value);
+            // Spill the value to an overflow chain now if it exceeds the inline threshold;
+            let val_bytes = V::as_bytes(value);
+            let (stored_val, rec_type) = self.materialize_value(val_bytes.as_ref())?;
+
+            let result = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).insert_raw(
+                slot,
+                key_bytes.as_ref(),
+                &stored_val,
+                rec_type,
+            );
             return match result {
                 Ok(()) => {
                     let page_id = leaf_guard.page_id;
@@ -367,19 +367,21 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                     // is enforced lazily by the buffer pool's WAL-before-page gate or at
                     // commit, never fsynced at insert time. Stamp the record's LSN as the
                     // page LSN so the gate flushes the WAL through it before the page lands.
-                    let val_bytes = V::as_bytes(value);
+                    // For overflow records `stored_val` is the descriptor;                     // pages get their own WAL records in milestone 4.
                     let lsn = self.wal.log_insert(
                         txn.txn_id,
                         page_id,
                         slot as u16,
                         key_bytes.as_ref(),
-                        val_bytes.as_ref(),
+                        &stored_val,
                         txn.txn_id,
                     )?;
                     LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
                     Ok(())
                 }
-                Err(_) => self.split_and_insert(leaf_guard, key, value, txn, &stack),
+                Err(_) => {
+                    self.split_and_insert(leaf_guard, key, &stored_val, rec_type, txn, &stack)
+                }
             };
         }
     }
@@ -493,15 +495,6 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             });
         }
 
-        let val_bytes_check = V::as_bytes(value);
-        let val_len = val_bytes_check.as_ref().len();
-        if val_len > MAX_VALUE_SIZE {
-            return Err(IndexError::ValueTooLarge {
-                size: val_len,
-                max: MAX_VALUE_SIZE,
-            });
-        }
-
         let root_pid = *self.root.lock().unwrap();
         let mut stack = BTStack::new();
         let mut pid = root_pid;
@@ -582,6 +575,12 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 Err(e) => return Err(e),
             }
 
+            // Spill the new value to an overflow chain if needed *before*
+            // mutating the page, so a pool error here leaves the old version
+            // untouched and never orphans overflow pages.
+            let val_bytes = V::as_bytes(value);
+            let (stored_val, rec_type) = self.materialize_value(val_bytes.as_ref())?;
+
             // ── Set xmax on the old version ──────────────────────────────────
             let vis_pid = vis_guard.page_id;
             let lsn_xmax =
@@ -617,21 +616,20 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             let page_id = vis_guard.page_id;
             let acc = LeafPageAccessor::<K, V>::new(&vis_guard[..]);
             let (slot, _) = acc.position(key);
-            let val_bytes = V::as_bytes(value);
 
-            // If the new version fits in place, insert() cannot fail — so we can
-            // log to the WAL *before* dirtying the page (WAL-before-page).
-            if acc.can_fit_direct(key_len, val_bytes.as_ref().len()) {
+            // If the new version fits in place, insert_raw() cannot fail — so we
+            // can log to the WAL *before* dirtying the page (WAL-before-page).
+            if acc.can_fit_direct(key_len, stored_val.len()) {
                 let lsn = self.wal.log_insert(
                     txn.txn_id,
                     page_id,
                     slot as u16,
                     key_bytes.as_ref(),
-                    val_bytes.as_ref(),
+                    &stored_val,
                     txn.txn_id,
                 )?;
                 let mut m = LeafPageMutator::<K, V>::new(&mut vis_guard[..]);
-                m.insert(slot, key, value)
+                m.insert_raw(slot, key_bytes.as_ref(), &stored_val, rec_type)
                     .expect("insert must succeed: can_fit_direct checked above");
                 m.set_xmin(slot, txn.txn_id);
                 m.set_lsn(lsn);
@@ -639,7 +637,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             }
 
             // Doesn't fit → split.
-            return self.split_and_insert(vis_guard, key, value, txn, &stack);
+            return self.split_and_insert(vis_guard, key, &stored_val, rec_type, txn, &stack);
         }
     }
 
