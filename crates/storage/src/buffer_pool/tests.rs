@@ -339,3 +339,75 @@ fn test_buffer_pool_manager_pin_count() {
     drop(pages);
     assert!(bpm.new_page().is_ok());
 }
+
+#[test]
+fn test_rec_lsn_and_fpi_flag() {
+    use std::sync::atomic::Ordering;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test.db");
+
+    let disk_manager = Arc::new(DiskManager::new(&path, MAX_PAGE_SIZE).unwrap());
+    let bpm = make_bpm(disk_manager, &dir);
+
+    let page_a_id;
+    let page_b_id;
+
+    //Manually assigning lsn value to different pages
+    //Page A : LSN = 5 <= Last_checkpoint_redo_point:10 (requires FPI)
+    //Page B : LSN = 15 >= Last_checkpoint_redo_point:10 (doesnt require FPI)
+    {
+        let mut guard_a = bpm.new_page().unwrap();
+        page_a_id = guard_a.page_id;
+        crate::page::set_lsn(&mut *guard_a, 5);
+
+        let mut guard_b = bpm.new_page().unwrap();
+        page_b_id = guard_b.page_id;
+        crate::page::set_lsn(&mut *guard_b, 15);
+    }
+
+    // set_lsn make page dirty, flush them to make clean 
+    // successful fpi check requires page to be clean
+    bpm.flush_page(page_a_id).unwrap();
+    bpm.flush_page(page_b_id).unwrap();
+
+    for shard in &bpm.shards {
+        shard
+            .last_checkpoint_redo_point
+            .store(10, Ordering::Relaxed);
+    }
+
+    let mut guard_a = bpm.fetch_page_mut(page_a_id).unwrap();
+    let needs_fpi_a = guard_a.mark_dirty_with_lsn(20);
+    assert!(needs_fpi_a, "Page A:First write needs fpi");
+
+    let mut guard_b = bpm.fetch_page_mut(page_b_id).unwrap();
+    let needs_fpi_b = guard_b.mark_dirty_with_lsn(21);
+    assert!(!needs_fpi_b, "Page B: No fpi needed");
+
+    drop(guard_a);
+    drop(guard_b);
+
+    // After dirtying A (LSN 20) and B (LSN 21), before any flush:
+    assert_eq!(
+        bpm.min_rec_lsn(),
+        Some(20),
+        "redo point should be min of rec_lsns"
+    );
+    bpm.flush_page(page_a_id).unwrap();
+
+    //After flushing page A, only page B rec_lsn should remain
+    assert_eq!(
+        bpm.min_rec_lsn(),
+        Some(21),
+        "After flushing Page A, min_rec_lsn should only see Page B's rec_lsn (21)"
+    );
+
+    // No dirty page remained -> None
+    bpm.flush_page(page_b_id).unwrap();
+    assert_eq!(
+        bpm.min_rec_lsn(),
+        None,
+        "After flushing all pages, min_rec_lsn must be None"
+    );
+}

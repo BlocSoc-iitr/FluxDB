@@ -462,7 +462,7 @@ impl BufferPoolShard {
 
         if let Some(&frame_id) = inner.page_table.get(&page_id) {
             let meta = &mut inner.metadata[frame_id];
-            let was_clean = meta.is_dirty;
+            let was_clean = !meta.is_dirty;
             meta.is_dirty = true;
 
             //Check if it is the first change after the checkpoint
