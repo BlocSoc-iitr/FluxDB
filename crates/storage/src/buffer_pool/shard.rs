@@ -116,6 +116,11 @@ impl<'a> Drop for PageWriteGuard<'a> {
     }
 }
 
+/// Marks the page as dirty and associates it with the WAL record LSN that caused the change.
+///
+/// This reads the old page LSN before the mutation occurs and passes it to the shard.
+/// Returns `true` if this is the first change since the last checkpoint, indicating
+/// the caller must log a Full-Page Image (FPI).
 impl<'a> PageWriteGuard<'a> {
     pub fn mark_dirty_with_lsn(&mut self, lsn: Lsn) -> bool {
         self.dirty = true;
@@ -460,6 +465,7 @@ impl BufferPoolShard {
             let was_clean = meta.is_dirty;
             meta.is_dirty = true;
 
+            //Check if it is the first change after the checkpoint
             if was_clean {
                 meta.rec_lsn = Some(lsn);
                 return page_lsn_before <= redo_point;

@@ -1,5 +1,6 @@
 use crate::buffer_pool::shard::{BufferPoolShard, PageReadGuard, PageWriteGuard};
 use crate::disk::DiskManager;
+use crate::page::Lsn;
 use crate::wal::Wal;
 use common::{BufferPoolError, MAX_FRAMES, NUM_SHARDS, SHARD_MASK};
 use std::cmp::max;
@@ -288,5 +289,21 @@ impl BufferPoolManager {
             dirty: false,
             record_lsn: None,
         })
+    }
+
+    /// Returns the min rec_lsn among all the frame or None if no
+    ///This point is the redo point
+    pub fn min_rec_lsn(&self) -> Option<Lsn> {
+        self.shards
+            .iter()
+            .flat_map(|shard| {
+                let inner = shard.inner.lock().unwrap();
+                inner
+                    .metadata
+                    .iter()
+                    .filter_map(|m| if m.is_dirty { m.rec_lsn } else { None })
+                    .collect::<Vec<_>>()
+            })
+            .min()
     }
 }
