@@ -869,6 +869,7 @@ impl Wal {
     /// chain and deletes its parent downlink. The deleted page id is kept in
     /// main data for future recycle bookkeeping; replay applies only the named
     /// sibling and parent block payloads.
+    #[allow(clippy::too_many_arguments)]
     pub fn log_unlink_page(
         &self,
         txn_id: u64,
