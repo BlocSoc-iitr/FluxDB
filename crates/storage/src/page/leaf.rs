@@ -57,11 +57,11 @@ use db_core::{transaction, transaction_manager::TransactionManager};
 use std::cmp::Ordering;
 use std::marker::PhantomData;
 
+use super::overflow::OverflowDescriptor;
 use super::{
     LEAF, Lsn, OFF_LSN, OFF_PAGE_ID, OFF_PAGE_TYPE, PAGE_SIZE, PageError, PageId, read_u8,
     read_u16, read_u64, write_u8, write_u16, write_u64,
 };
-use super::overflow::OverflowDescriptor;
 
 // ── Leaf-page-specific header offsets ────────────────────────────────────────
 
@@ -590,7 +590,7 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
         let n = acc.num_pairs() as usize;
 
         // 1. Gather all non-vacuumable records. Value bytes and rec_type are
-        //    captured verbatim so overflow pointers survive compaction 
+        //    captured verbatim so overflow pointers survive compaction
         type LiveRecord = (Vec<u8>, Vec<u8>, u8, u64, u64);
         let mut live: Vec<LiveRecord> = Vec::with_capacity(n);
         let mut dead_count = 0;
