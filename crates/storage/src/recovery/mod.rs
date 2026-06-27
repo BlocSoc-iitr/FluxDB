@@ -154,10 +154,12 @@ impl RecoveryManager {
                 )?;
             }
             (WalRecordType::MarkHalfDead, 0) => {
-                // page-0 block: mark the page half-dead.
+                // Single page block: mark the target leaf half-dead.
                 crate::page::set_half_dead(page);
             }
             (WalRecordType::UnlinkPage, _) => {
+                // Each UnlinkPage block carries a role byte followed by that
+                // page's redo payload, so block order can stay flexible.
                 let d = data.expect("UnlinkPage record missing data block");
                 match d[0] {
                     UNLINK_ROLE_LEFT => {

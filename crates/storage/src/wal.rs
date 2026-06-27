@@ -114,9 +114,13 @@ impl TryFrom<u8> for WalRecordType {
 pub const BLK_HAS_FPI: u8 = 0b01;
 pub const BLK_HAS_DATA: u8 = 0b10;
 
+/// UnlinkPage block payload roles. Each block starts with one of these bytes so
+/// replay can decode records even when the optional left-sibling block is absent.
 pub const UNLINK_ROLE_LEFT: u8 = 0;
 pub const UNLINK_ROLE_RIGHT: u8 = 1;
 pub const UNLINK_ROLE_PARENT: u8 = 2;
+
+/// Parent block payload values for `InternalPageMutator::remove_key_at`.
 pub const UNLINK_KEEP_LEFT: u8 = 0;
 pub const UNLINK_KEEP_RIGHT: u8 = 1;
 
@@ -807,6 +811,8 @@ impl Wal {
         self.append(WalRecordType::Abort, txn_id, &[], None)
     }
 
+    /// Log step one of leaf deletion: mark an empty leaf half-dead so future
+    /// descents can route around it via the leaf rightlink.
     pub fn log_mark_half_dead(&self, txn_id: u64, page_id: PageId) -> Result<Lsn> {
         let block = Block {
             page_id,
@@ -859,6 +865,10 @@ impl Wal {
         self.append(WalRecordType::SetXMax, txn_id, &[block], None)
     }
 
+    /// Log the atomic splice that removes a half-dead leaf from the sibling
+    /// chain and deletes its parent downlink. The deleted page id is kept in
+    /// main data for future recycle bookkeeping; replay applies only the named
+    /// sibling and parent block payloads.
     pub fn log_unlink_page(
         &self,
         txn_id: u64,
@@ -1312,6 +1322,69 @@ mod tests {
             assert_eq!(entry2.main_data.unwrap(), &[8, 7, 6, 5, 4, 3, 2, 1]);
         }
 
+        assert!(iter.next_record().is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_mark_half_dead_roundtrip() -> Result<()> {
+        let dir = tempdir().map_err(WalError::Io)?;
+        let wal_dir = dir.path().join("mark-half-dead-wal");
+
+        let wal = Wal::new(&wal_dir)?;
+        let lsn = wal.log_mark_half_dead(0, 42)?;
+        wal.flush_up_to(lsn)?;
+
+        let mut iter = WalIterator::new(&wal_dir).map_err(WalError::Io)?;
+        let record = iter.next_record().unwrap()?;
+        assert_eq!(record.entry_type, WalRecordType::MarkHalfDead);
+        assert_eq!(record.txn_id, 0);
+        assert_eq!(record.blocks.len(), 1);
+        assert_eq!(record.blocks[0].page_id, 42);
+        assert_eq!(record.blocks[0].blk_flags, 0);
+        assert!(record.blocks[0].fpi.is_none());
+        assert!(record.blocks[0].data.is_none());
+        assert!(record.main_data.is_none());
+        assert!(iter.next_record().is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_unlink_page_roundtrip() -> Result<()> {
+        let dir = tempdir().map_err(WalError::Io)?;
+        let wal_dir = dir.path().join("unlink-page-wal");
+
+        let wal = Wal::new(&wal_dir)?;
+        let lsn = wal.log_unlink_page(0, 22, Some(11), 33, 44, 2, true)?;
+        wal.flush_up_to(lsn)?;
+
+        let mut iter = WalIterator::new(&wal_dir).map_err(WalError::Io)?;
+        let record = iter.next_record().unwrap()?;
+        assert_eq!(record.entry_type, WalRecordType::UnlinkPage);
+        assert_eq!(record.txn_id, 0);
+        assert_eq!(record.main_data.unwrap(), &22u64.to_le_bytes());
+        assert_eq!(record.blocks.len(), 3);
+
+        assert_eq!(record.blocks[0].page_id, 11);
+        assert_eq!(record.blocks[0].blk_flags, BLK_HAS_DATA);
+        let left = record.blocks[0].data.unwrap();
+        assert_eq!(left[0], UNLINK_ROLE_LEFT);
+        assert_eq!(u64::from_le_bytes(left[1..9].try_into().unwrap()), 33);
+
+        assert_eq!(record.blocks[1].page_id, 33);
+        assert_eq!(record.blocks[1].blk_flags, BLK_HAS_DATA);
+        let right = record.blocks[1].data.unwrap();
+        assert_eq!(right[0], UNLINK_ROLE_RIGHT);
+        assert_eq!(u64::from_le_bytes(right[1..9].try_into().unwrap()), 11);
+
+        assert_eq!(record.blocks[2].page_id, 44);
+        assert_eq!(record.blocks[2].blk_flags, BLK_HAS_DATA);
+        let parent = record.blocks[2].data.unwrap();
+        assert_eq!(parent[0], UNLINK_ROLE_PARENT);
+        assert_eq!(u16::from_le_bytes(parent[1..3].try_into().unwrap()), 2);
+        assert_eq!(parent[3], UNLINK_KEEP_RIGHT);
         assert!(iter.next_record().is_none());
 
         Ok(())
