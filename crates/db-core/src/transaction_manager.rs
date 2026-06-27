@@ -64,6 +64,7 @@ type WaiterEntry = Arc<(Mutex<bool>, Condvar)>;
 pub struct TransactionManager {
     pub next_txn_id: AtomicU64,
     pub clog: RwLock<HashMap<u64, TransactionStatus>>,
+    pub vacuum_horizon: AtomicU64,
     pub active_txns: RwLock<HashSet<u64>>,
     waiters: Mutex<HashMap<u64, WaiterEntry>>,
 }
@@ -80,6 +81,7 @@ impl TransactionManager {
         Self {
             next_txn_id: AtomicU64::new(1),
             clog: RwLock::new(HashMap::new()),
+            vacuum_horizon: AtomicU64::new(0),
             active_txns: RwLock::new(HashSet::new()),
             waiters: Mutex::new(HashMap::new()),
         }
@@ -100,18 +102,32 @@ impl TransactionManager {
             .unwrap_or_else(|| self.next_txn_id.load(Acquire))
     }
 
+    /// Publishes the horizon of a COMPLETED full vacuum sweep. `fetch_max` so a
+    /// slower concurrent sweep can never move the horizon backward. (DESIGN §8.4)
+    pub fn publish_vacuum_horizon(&self, horizon: u64) {
+        self.vacuum_horizon.fetch_max(horizon, AcqRel);
+    }
+
+    /// The oldest-active-txn-id captured at the start of the most recent
+    /// completed full sweep (0 until the first post-restart sweep completes).
+    pub fn vacuum_horizon(&self) -> u64 {
+        self.vacuum_horizon.load(Acquire)
+    }
+
     /// Truncates the CLOG, removing entries older than `horizon`.
-    ///
-    /// Note: We ONLY remove `Committed` entries. `Aborted` entries must be retained forever
-    /// (or until a physical vacuum confirms their records are gone) because dropping an `Aborted`
-    /// entry before its dirty records are vacuumed would cause our presumed-commit logic to
-    /// suddenly treat those aborted records as visible `Committed` records, breaking isolation.
-    pub fn truncate_clog(&self, horizon: u64) {
+    /// Now the removal of entries has been made two-tier, such that the entries that are
+    /// committed and their txn_id lying below committed_horizon are deleted directly because
+    /// they have already been committed into the tree. However, the transactions that aborted are removed
+    /// once a successful sweep returns a vacuum_horizon value that can be used to check if the rows
+    /// concerning that aborted entry in the CLOG have been deleted or not. This physical vacuum confirms
+    /// that the records of aborted transactions are gone, allowing the truncation of aborted entries in CLOG.
+    pub fn truncate_clog(&self, committed_horizon: u64) {
+        let aborted_horizon = self.vacuum_horizon();
         let mut clog = self.clog.write().unwrap();
-        clog.retain(|&txn_id, status| {
-            txn_id >= horizon
-                || *status == TransactionStatus::Active
-                || *status == TransactionStatus::Aborted
+        clog.retain(|&txn_id, status| match status {
+            TransactionStatus::Active => true,
+            TransactionStatus::Committed => txn_id >= committed_horizon,
+            TransactionStatus::Aborted => txn_id >= aborted_horizon,
         });
     }
 
@@ -534,6 +550,66 @@ mod tests {
         assert_eq!(
             clog.get(&txn_active.txn_id),
             Some(&TransactionStatus::Active)
+        );
+    }
+
+    #[test]
+    fn test_truncate_clog_retains_aborted_above_vacuum_horizon() {
+        let tm = std::sync::Arc::new(TransactionManager::new());
+
+        //make a dummy entry into the database, followed by an aborted entry
+        //and then a dummy entry again to mark global_xmin > aborted_txn.txn_id
+
+        //txc2 was not committed - which means global_xmin will set to it's txn_id
+        //when a sweep runs
+        let txc1 = tm.begin();
+        let tx_abort = tm.begin();
+        let _txc2 = tm.begin();
+
+        tm.mark_committed(txc1.txn_id);
+        tm.mark_aborted(tx_abort.txn_id);
+
+        //now, we run a full sweep
+        tm.publish_vacuum_horizon(tx_abort.txn_id - 1); // so that the horizon is below the aborted txn's id 
+
+        let committed_horizon = tm.global_xmin();
+        assert!(tx_abort.txn_id < committed_horizon);
+        assert!(tm.vacuum_horizon() < tx_abort.txn_id);
+
+        tm.truncate_clog(committed_horizon);
+
+        //Now the mandatory asserts - the transaction is still present in the map
+        assert_eq!(
+            tm.clog.read().unwrap().get(&tx_abort.txn_id),
+            Some(&TransactionStatus::Aborted),
+            "aborted entry below global_xmin but above vacuum_horizon must survive",
+        );
+        // And settled_status is unchanged for it, that is it did not flip to committed.
+        assert_eq!(
+            tm.settled_status(tx_abort.txn_id),
+            TransactionStatus::Aborted
+        );
+    }
+
+    #[test]
+    fn test_truncate_clog_drops_aborted_below_vacuum_horizon() {
+        let tm = std::sync::Arc::new(TransactionManager::new());
+
+        let tx_abort = tm.begin();
+        tm.mark_aborted(tx_abort.txn_id);
+
+        let txc1 = tm.begin();
+        tm.mark_committed(txc1.txn_id);
+        let _txc2 = tm.begin();
+
+        tm.publish_vacuum_horizon(txc1.txn_id);
+        let committed_horizon = tm.global_xmin();
+        tm.truncate_clog(committed_horizon);
+
+        assert_eq!(
+            tm.clog.read().unwrap().get(&tx_abort.txn_id),
+            None,
+            "aborted entry below vacuum_horizon must not survive",
         );
     }
 }
