@@ -114,6 +114,12 @@ impl TryFrom<u8> for WalRecordType {
 pub const BLK_HAS_FPI: u8 = 0b01;
 pub const BLK_HAS_DATA: u8 = 0b10;
 
+pub const UNLINK_ROLE_LEFT: u8 = 0;
+pub const UNLINK_ROLE_RIGHT: u8 = 1;
+pub const UNLINK_ROLE_PARENT: u8 = 2;
+pub const UNLINK_KEEP_LEFT: u8 = 0;
+pub const UNLINK_KEEP_RIGHT: u8 = 1;
+
 /// Represents a reference to a page modified by the transaction, potentially
 /// including a Full-Page Image (FPI) and specific redo data for that page.
 #[derive(Debug)]
@@ -851,6 +857,63 @@ impl Wal {
             data: Some(&payload),
         };
         self.append(WalRecordType::SetXMax, txn_id, &[block], None)
+    }
+
+    pub fn log_unlink_page(
+        &self,
+        txn_id: u64,
+        deleted_page_id: PageId,
+        left_sibling: Option<PageId>,
+        right_sibling: PageId,
+        parent_page: PageId,
+        remove_index: u16,
+        keep_right_child: bool,
+    ) -> Result<Lsn> {
+        let mut blocks = Vec::with_capacity(if left_sibling.is_some() { 3 } else { 2 });
+
+        let left_payload;
+        if let Some(left_page) = left_sibling {
+            left_payload = {
+                let mut p = Vec::with_capacity(1 + 8);
+                p.push(UNLINK_ROLE_LEFT);
+                p.extend_from_slice(&right_sibling.to_le_bytes());
+                p
+            };
+            blocks.push(Block {
+                page_id: left_page,
+                blk_flags: BLK_HAS_DATA,
+                fpi: None,
+                data: Some(&left_payload),
+            });
+        }
+
+        let mut right_payload = Vec::with_capacity(1 + 8);
+        right_payload.push(UNLINK_ROLE_RIGHT);
+        right_payload.extend_from_slice(&left_sibling.unwrap_or(0).to_le_bytes());
+        blocks.push(Block {
+            page_id: right_sibling,
+            blk_flags: BLK_HAS_DATA,
+            fpi: None,
+            data: Some(&right_payload),
+        });
+
+        let mut parent_payload = Vec::with_capacity(1 + 2 + 1);
+        parent_payload.push(UNLINK_ROLE_PARENT);
+        parent_payload.extend_from_slice(&remove_index.to_le_bytes());
+        parent_payload.push(if keep_right_child {
+            UNLINK_KEEP_RIGHT
+        } else {
+            UNLINK_KEEP_LEFT
+        });
+        blocks.push(Block {
+            page_id: parent_page,
+            blk_flags: BLK_HAS_DATA,
+            fpi: None,
+            data: Some(&parent_payload),
+        });
+
+        let main_data = deleted_page_id.to_le_bytes();
+        self.append(WalRecordType::UnlinkPage, txn_id, &blocks, Some(&main_data))
     }
 
     pub fn log_leaf_split(
