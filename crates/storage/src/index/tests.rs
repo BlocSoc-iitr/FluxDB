@@ -686,13 +686,13 @@ fn insert_and_update_accept_oversized_value() {
     let idx = make_index();
     let k: &[u8] = b"key";
     // Larger than the inline threshold → spills to an overflow page chain.
-    let oversized = vec![0xFFu8; OVERFLOW_THRESHHOLD + 1];
+    let oversized = vec![0xFFu8; OVERFLOW_THRESHOLD + 1];
 
     // insert no longer rejects — it allocates an overflow chain.
     idx.insert(&k, &oversized.as_slice(), &auto()).unwrap();
 
     // update to an even larger value also succeeds.
-    let bigger = vec![0xABu8; OVERFLOW_THRESHHOLD * 3];
+    let bigger = vec![0xABu8; OVERFLOW_THRESHOLD * 3];
     idx.update(&k, &bigger.as_slice(), &auto()).unwrap();
 }
 

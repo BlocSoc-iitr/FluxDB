@@ -39,7 +39,7 @@ pub const OVERFLOW: u8 = 4;
 /// Canonical page size used throughout the storage engine (4 KB).
 pub const PAGE_SIZE: usize = 4096;
 
-pub const OVERFLOW_THRESHHOLD: usize = 2048;
+pub const OVERFLOW_THRESHOLD: usize = 2048;
 
 // ── Shared header offsets (present in all three page types) ───────────────────────
 
