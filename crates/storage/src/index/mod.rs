@@ -17,7 +17,7 @@ use db_core::transaction_manager::TransactionManager;
 use crate::buffer_pool::{BufferPoolManager, PageReadGuard, PageWriteGuard};
 use crate::page::{
     INTERNAL, InternalPageAccessor, InternalPageBuilder, InternalPageMutator, LEAF,
-    LeafPageAccessor, LeafPageBuilder, LeafPageMutator, OVERFLOW_THRESHHOLD, PAGE_SIZE, PageId,
+    LeafPageAccessor, LeafPageBuilder, LeafPageMutator, OVERFLOW_THRESHOLD, PAGE_SIZE, PageId,
     REC_TYPE_INLINE, REC_TYPE_OVERFLOW, read_overflow_chain, write_overflow_chain,
 };
 use crate::wal::Wal;
@@ -160,42 +160,23 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
 
         let acc = LeafPageAccessor::<K, V>::new(&page[..]);
         match self.find_visible_slot(&acc, key, txn) {
-            Some(slot) => {
-                let val = acc.get_value(slot);
-                Ok(Some(V::as_bytes(&val).as_ref().to_vec()))
-            }
+            Some(slot) => Ok(Some(reify_value(&acc, slot, &self.pool)?)),
             None => Ok(None),
         }
     }
 
     /// Decide how a value is stored in a leaf record.
     ///
-    /// Values up to [`OVERFLOW_THRESHHOLD`] are stored inline. Larger values
+    /// Values up to [`OVERFLOW_THRESHOLD`] are stored inline. Larger values
     /// are written to a freshly allocated overflow page chain and the record
     /// stores a serialized [`OverflowDescriptor`] instead. Returns the bytes to
     /// place in the record together with the record-type byte.
     fn materialize_value(&self, val_bytes: &[u8]) -> Result<(Vec<u8>, u8)> {
-        if val_bytes.len() <= OVERFLOW_THRESHHOLD {
+        if val_bytes.len() <= OVERFLOW_THRESHOLD {
             Ok((val_bytes.to_vec(), REC_TYPE_INLINE))
         } else {
             let desc = write_overflow_chain(val_bytes, &self.pool)?;
             Ok((desc.to_bytes().to_vec(), REC_TYPE_OVERFLOW))
-        }
-    }
-
-    /// Reconstruct the full value stored at slot `slot`.
-    ///
-    /// For inline records this copies the record bytes; for overflow records it
-    /// walks the page chain referenced by the record's descriptor.
-    #[allow(dead_code)]
-    fn reify_value(&self, acc: &LeafPageAccessor<K, V>, slot: usize) -> Result<Vec<u8>> {
-        if acc.is_overflow(slot) {
-            let desc = acc
-                .overflow_descriptor(slot)
-                .expect("overflow record must carry a 12-byte descriptor");
-            read_overflow_chain(desc, &self.pool)
-        } else {
-            Ok(acc.raw_value(slot).to_vec())
         }
     }
 
@@ -941,6 +922,27 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
     }
 }
 
+/// Reconstruct the full value stored at slot `slot` of `acc`.
+///
+/// For inline records this copies the record bytes; for overflow records it
+/// walks the page chain referenced by the record's descriptor via `pool`.
+/// A free function (not a method) so the range-scan iterators — which hold only
+/// a `&BufferPoolManager` — can share it with `BTreeIndex::get`.
+fn reify_value<K: Key, V: Value>(
+    acc: &LeafPageAccessor<K, V>,
+    slot: usize,
+    pool: &BufferPoolManager,
+) -> Result<Vec<u8>> {
+    if acc.is_overflow(slot) {
+        let desc = acc
+            .overflow_descriptor(slot)
+            .expect("overflow record must carry a 12-byte descriptor");
+        read_overflow_chain(desc, pool)
+    } else {
+        Ok(acc.raw_value(slot).to_vec())
+    }
+}
+
 // ── RangeScan ─────────────────────────────────────────────────────────────────
 
 pub struct RangeScan<'a, K: Key, V: Value> {
@@ -978,7 +980,6 @@ impl<'a, K: Key, V: Value> Iterator for RangeScan<'a, K, V> {
                 }
 
                 let k = K::as_bytes(&acc.get_key(self.slot)).as_ref().to_vec();
-                let v = V::as_bytes(&acc.get_value(self.slot)).as_ref().to_vec();
 
                 let in_range = match &self.end_key {
                     None => true,
@@ -996,6 +997,11 @@ impl<'a, K: Key, V: Value> Iterator for RangeScan<'a, K, V> {
                     self.current_leaf = None;
                     return None;
                 }
+
+                let v = match reify_value(&acc, self.slot, self.pool) {
+                    Ok(v) => v,
+                    Err(e) => return Some(Err(e)),
+                };
 
                 self.slot += 1;
                 return Some(Ok((k, v)));
@@ -1055,7 +1061,6 @@ impl<'a, K: Key, V: Value> Iterator for BackwardRangeScan<'a, K, V> {
                 }
 
                 let k = K::as_bytes(&acc.get_key(s)).as_ref().to_vec();
-                let v = V::as_bytes(&acc.get_value(s)).as_ref().to_vec();
 
                 let in_range = match &self.start_key {
                     None => true,
@@ -1073,6 +1078,11 @@ impl<'a, K: Key, V: Value> Iterator for BackwardRangeScan<'a, K, V> {
                     self.current_leaf = None;
                     return None;
                 }
+
+                let v = match reify_value(&acc, s, self.pool) {
+                    Ok(v) => v,
+                    Err(e) => return Some(Err(e)),
+                };
 
                 self.slot -= 1;
                 if self.slot < 0 {
