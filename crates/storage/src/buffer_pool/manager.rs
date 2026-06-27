@@ -10,8 +10,8 @@ pub type Result<T> = std::result::Result<T, BufferPoolError>;
 
 /// The main manager for the buffer pool, providing a partitioned cache for disk pages.
 pub struct BufferPoolManager {
-    pub shards: Vec<BufferPoolShard>,
-    pub next_page_id: Mutex<u64>,
+    pub(crate) shards: Vec<BufferPoolShard>,
+     next_page_id: Mutex<u64>,
 }
 
 impl BufferPoolManager {
