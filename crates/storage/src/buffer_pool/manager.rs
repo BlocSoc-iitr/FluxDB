@@ -78,6 +78,7 @@ impl BufferPoolManager {
             page_id,
             guard: Some(data),
             dirty: false,
+            record_lsn: None,
         })
     }
 
@@ -184,6 +185,7 @@ impl BufferPoolManager {
             page_id,
             guard: Some(data),
             dirty: false,
+            record_lsn: None,
         })
     }
 
@@ -284,6 +286,7 @@ impl BufferPoolManager {
             page_id,
             guard: Some(data),
             dirty: false,
+            record_lsn: None,
         })
     }
 }

@@ -6,14 +6,14 @@
 
 use crate::buffer_pool::replacer::ClockReplacer;
 use crate::disk::DiskManager;
-use crate::wal::Wal;
 use crate::page::Lsn;
+use crate::wal::Wal;
 use common::BufferPoolError;
 use common::{INVALID_FRAME_ID, MAX_PAGE_SIZE};
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::sync::atomic::{AtomicU64,Ordering};
 
 type Result<T> = std::result::Result<T, BufferPoolError>;
 
@@ -83,6 +83,7 @@ pub struct PageWriteGuard<'a> {
     pub(crate) page_id: u64,
     pub(crate) guard: Option<RwLockWriteGuard<'a, PageData>>,
     pub(crate) dirty: bool,
+    pub(crate) record_lsn: Option<Lsn>,
 }
 
 impl<'a> Deref for PageWriteGuard<'a> {
@@ -110,7 +111,23 @@ impl<'a> Drop for PageWriteGuard<'a> {
         if let Some(guard) = self.guard.take() {
             drop(guard);
         }
-        self.shard.unpin_page(self.page_id, self.dirty);
+        let needs_dirty_unpin = self.dirty && self.record_lsn.is_none();
+        self.shard.unpin_page(self.page_id, needs_dirty_unpin);
+    }
+}
+
+impl<'a> PageWriteGuard<'a> {
+    pub fn mark_dirty_with_lsn(&mut self, lsn: Lsn) -> bool {
+        self.dirty = true;
+        self.record_lsn = Some(lsn);
+
+        let old_page_lsn = if let Some(guard) = &self.guard {
+            crate::page::page_lsn(&guard[..])
+        } else {
+            0
+        };
+
+        self.shard.mark_dirty(self.page_id, lsn, old_page_lsn)
     }
 }
 
@@ -169,7 +186,6 @@ impl BufferPoolShard {
             load_done: Condvar::new(),
             wal,
             last_checkpoint_redo_point: AtomicU64::new(0), //lsn 0 is null pageLsn
-
         }
     }
 
@@ -323,6 +339,9 @@ impl BufferPoolShard {
         if let Err(e) = res {
             inner.metadata[frame_id].is_dirty = true;
             return Err(e);
+        } else {
+            //When WRITE is succeded it is safe to clear the lsn
+            inner.metadata[frame_id].rec_lsn = None;
         }
 
         Ok(true)
@@ -429,23 +448,22 @@ impl BufferPoolShard {
             return Ok(());
         }
     }
-    
+
     /// returns 'true' if the FPI is to be attached with WAL record
     /// page_lsn_before <= redo_point ensures that this is the first change in page after the last checkpoint
-    pub fn mark_dirty(&self, page_id:u64 ,lsn:Lsn,page_lsn_before: Lsn) -> bool{
+    pub fn mark_dirty(&self, page_id: u64, lsn: Lsn, page_lsn_before: Lsn) -> bool {
         let redo_point = self.last_checkpoint_redo_point.load(Ordering::Relaxed);
-        let mut inner = self.inner.lock().unwrap() ;
+        let mut inner = self.inner.lock().unwrap();
 
-        if let Some(&frame_id) = inner.page_table.get(&page_id){
+        if let Some(&frame_id) = inner.page_table.get(&page_id) {
             let meta = &mut inner.metadata[frame_id];
             let was_clean = meta.is_dirty;
             meta.is_dirty = true;
 
-            if was_clean{
+            if was_clean {
                 meta.rec_lsn = Some(lsn);
-                return page_lsn_before<= redo_point;
+                return page_lsn_before <= redo_point;
             }
-
         }
         false
     }
