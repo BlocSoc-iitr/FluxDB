@@ -366,7 +366,7 @@ fn test_rec_lsn_and_fpi_flag() {
         crate::page::set_lsn(&mut *guard_b, 15);
     }
 
-    // set_lsn make page dirty, flush them to make clean 
+    // set_lsn make page dirty, flush them to make clean
     // successful fpi check requires page to be clean
     bpm.flush_page(page_a_id).unwrap();
     bpm.flush_page(page_b_id).unwrap();
