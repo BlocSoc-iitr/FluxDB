@@ -801,6 +801,16 @@ impl Wal {
         self.append(WalRecordType::Abort, txn_id, &[], None)
     }
 
+    pub fn log_mark_half_dead(&self, txn_id: u64, page_id: PageId) -> Result<Lsn> {
+        let block = Block {
+            page_id,
+            blk_flags: 0,
+            fpi: None,
+            data: None,
+        };
+        self.append(WalRecordType::MarkHalfDead, txn_id, &[block], None)
+    }
+
     /// Appends only — durability is deferred to the buffer pool's flush seam
     /// (WAL-before-page) or to the transaction's commit, never an fsync here.
     pub fn log_insert(
@@ -842,6 +852,7 @@ impl Wal {
         };
         self.append(WalRecordType::SetXMax, txn_id, &[block], None)
     }
+
     pub fn log_leaf_split(
         &self,
         txn_id: u64,
@@ -875,6 +886,7 @@ impl Wal {
         }
         self.append(WalRecordType::LeafSplit, txn_id, &blocks, None)
     }
+
     pub fn log_internal_split(
         &self,
         txn_id: u64,
@@ -952,6 +964,7 @@ impl Wal {
         blocks.push(child_block);
         self.append(WalRecordType::InsertDownLink, txn_id, &blocks, None)
     }
+
     pub fn log_new_root(
         &self,
         txn_id: u64,

@@ -150,6 +150,10 @@ impl RecoveryManager {
                     right_child,
                 )?;
             }
+            (WalRecordType::MarkHalfDead, 0) => {
+                // page-0 block: mark the page half-dead.
+                crate::page::set_half_dead(page);
+            }
             (WalRecordType::InsertDownLink, 1) => {
                 // child block: clear INCOMPLETE_SPLIT (option A).
                 crate::page::clear_incomplete_split(page);
