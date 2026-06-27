@@ -37,11 +37,9 @@
 //! splits — `_reserved` (offset 1) must never be touched by the
 //! `set_incomplete_split` helper.
 
-use std::io::BufReader;
-
 use super::{
-    Lsn, OFF_LSN, OFF_PAGE_ID, OFF_PAGE_TYPE, OVERFLOW, PAGE_SIZE, PageError, PageId, read_u8,
-    read_u16, read_u64, write_u8, write_u16, write_u64,
+    Lsn, OFF_LSN, OFF_PAGE_ID, OFF_PAGE_TYPE, OVERFLOW, PageError, PageId, read_u8, read_u16,
+    read_u64, write_u8, write_u16, write_u64,
 };
 
 // ── Overflow-page-specific header offsets ────────────────────────────────────────

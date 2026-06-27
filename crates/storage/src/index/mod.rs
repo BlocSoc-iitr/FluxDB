@@ -17,7 +17,8 @@ use db_core::transaction_manager::TransactionManager;
 use crate::buffer_pool::{BufferPoolManager, PageReadGuard, PageWriteGuard};
 use crate::page::{
     INTERNAL, InternalPageAccessor, InternalPageBuilder, InternalPageMutator, LEAF,
-    LeafPageAccessor, LeafPageBuilder, LeafPageMutator, PAGE_SIZE, PageId,
+    LeafPageAccessor, LeafPageBuilder, LeafPageMutator, OVERFLOW_THRESHHOLD, PAGE_SIZE, PageId,
+    REC_TYPE_INLINE, REC_TYPE_OVERFLOW, read_overflow_chain, write_overflow_chain,
 };
 use crate::wal::Wal;
 use common::IndexError;
@@ -167,6 +168,37 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         }
     }
 
+    /// Decide how a value is stored in a leaf record.
+    ///
+    /// Values up to [`OVERFLOW_THRESHHOLD`] are stored inline. Larger values
+    /// are written to a freshly allocated overflow page chain and the record
+    /// stores a serialized [`OverflowDescriptor`] instead. 
+    #[allow(dead_code)]
+    fn materialize_value(&self, val_bytes: &[u8]) -> Result<(Vec<u8>, u8)> {
+        if val_bytes.len() <= OVERFLOW_THRESHHOLD {
+            Ok((val_bytes.to_vec(), REC_TYPE_INLINE))
+        } else {
+            let desc = write_overflow_chain(val_bytes, &self.pool)?;
+            Ok((desc.to_bytes().to_vec(), REC_TYPE_OVERFLOW))
+        }
+    }
+
+    /// Reconstruct the full value stored at slot `slot`.
+    ///
+    /// For inline records this copies the record bytes; for overflow records it
+    /// walks the page chain referenced by the record's descriptor.
+    #[allow(dead_code)]
+    fn reify_value(&self, acc: &LeafPageAccessor<K, V>, slot: usize) -> Result<Vec<u8>> {
+        if acc.is_overflow(slot) {
+            let desc = acc
+                .overflow_descriptor(slot)
+                .expect("overflow record must carry a 12-byte descriptor");
+            read_overflow_chain(desc, &self.pool)
+        } else {
+            Ok(acc.raw_value(slot).to_vec())
+        }
+    }
+
     /// Insert a new `(key, value)` pair. Returns `DuplicateKey` if a visible
     /// version already exists under `txn`'s snapshot.
     pub fn insert(
@@ -193,7 +225,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 max: MAX_VALUE_SIZE,
             });
         }
-
+        
         let root_pid = *self.root.lock().unwrap();
         let mut stack = BTStack::new();
         let mut pid = root_pid;
