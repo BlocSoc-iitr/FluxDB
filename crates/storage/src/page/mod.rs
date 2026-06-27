@@ -11,7 +11,10 @@ pub mod leaf;
 pub mod meta;
 pub mod overflow;
 pub use internal::{InternalPageAccessor, InternalPageBuilder, InternalPageMutator};
-pub use leaf::{LeafPageAccessor, LeafPageBuilder, LeafPageMutator};
+pub use leaf::{LeafPageAccessor, LeafPageBuilder, LeafPageMutator, REC_TYPE_INLINE, REC_TYPE_OVERFLOW};
+pub use overflow::{
+    OverflowDescriptor, free_overflow_chain, read_overflow_chain, write_overflow_chain,
+};
 
 pub use common::PageError;
 
