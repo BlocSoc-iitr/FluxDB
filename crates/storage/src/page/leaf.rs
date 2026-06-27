@@ -59,8 +59,9 @@ use std::marker::PhantomData;
 
 use super::{
     LEAF, Lsn, OFF_LSN, OFF_PAGE_ID, OFF_PAGE_TYPE, PAGE_SIZE, PageError, PageId, read_u8,
-    read_u16, read_u64, write_u8, write_u16, write_u32, write_u64,
+    read_u16, read_u64, write_u8, write_u16, write_u64,
 };
+use super::overflow::OverflowDescriptor;
 
 // ── Leaf-page-specific header offsets ────────────────────────────────────────
 
@@ -328,6 +329,25 @@ impl<'a, K: Key, V: Value> LeafPageAccessor<'a, K, V> {
         self.get_rec_type(i) == REC_TYPE_OVERFLOW
     }
 
+    /// Raw stored value bytes at slot `i`, without `V` deserialization.
+    ///
+    /// For an inline record these are the value bytes; for an overflow record
+    /// they are the serialized [`OverflowDescriptor`]. Used by paths that move
+    /// records verbatim (split / compact) and by the index when reconstructing
+    /// overflow values.
+    pub fn raw_value(&self, i: usize) -> &'a [u8] {
+        self.value_bytes_at(i)
+    }
+
+    /// Decoded [`OverflowDescriptor`] for slot `i`, or `None` if the record is
+    /// inline or its descriptor bytes are malformed.
+    pub fn overflow_descriptor(&self, i: usize) -> Option<OverflowDescriptor> {
+        if !self.is_overflow(i) {
+            return None;
+        }
+        OverflowDescriptor::from_bytes(self.value_bytes_at(i))
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────────
 
     fn slot_rec_base(&self, i: usize) -> usize {
@@ -433,6 +453,9 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
     // ── Insert ────────────────────────────────────────────────────────────────
 
     /// Insert a new `(key, value)` pair at slot position `pos`.
+    ///
+    /// Thin typed wrapper over [`insert_raw`](Self::insert_raw) that stores the
+    /// value inline.
     pub fn insert(
         &mut self,
         pos: usize,
@@ -440,9 +463,24 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
         value: &V::SelfType<'_>,
     ) -> Result<(), PageError> {
         let key_bytes = K::as_bytes(key);
-        let key_bytes = key_bytes.as_ref();
         let val_bytes = V::as_bytes(value);
-        let val_bytes = val_bytes.as_ref();
+        self.insert_raw(pos, key_bytes.as_ref(), val_bytes.as_ref(), REC_TYPE_INLINE)
+    }
+
+    /// Insert a record at slot `pos` from raw key/value byte slices with an
+    /// explicit record-type byte.
+    ///
+    /// `val_bytes` is the *stored* payload: either the inline value bytes
+    ///  or a serialized [`OverflowDescriptor`]
+    /// The new record is created live (xmin/xmax = 0);
+    /// callers stamp `xmin` via [`set_xmin`](Self::set_xmin) afterwards.
+    pub fn insert_raw(
+        &mut self,
+        pos: usize,
+        key_bytes: &[u8],
+        val_bytes: &[u8],
+        rec_type: u8,
+    ) -> Result<(), PageError> {
         let key_len = key_bytes.len();
         let val_len = val_bytes.len();
         let rec_size = rec_total_size(key_len, val_len);
@@ -463,7 +501,7 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
 
         write_u16(self.data, rec_base + REC_OFF_KEY_LEN, key_len as u16);
         write_u16(self.data, rec_base + REC_OFF_VAL_LEN, val_len as u16);
-        write_u8(self.data, rec_base + REC_OFF_REC_TYPE, REC_TYPE_INLINE); // bytes 5..8 zeroed by page fill
+        write_u8(self.data, rec_base + REC_OFF_REC_TYPE, rec_type); // bytes 5..8 zeroed by page fill
         write_u64(self.data, rec_base + REC_OFF_XMIN, 0);
         write_u64(self.data, rec_base + REC_OFF_XMAX, 0);
 
@@ -551,8 +589,10 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
         let acc = LeafPageAccessor::<K, V>::new(page_data);
         let n = acc.num_pairs() as usize;
 
-        // 1. Gather all non-vacuumable records.
-        let mut live: Vec<(Vec<u8>, Vec<u8>, u64, u64)> = Vec::with_capacity(n);
+        // 1. Gather all non-vacuumable records. Value bytes and rec_type are
+        //    captured verbatim so overflow pointers survive compaction 
+        type LiveRecord = (Vec<u8>, Vec<u8>, u8, u64, u64);
+        let mut live: Vec<LiveRecord> = Vec::with_capacity(n);
         let mut dead_count = 0;
 
         for i in 0..n {
@@ -565,8 +605,9 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
             }
 
             let k = K::as_bytes(&acc.get_key(i)).as_ref().to_vec();
-            let v = V::as_bytes(&acc.get_value(i)).as_ref().to_vec();
-            live.push((k, v, xmin, xmax));
+            let v = acc.raw_value(i).to_vec();
+            let rt = acc.get_rec_type(i);
+            live.push((k, v, rt, xmin, xmax));
         }
 
         // 2. If no records were removed, don't touch the page.
@@ -587,8 +628,8 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
         }
         builder.set_rightlink(rightlink);
         builder.set_prev_page(prev_page);
-        for (k, v, xmin, xmax) in &live {
-            builder.push_with_mvcc(&K::from_bytes(k), &V::from_bytes(v), *xmin, *xmax);
+        for (k, v, rt, xmin, xmax) in &live {
+            builder.push_with_mvcc_raw(k, v, *rt, *xmin, *xmax);
         }
 
         let mut m = builder.finish();
@@ -666,11 +707,35 @@ impl<'a, K: Key, V: Value> LeafPageBuilder<'a, K, V> {
         xmin: u64,
         xmax: u64,
     ) {
-        // Identical to push() but writes caller-supplied xmin/xmax.
         let key_bytes = K::as_bytes(key);
-        let key_bytes = key_bytes.as_ref();
         let val_bytes = V::as_bytes(value);
-        let val_bytes = val_bytes.as_ref();
+        self.push_with_mvcc_raw(
+            key_bytes.as_ref(),
+            val_bytes.as_ref(),
+            REC_TYPE_INLINE,
+            xmin,
+            xmax,
+        );
+    }
+
+    /// Append a record from raw key/value byte slices with an explicit
+    /// record-type byte and caller-supplied xmin/xmax.
+    ///
+    /// `val_bytes` is the stored payload — inline value bytes or a serialized
+    /// [`OverflowDescriptor`]. Used by split/compact paths to move records
+    /// (including overflow pointers) while preserving their version
+    /// chain. Keys must be pushed in strictly ascending order.
+    ///
+    /// # Panics
+    /// Panics if the page has no remaining space for the record.
+    pub fn push_with_mvcc_raw(
+        &mut self,
+        key_bytes: &[u8],
+        val_bytes: &[u8],
+        rec_type: u8,
+        xmin: u64,
+        xmax: u64,
+    ) {
         let key_len = key_bytes.len();
         let val_len = val_bytes.len();
         let rec_size = rec_total_size(key_len, val_len);
@@ -680,7 +745,7 @@ impl<'a, K: Key, V: Value> LeafPageBuilder<'a, K, V> {
 
         assert!(
             self.write_end >= free_start + SLOT_SIZE + rec_size,
-            "LeafPageBuilder::push_with_mvcc: page is full"
+            "LeafPageBuilder::push_with_mvcc_raw: page is full"
         );
 
         self.write_end -= rec_size;
@@ -688,7 +753,7 @@ impl<'a, K: Key, V: Value> LeafPageBuilder<'a, K, V> {
 
         write_u16(self.data, rec_base + REC_OFF_KEY_LEN, key_len as u16);
         write_u16(self.data, rec_base + REC_OFF_VAL_LEN, val_len as u16);
-        write_u8(self.data, rec_base + REC_OFF_REC_TYPE, REC_TYPE_INLINE); // bytes 5..8 zeroed by page fill
+        write_u8(self.data, rec_base + REC_OFF_REC_TYPE, rec_type); // bytes 5..8 zeroed by page fill
         write_u64(self.data, rec_base + REC_OFF_XMIN, xmin);
         write_u64(self.data, rec_base + REC_OFF_XMAX, xmax);
 
