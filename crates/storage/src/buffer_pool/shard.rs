@@ -483,7 +483,7 @@ impl BufferPoolShard {
                 meta.rec_lsn = Some(lsn);
 
                 //Comparing the recent lsn with min_rec_lsn of the shard and update it
-                if inner.min_rec_lsn == None || lsn < inner.min_rec_lsn.unwrap() {
+                if inner.min_rec_lsn.is_none() || lsn < inner.min_rec_lsn.unwrap() {
                     inner.min_rec_lsn = Some(lsn);
                 }
                 return page_lsn_before <= redo_point;
