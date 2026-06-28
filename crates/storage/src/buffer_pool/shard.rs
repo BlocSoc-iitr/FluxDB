@@ -147,7 +147,7 @@ pub struct FrameMetadata {
 
 /// Internal state of a buffer pool shard, protected by a mutex.
 pub struct ShardInner {
-    pub metadata: Vec<FrameMetadata>, 
+    pub metadata: Vec<FrameMetadata>,
     pub page_table: HashMap<u64, usize>,
     pub free_list: Vec<usize>,
     pub replacer: ClockReplacer,
