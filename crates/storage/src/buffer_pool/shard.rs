@@ -142,12 +142,12 @@ pub struct FrameMetadata {
     pub pin_count: u64,
     pub is_dirty: bool,
     pub loading: bool, // true while a load is in flight; frame not usable yet
-    pub rec_lsn: Option<u64>, // Added a recovery lsn for each lsn, the lowest rec_lsn among all dirty page is selected for new redo point
+    pub rec_lsn: Option<Lsn>, // Added a recovery lsn for each lsn, the lowest rec_lsn among all dirty page is selected for new redo point
 }
 
 /// Internal state of a buffer pool shard, protected by a mutex.
 pub struct ShardInner {
-    pub metadata: Vec<FrameMetadata>,
+    pub metadata: Vec<FrameMetadata>, 
     pub page_table: HashMap<u64, usize>,
     pub free_list: Vec<usize>,
     pub replacer: ClockReplacer,
