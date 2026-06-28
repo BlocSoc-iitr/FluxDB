@@ -291,19 +291,12 @@ impl BufferPoolManager {
         })
     }
 
-    /// Returns the min rec_lsn among all the frame or None if no
+    /// Returns the min rec_lsn among all the frame by comparing minimun lsn of the shards
     ///This point is the redo point
     pub fn min_rec_lsn(&self) -> Option<Lsn> {
         self.shards
             .iter()
-            .flat_map(|shard| {
-                let inner = shard.inner.lock().unwrap();
-                inner
-                    .metadata
-                    .iter()
-                    .filter_map(|m| if m.is_dirty { m.rec_lsn } else { None })
-                    .collect::<Vec<_>>()
-            })
+            .filter_map(|shard| shard.inner.lock().unwrap().min_rec_lsn)
             .min()
     }
 }

@@ -151,6 +151,7 @@ pub struct ShardInner {
     pub page_table: HashMap<u64, usize>,
     pub free_list: Vec<usize>,
     pub replacer: ClockReplacer,
+    pub min_rec_lsn: Option<Lsn>,
 }
 
 /// A shard of the buffer pool, managing a subset of the total frames.
@@ -187,6 +188,7 @@ impl BufferPoolShard {
                 page_table: HashMap::with_capacity(size),
                 free_list,
                 replacer: ClockReplacer::new(size),
+                min_rec_lsn: None,
             }),
             load_done: Condvar::new(),
             wal,
@@ -345,8 +347,19 @@ impl BufferPoolShard {
             inner.metadata[frame_id].is_dirty = true;
             return Err(e);
         } else {
+            let old_rec_lsn = inner.metadata[frame_id].rec_lsn; //saving before clearing it
             //When WRITE is succeded it is safe to clear the lsn
             inner.metadata[frame_id].rec_lsn = None;
+
+            //when page with min_rec_lsn itself is flushed
+            if old_rec_lsn == inner.min_rec_lsn {
+                inner.min_rec_lsn = inner
+                    .metadata
+                    .iter()
+                    .filter(|m| m.is_dirty)
+                    .filter_map(|m| m.rec_lsn)
+                    .min()
+            }
         }
 
         Ok(true)
@@ -468,6 +481,11 @@ impl BufferPoolShard {
             //Check if it is the first change after the checkpoint
             if was_clean {
                 meta.rec_lsn = Some(lsn);
+
+                //Comparing the recent lsn with min_rec_lsn of the shard and update it
+                if inner.min_rec_lsn == None || lsn < inner.min_rec_lsn.unwrap() {
+                    inner.min_rec_lsn = Some(lsn);
+                }
                 return page_lsn_before <= redo_point;
             }
         }
