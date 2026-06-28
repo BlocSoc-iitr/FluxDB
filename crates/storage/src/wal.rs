@@ -87,6 +87,7 @@ pub enum WalRecordType {
     UnlinkPage = 10,
     Checkpoint = 11,
     OverflowWrite = 12,
+    OverflowFree = 13,
 }
 
 impl TryFrom<u8> for WalRecordType {
@@ -106,6 +107,7 @@ impl TryFrom<u8> for WalRecordType {
             10 => Ok(WalRecordType::UnlinkPage),
             11 => Ok(WalRecordType::Checkpoint),
             12 => Ok(WalRecordType::OverflowWrite),
+            13 => Ok(WalRecordType::OverflowFree),
             _ => Err(WalError::InvalidEntryType(value)),
         }
     }
@@ -1003,7 +1005,7 @@ impl Wal {
 
     /// Logs a full-page image of one overflow-chain page. One record per page
     /// keeps every record well under the segment size regardless of the total
-    /// value length. 
+    /// value length.
     pub fn log_overflow_write(
         &self,
         txn_id: u64,
@@ -1017,6 +1019,18 @@ impl Wal {
             data: None,
         };
         self.append(WalRecordType::OverflowWrite, txn_id, &[block], None)
+    }
+
+    /// Logs the deallocation of a set of overflow pages during vacuum. The page
+    /// IDs are packed little-endian into the record's main data; redo re-deletes
+    /// each one (idempotent). Logged before the physical `delete_page` so a crash
+    /// can never leave a freed page referenced by a still-live record.
+    pub fn log_overflow_free(&self, txn_id: u64, page_ids: &[PageId]) -> Result<Lsn> {
+        let mut payload = Vec::with_capacity(page_ids.len() * 8);
+        for pid in page_ids {
+            payload.extend_from_slice(&pid.to_le_bytes());
+        }
+        self.append(WalRecordType::OverflowFree, txn_id, &[], Some(&payload))
     }
 
     /// Appends a new physiological record to the WAL buffer.

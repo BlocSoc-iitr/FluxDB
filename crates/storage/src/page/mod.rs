@@ -15,7 +15,8 @@ pub use leaf::{
     LeafPageAccessor, LeafPageBuilder, LeafPageMutator, REC_TYPE_INLINE, REC_TYPE_OVERFLOW,
 };
 pub use overflow::{
-    OverflowDescriptor, free_overflow_chain, read_overflow_chain, write_overflow_chain,
+    OverflowDescriptor, collect_overflow_page_ids, free_overflow_chain, read_overflow_chain,
+    write_overflow_chain,
 };
 
 pub use common::PageError;

@@ -69,6 +69,12 @@ impl RecoveryManager {
             match record.entry_type {
                 WalRecordType::Commit => self.tm.mark_committed(record.txn_id),
                 WalRecordType::Abort => self.tm.mark_aborted(record.txn_id),
+                // OverflowFree carries no page blocks — it lists freed overflow
+                // page IDs in main_data. Re-delete each (idempotent on absent
+                // pages)
+                WalRecordType::OverflowFree => self.redo_overflow_free(&record)?,
+                // OverflowWrite carries a full-page image and is replayed by the
+                // generic FPI path in redo_record — no physiological apply needed.
                 _ => self.redo_record::<K, V>(&record)?,
             }
         }
@@ -85,6 +91,20 @@ impl RecoveryManager {
         self.tm.next_txn_id.fetch_max(max_txn + 1, Ordering::AcqRel);
 
         self.pool.flush_all_pages()?;
+        Ok(())
+    }
+
+    /// Replay an `OverflowFree` record: delete every overflow page listed in
+    /// `main_data`. `delete_page` is idempotent on pages absent from the pool,
+    /// so replaying an already-applied free is harmless.
+    fn redo_overflow_free(&self, record: &WalRecord) -> Result<()> {
+        let data = record
+            .main_data
+            .expect("OverflowFree record missing main data");
+        for chunk in data.chunks_exact(8) {
+            let page_id = u64::from_le_bytes(chunk.try_into().unwrap());
+            self.pool.delete_page(page_id)?;
+        }
         Ok(())
     }
 

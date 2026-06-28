@@ -250,6 +250,27 @@ pub fn read_overflow_chain(
     Ok(result)
 }
 
+/// Walk an overflow chain from `first_page_id` and return every page ID it
+/// contains. Used before deallocation so the full free set can be WAL-logged
+/// (the descriptor only stores `first_page_id`; the rest live in `next_page_id`
+/// links).
+pub fn collect_overflow_page_ids(
+    first_page_id: PageId,
+    pool: &BufferPoolManager,
+) -> Result<Vec<PageId>, IndexError> {
+    let mut ids = Vec::new();
+    let mut current_page_id = Some(first_page_id);
+
+    while let Some(pid) = current_page_id {
+        let guard = pool.fetch_page(pid)?;
+        let acc = OverflowPageAccessor::new(&guard[..]);
+        ids.push(pid);
+        current_page_id = acc.next_page_id();
+    }
+
+    Ok(ids)
+}
+
 pub fn free_overflow_chain(
     first_page_id: PageId,
     pool: &BufferPoolManager,

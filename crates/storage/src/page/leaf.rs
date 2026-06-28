@@ -579,13 +579,17 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
     ///
     /// This rebuilds the page in-place, keeping only records that are NOT
     /// considered vacuumable under the current `global_xmin` horizon.
-    /// Returns the number of records removed.
+    ///
+    /// Returns `(removed, orphaned_chains)` where `removed` is the number of
+    /// records dropped and `orphaned_chains` holds the `first_page_id` of every
+    /// vacuumed *overflow* record. The page layer cannot reach the buffer pool,
+    /// so the caller ([`crate::index::BTreeIndex::vacuum`]) frees those chains.
     pub fn compact(
         page_id: PageId,
         page_data: &mut [u8],
         horizon: u64,
         tm: &TransactionManager,
-    ) -> usize {
+    ) -> (usize, Vec<PageId>) {
         let acc = LeafPageAccessor::<K, V>::new(page_data);
         let n = acc.num_pairs() as usize;
 
@@ -594,6 +598,7 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
         type LiveRecord = (Vec<u8>, Vec<u8>, u8, u64, u64);
         let mut live: Vec<LiveRecord> = Vec::with_capacity(n);
         let mut dead_count = 0;
+        let mut orphaned_chains: Vec<PageId> = Vec::new();
 
         for i in 0..n {
             let xmin = acc.get_xmin(i);
@@ -601,6 +606,11 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
 
             if transaction::is_vacuumable(xmin, xmax, horizon, tm) {
                 dead_count += 1;
+                // Record the overflow chain so the caller can free it; the
+                // descriptor disappears once the record bytes are dropped.
+                if let Some(desc) = acc.overflow_descriptor(i) {
+                    orphaned_chains.push(desc.first_page_id);
+                }
                 continue;
             }
 
@@ -612,7 +622,7 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
 
         // 2. If no records were removed, don't touch the page.
         if dead_count == 0 {
-            return 0;
+            return (0, Vec::new());
         }
 
         // 3. Preserve page metadata before clearing.
@@ -635,7 +645,7 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
         let mut m = builder.finish();
         m.set_lsn(lsn);
 
-        dead_count
+        (dead_count, orphaned_chains)
     }
 }
 
@@ -1098,7 +1108,7 @@ mod tests {
             b.finish();
         }
 
-        let removed = LeafPageMutator::<K, V>::compact(1, buf.memory_mut(), 15, &tm);
+        let (removed, _chains) = LeafPageMutator::<K, V>::compact(1, buf.memory_mut(), 15, &tm);
         assert_eq!(removed, 2);
 
         let acc = LeafPageAccessor::<K, V>::new(buf.memory());
@@ -1116,7 +1126,7 @@ mod tests {
             b.finish();
         }
 
-        let removed = LeafPageMutator::<K, V>::compact(1, buf.memory_mut(), 100, &tm);
+        let (removed, _chains) = LeafPageMutator::<K, V>::compact(1, buf.memory_mut(), 100, &tm);
         assert_eq!(removed, 0);
         assert_eq!(LeafPageAccessor::<K, V>::new(buf.memory()).num_pairs(), 1);
     }
