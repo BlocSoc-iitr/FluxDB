@@ -1,5 +1,6 @@
 use crate::buffer_pool::shard::{BufferPoolShard, PageReadGuard, PageWriteGuard};
 use crate::disk::DiskManager;
+use crate::page::Lsn;
 use crate::wal::Wal;
 use common::{BufferPoolError, MAX_FRAMES, NUM_SHARDS, SHARD_MASK};
 use std::cmp::max;
@@ -9,7 +10,7 @@ pub type Result<T> = std::result::Result<T, BufferPoolError>;
 
 /// The main manager for the buffer pool, providing a partitioned cache for disk pages.
 pub struct BufferPoolManager {
-    shards: Vec<BufferPoolShard>,
+    pub(crate) shards: Vec<BufferPoolShard>,
     next_page_id: Mutex<u64>,
 }
 
@@ -78,6 +79,7 @@ impl BufferPoolManager {
             page_id,
             guard: Some(data),
             dirty: false,
+            record_lsn: None,
         })
     }
 
@@ -184,6 +186,7 @@ impl BufferPoolManager {
             page_id,
             guard: Some(data),
             dirty: false,
+            record_lsn: None,
         })
     }
 
@@ -284,6 +287,16 @@ impl BufferPoolManager {
             page_id,
             guard: Some(data),
             dirty: false,
+            record_lsn: None,
         })
+    }
+
+    /// Returns the min rec_lsn among all the frame by comparing minimun lsn of the shards
+    ///This point is the redo point
+    pub fn min_rec_lsn(&self) -> Option<Lsn> {
+        self.shards
+            .iter()
+            .filter_map(|shard| shard.inner.lock().unwrap().min_rec_lsn)
+            .min()
     }
 }
