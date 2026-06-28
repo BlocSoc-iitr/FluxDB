@@ -18,7 +18,8 @@ use crate::buffer_pool::{BufferPoolManager, PageReadGuard, PageWriteGuard};
 use crate::page::{
     INTERNAL, InternalPageAccessor, InternalPageBuilder, InternalPageMutator, LEAF,
     LeafPageAccessor, LeafPageBuilder, LeafPageMutator, OVERFLOW_THRESHOLD, PAGE_SIZE, PageId,
-    REC_TYPE_INLINE, REC_TYPE_OVERFLOW, read_overflow_chain, write_overflow_chain,
+    REC_TYPE_INLINE, REC_TYPE_OVERFLOW, collect_overflow_page_ids, free_overflow_chain,
+    read_overflow_chain, write_overflow_chain,
 };
 use crate::wal::Wal;
 use common::IndexError;
@@ -98,12 +99,34 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         loop {
             let mut guard = self.pool.fetch_page_mut(leaf_pid)?;
 
-            total_dead +=
+            let (dead, chains) =
                 LeafPageMutator::<K, V>::compact(leaf_pid, &mut guard[..], global_xmin, tm);
+            total_dead += dead;
+
+            // WAL: log the compacted leaf as an FPI so recovery replays the
+            // post-vacuum page and never resurrects a record pointing at a freed
+            // overflow chain. Stamp the returned LSN so the WAL-before-page gate
+            // flushes this record before the compacted leaf reaches disk. Vacuum
+            // is a system operation, so it uses txn_id 0 (recovery skips it).
+            if dead > 0 {
+                let image: &[u8; PAGE_SIZE] = (&guard[..]).try_into().unwrap();
+                let lsn = self.wal.log_page_compact(SYSTEM_TXN_ID, leaf_pid, image)?;
+                LeafPageMutator::<K, V>::new(&mut guard[..]).set_lsn(lsn);
+            }
 
             let acc = LeafPageAccessor::<K, V>::new(&guard[..]);
             let next = acc.rightlink();
             drop(guard);
+
+            // Free the overflow chains orphaned by this page. Log the full set of
+            // page IDs before the physical delete (log-before-delete). These
+            // chains belong to records below the vacuum horizon, invisible to
+            // every active snapshot, so no reader can be traversing them.
+            for first_page_id in chains {
+                let ids = collect_overflow_page_ids(first_page_id, &self.pool)?;
+                self.wal.log_overflow_free(SYSTEM_TXN_ID, &ids)?;
+                free_overflow_chain(first_page_id, &self.pool)?;
+            }
 
             match next {
                 Some(pid) => leaf_pid = pid,

@@ -25,7 +25,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
 
         // ── Try compaction first (design doc 25: bottom-up deletion) ──
         let global_xmin = txn.tm.global_xmin();
-        let dead_count = LeafPageMutator::<K, V>::compact(
+        let (dead_count, chains) = LeafPageMutator::<K, V>::compact(
             leaf_pid_actual,
             &mut leaf_guard[..],
             global_xmin,
@@ -39,6 +39,13 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 .wal
                 .log_page_compact(SYSTEM_TXN_ID, leaf_pid_actual, fpi)?;
             LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
+
+            // Free overflow chains orphaned by the compaction (log-before-delete).
+            for first_page_id in &chains {
+                let ids = collect_overflow_page_ids(*first_page_id, &self.pool)?;
+                self.wal.log_overflow_free(SYSTEM_TXN_ID, &ids)?;
+                free_overflow_chain(*first_page_id, &self.pool)?;
+            }
 
             let key_bytes = K::as_bytes(key);
             let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
