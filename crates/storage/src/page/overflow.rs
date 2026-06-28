@@ -187,11 +187,15 @@ impl<'a> OverflowPageMutator<'a> {
 }
 
 use crate::buffer_pool::BufferPoolManager;
+use crate::page::PAGE_SIZE;
+use crate::wal::Wal;
 use common::IndexError;
 
 pub fn write_overflow_chain(
     value: &[u8],
     pool: &BufferPoolManager,
+    wal: &Wal,
+    txn_id: u64,
 ) -> Result<OverflowDescriptor, IndexError> {
     let total_size = value.len() as u32;
     let chunks: Vec<&[u8]> = value.chunks(OVERFLOW_PAYLOAD_SIZE).collect();
@@ -217,6 +221,10 @@ pub fn write_overflow_chain(
         builder.set_next_page_id(next_page_id);
         builder.set_chunk(chunks[i])?;
         builder.finish();
+
+        let image: &[u8; PAGE_SIZE] = (&guards[i][..]).try_into().unwrap();
+        let lsn = wal.log_overflow_write(txn_id, page_id, image)?;
+        OverflowPageMutator::new(&mut guards[i][..]).set_lsn(lsn);
     }
 
     Ok(OverflowDescriptor {

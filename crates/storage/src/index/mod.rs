@@ -171,11 +171,11 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
     /// are written to a freshly allocated overflow page chain and the record
     /// stores a serialized [`OverflowDescriptor`] instead. Returns the bytes to
     /// place in the record together with the record-type byte.
-    fn materialize_value(&self, val_bytes: &[u8]) -> Result<(Vec<u8>, u8)> {
+    fn materialize_value(&self, val_bytes: &[u8], txn_id: u64) -> Result<(Vec<u8>, u8)> {
         if val_bytes.len() <= OVERFLOW_THRESHOLD {
             Ok((val_bytes.to_vec(), REC_TYPE_INLINE))
         } else {
-            let desc = write_overflow_chain(val_bytes, &self.pool)?;
+            let desc = write_overflow_chain(val_bytes, &self.pool, &self.wal, txn_id)?;
             Ok((desc.to_bytes().to_vec(), REC_TYPE_OVERFLOW))
         }
     }
@@ -282,7 +282,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
 
             // Spill the value to an overflow chain now if it exceeds the inline threshold;
             let val_bytes = V::as_bytes(value);
-            let (stored_val, rec_type) = self.materialize_value(val_bytes.as_ref())?;
+            let (stored_val, rec_type) = self.materialize_value(val_bytes.as_ref(), txn.txn_id)?;
 
             let result = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).insert_raw(
                 slot,
@@ -497,7 +497,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             // mutating the page, so a pool error here leaves the
             // old version untouched and never orphans overflow pages.
             let val_bytes = V::as_bytes(value);
-            let (stored_val, rec_type) = self.materialize_value(val_bytes.as_ref())?;
+            let (stored_val, rec_type) = self.materialize_value(val_bytes.as_ref(), txn.txn_id)?;
 
             // ── ATOMIC: set xmax on old + insert new (same latch) ────────────
             let page_id = leaf_guard.page_id;

@@ -86,6 +86,7 @@ pub enum WalRecordType {
     MarkHalfDead = 9,
     UnlinkPage = 10,
     Checkpoint = 11,
+    OverflowWrite = 12,
 }
 
 impl TryFrom<u8> for WalRecordType {
@@ -104,6 +105,7 @@ impl TryFrom<u8> for WalRecordType {
             9 => Ok(WalRecordType::MarkHalfDead),
             10 => Ok(WalRecordType::UnlinkPage),
             11 => Ok(WalRecordType::Checkpoint),
+            12 => Ok(WalRecordType::OverflowWrite),
             _ => Err(WalError::InvalidEntryType(value)),
         }
     }
@@ -997,6 +999,24 @@ impl Wal {
             data: None,
         };
         self.append(WalRecordType::PageCompact, txn_id, &[block], None)
+    }
+
+    /// Logs a full-page image of one overflow-chain page. One record per page
+    /// keeps every record well under the segment size regardless of the total
+    /// value length. 
+    pub fn log_overflow_write(
+        &self,
+        txn_id: u64,
+        page_id: PageId,
+        image: &[u8; PAGE_SIZE],
+    ) -> Result<Lsn> {
+        let block = Block {
+            page_id,
+            blk_flags: BLK_HAS_FPI,
+            fpi: Some(image),
+            data: None,
+        };
+        self.append(WalRecordType::OverflowWrite, txn_id, &[block], None)
     }
 
     /// Appends a new physiological record to the WAL buffer.
