@@ -906,7 +906,12 @@ fn write_read_single_page_chain() {
     let desc = write_overflow_chain(&value, &pool, &wal, 1).unwrap();
 
     assert_eq!(desc.total_size as usize, value.len());
-    assert_eq!(collect_overflow_page_ids(desc.first_page_id, &pool).unwrap().len(), 1);
+    assert_eq!(
+        collect_overflow_page_ids(desc.first_page_id, &pool)
+            .unwrap()
+            .len(),
+        1
+    );
     assert_eq!(read_overflow_chain(desc, &pool).unwrap(), value);
 }
 
@@ -925,7 +930,11 @@ fn write_read_multi_page_chain() {
     let mut sorted = ids.clone();
     sorted.sort_unstable();
     sorted.dedup();
-    assert_eq!(sorted.len(), ids.len(), "chain contains a duplicate page id");
+    assert_eq!(
+        sorted.len(),
+        ids.len(),
+        "chain contains a duplicate page id"
+    );
 
     assert_eq!(read_overflow_chain(desc, &pool).unwrap(), value);
 }
@@ -936,7 +945,12 @@ fn chain_length_matches_value_size() {
     let (pool, wal, _tm, _idx) = build_db(dir.path());
 
     // Boundary sizes around the payload limit: empty-ish, exact, one-over, multi.
-    for &len in &[1usize, OVERFLOW_PAYLOAD, OVERFLOW_PAYLOAD + 1, OVERFLOW_PAYLOAD * 3] {
+    for &len in &[
+        1usize,
+        OVERFLOW_PAYLOAD,
+        OVERFLOW_PAYLOAD + 1,
+        OVERFLOW_PAYLOAD * 3,
+    ] {
         let value = big_value(len);
         let desc = write_overflow_chain(&value, &pool, &wal, 1).unwrap();
         let pages = collect_overflow_page_ids(desc.first_page_id, &pool).unwrap();
@@ -975,7 +989,12 @@ fn write_chain_logs_one_overflow_write_per_page() {
     // `create` logs nothing, so every record below is from write_overflow_chain.
     let value = big_value(OVERFLOW_PAYLOAD * 3 - 10); // 3 pages
     let desc = write_overflow_chain(&value, &pool, &wal, 1).unwrap();
-    assert_eq!(collect_overflow_page_ids(desc.first_page_id, &pool).unwrap().len(), 3);
+    assert_eq!(
+        collect_overflow_page_ids(desc.first_page_id, &pool)
+            .unwrap()
+            .len(),
+        3
+    );
 
     // Make the records durable so the iterator can read them off disk.
     wal.flush_up_to(wal.next_lsn()).unwrap();
@@ -993,7 +1012,10 @@ fn write_chain_logs_one_overflow_write_per_page() {
             );
         }
     }
-    assert_eq!(overflow_writes, 3, "one OverflowWrite record per overflow page");
+    assert_eq!(
+        overflow_writes, 3,
+        "one OverflowWrite record per overflow page"
+    );
 }
 
 // ── Overflow through the B+Tree (Layer C) ─────────────────────────────
@@ -1036,7 +1058,10 @@ fn insert_large_value_stored_as_overflow_record() {
     let page = idx.pool.fetch_page(leaf_pid).unwrap();
     let acc = LeafPageAccessor::<&[u8], &[u8]>::new(&page[..]);
     let slot = acc.find_key(&k).unwrap();
-    assert!(acc.is_overflow(slot), "large value must be tagged as overflow");
+    assert!(
+        acc.is_overflow(slot),
+        "large value must be tagged as overflow"
+    );
     assert_eq!(
         acc.raw_value(slot).len(),
         12,
@@ -1062,7 +1087,8 @@ fn update_inline_to_overflow() {
 fn update_overflow_to_inline() {
     let idx = make_index();
     let k: &[u8] = b"k";
-    idx.insert(&k, &overflow_sized().as_slice(), &auto()).unwrap();
+    idx.insert(&k, &overflow_sized().as_slice(), &auto())
+        .unwrap();
 
     idx.update(&k, &(&b"small"[..]), &auto()).unwrap();
     assert_eq!(idx.get(&k, &auto()).unwrap().unwrap(), b"small");
@@ -1087,7 +1113,8 @@ fn update_overflow_to_larger_overflow() {
 fn delete_overflow_then_invisible() {
     let idx = make_index();
     let k: &[u8] = b"k";
-    idx.insert(&k, &overflow_sized().as_slice(), &auto()).unwrap();
+    idx.insert(&k, &overflow_sized().as_slice(), &auto())
+        .unwrap();
     idx.delete(&k, &auto()).unwrap();
     assert!(idx.get(&k, &auto()).unwrap().is_none());
 }
@@ -1145,11 +1172,17 @@ fn split_preserves_overflow_descriptor() {
     }
 
     // The tree really split (root is now internal).
-    assert_eq!(idx.pool.fetch_page(idx.root_page_id()).unwrap()[0], INTERNAL);
+    assert_eq!(
+        idx.pool.fetch_page(idx.root_page_id()).unwrap()[0],
+        INTERNAL
+    );
 
     // The overflow value is intact after the split…
     let big_key = 150u32.to_be_bytes();
-    assert_eq!(idx.get(&(big_key.as_ref()), &auto()).unwrap().unwrap(), big_val);
+    assert_eq!(
+        idx.get(&(big_key.as_ref()), &auto()).unwrap().unwrap(),
+        big_val
+    );
     // …and so is an inline neighbour.
     let neighbour = 149u32.to_be_bytes();
     assert_eq!(
