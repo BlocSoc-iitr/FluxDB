@@ -878,3 +878,120 @@ fn clog_reconstructed_after_crash() {
     );
     assert_eq!(tm.settled_status(inflight_id), TransactionStatus::Aborted);
 }
+
+// ── Overflow chain helpers (Layer B) ──────────────────────────────────
+//
+// These exercise write_overflow_chain / read_overflow_chain /
+// collect_overflow_page_ids / free_overflow_chain directly against a real
+// buffer pool + WAL, independent of the B+Tree. They bypass OVERFLOW_THRESHOLD
+// (the helpers always spill), so values smaller than the threshold are fine here.
+
+/// Bytes per overflow page payload. Mirrors the private OVERFLOW_PAYLOAD_SIZE in
+/// page::overflow; kept in sync by `chain_length_matches_value_size` below, which
+/// would fail if the real constant ever diverges from this value.
+const OVERFLOW_PAYLOAD: usize = 4048;
+
+/// A value with a non-repeating, page-boundary-crossing byte pattern so a
+/// mis-assembled chain (wrong order, dropped/duplicated page) is detected.
+fn big_value(n: usize) -> Vec<u8> {
+    (0..n).map(|i| (i % 251) as u8).collect()
+}
+
+#[test]
+fn write_read_single_page_chain() {
+    let dir = tempdir().unwrap();
+    let (pool, wal, _tm, _idx) = build_db(dir.path());
+
+    let value = big_value(1000); // < one page
+    let desc = write_overflow_chain(&value, &pool, &wal, 1).unwrap();
+
+    assert_eq!(desc.total_size as usize, value.len());
+    assert_eq!(collect_overflow_page_ids(desc.first_page_id, &pool).unwrap().len(), 1);
+    assert_eq!(read_overflow_chain(desc, &pool).unwrap(), value);
+}
+
+#[test]
+fn write_read_multi_page_chain() {
+    let dir = tempdir().unwrap();
+    let (pool, wal, _tm, _idx) = build_db(dir.path());
+
+    // 6 pages: five full payloads plus a 7-byte tail.
+    let value = big_value(OVERFLOW_PAYLOAD * 5 + 7);
+    let desc = write_overflow_chain(&value, &pool, &wal, 1).unwrap();
+
+    let ids = collect_overflow_page_ids(desc.first_page_id, &pool).unwrap();
+    assert_eq!(ids.len(), 6, "expected six pages in the chain");
+    // Page IDs are distinct (no self-link / cycle).
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), ids.len(), "chain contains a duplicate page id");
+
+    assert_eq!(read_overflow_chain(desc, &pool).unwrap(), value);
+}
+
+#[test]
+fn chain_length_matches_value_size() {
+    let dir = tempdir().unwrap();
+    let (pool, wal, _tm, _idx) = build_db(dir.path());
+
+    // Boundary sizes around the payload limit: empty-ish, exact, one-over, multi.
+    for &len in &[1usize, OVERFLOW_PAYLOAD, OVERFLOW_PAYLOAD + 1, OVERFLOW_PAYLOAD * 3] {
+        let value = big_value(len);
+        let desc = write_overflow_chain(&value, &pool, &wal, 1).unwrap();
+        let pages = collect_overflow_page_ids(desc.first_page_id, &pool).unwrap();
+        assert_eq!(
+            pages.len(),
+            len.div_ceil(OVERFLOW_PAYLOAD),
+            "wrong page count for value of {len} bytes"
+        );
+        assert_eq!(read_overflow_chain(desc, &pool).unwrap(), value);
+    }
+}
+
+#[test]
+fn free_chain_then_rewrite_roundtrips() {
+    let dir = tempdir().unwrap();
+    let (pool, wal, _tm, _idx) = build_db(dir.path());
+
+    let value = big_value(OVERFLOW_PAYLOAD * 3);
+    let desc = write_overflow_chain(&value, &pool, &wal, 1).unwrap();
+    let freed = collect_overflow_page_ids(desc.first_page_id, &pool).unwrap();
+    assert_eq!(freed.len(), 3);
+
+    // Freeing must succeed and leave the pool usable: a fresh chain of the same
+    // value writes and reads back identically (no corrupted frame bookkeeping).
+    free_overflow_chain(desc.first_page_id, &pool).unwrap();
+
+    let desc2 = write_overflow_chain(&value, &pool, &wal, 2).unwrap();
+    assert_eq!(read_overflow_chain(desc2, &pool).unwrap(), value);
+}
+
+#[test]
+fn write_chain_logs_one_overflow_write_per_page() {
+    let dir = tempdir().unwrap();
+    let (pool, wal, _tm, _idx) = build_db(dir.path());
+
+    // `create` logs nothing, so every record below is from write_overflow_chain.
+    let value = big_value(OVERFLOW_PAYLOAD * 3 - 10); // 3 pages
+    let desc = write_overflow_chain(&value, &pool, &wal, 1).unwrap();
+    assert_eq!(collect_overflow_page_ids(desc.first_page_id, &pool).unwrap().len(), 3);
+
+    // Make the records durable so the iterator can read them off disk.
+    wal.flush_up_to(wal.next_lsn()).unwrap();
+
+    let mut it = WalIterator::new(dir.path().join("wal")).unwrap();
+    let mut overflow_writes = 0;
+    while let Some(rec) = it.next_record() {
+        let rec = rec.unwrap();
+        if rec.entry_type == WalRecordType::OverflowWrite {
+            overflow_writes += 1;
+            assert_eq!(rec.blocks.len(), 1, "OverflowWrite carries one block");
+            assert!(
+                rec.blocks[0].fpi.is_some(),
+                "OverflowWrite block must carry a full-page image"
+            );
+        }
+    }
+    assert_eq!(overflow_writes, 3, "one OverflowWrite record per overflow page");
+}
