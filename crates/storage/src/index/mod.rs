@@ -375,13 +375,17 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                     // is enforced lazily by the buffer pool's WAL-before-page gate or at
                     // commit, never fsynced at insert time. Stamp the record's LSN as the
                     // page LSN so the gate flushes the WAL through it before the page lands.
-                    // For overflow records `stored_val` is the descriptor;                     // pages get their own WAL records in milestone 4.
+                    // For overflow records `stored_val` is the descriptor; the
+                    // overflow pages get their own WAL records via
+                    // write_overflow_chain. rec_type is logged so recovery
+                    // replays the record with the right inline/overflow tag.
                     let lsn = self.wal.log_insert(
                         txn.txn_id,
                         page_id,
                         slot as u16,
                         key_bytes.as_ref(),
                         &stored_val,
+                        rec_type,
                         txn.txn_id,
                     )?;
                     LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
@@ -634,6 +638,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                     slot as u16,
                     key_bytes.as_ref(),
                     &stored_val,
+                    rec_type,
                     txn.txn_id,
                 )?;
                 let mut m = LeafPageMutator::<K, V>::new(&mut vis_guard[..]);

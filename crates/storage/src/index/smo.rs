@@ -64,6 +64,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                     slot as u16,
                     key_bytes.as_ref(),
                     stored_val,
+                    rec_type,
                     txn.txn_id,
                 )?;
                 LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
@@ -93,6 +94,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 s as u16,
                 key_bytes.as_ref(),
                 stored_val,
+                rec_type,
                 txn.txn_id,
             )?;
             LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
@@ -145,6 +147,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 s as u16,
                 key_bytes.as_ref(),
                 stored_val,
+                rec_type,
                 txn.txn_id,
             )?;
             LeafPageMutator::<K, V>::new(&mut right[..]).set_lsn(lsn);
