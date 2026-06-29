@@ -8,3 +8,6 @@ common = { path = "crates/common" }
 storage = {path = "crates/storage"}
 thiserror = "1"
 db-core = { path = "crates/db-core"}
+
+[profile.release]
+debug = true
