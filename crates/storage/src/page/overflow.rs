@@ -291,3 +291,159 @@ pub fn free_overflow_chain(
 
     Ok(())
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::page::{OFF_PAGE_TYPE, PageBuffer, read_u8};
+
+    // ── OverflowDescriptor ────────────────────────────────────────────────────
+
+    #[test]
+    fn descriptor_round_trip() {
+        let desc = OverflowDescriptor {
+            first_page_id: 0xDEAD_BEEF,
+            total_size: 123_456,
+        };
+        let bytes = desc.to_bytes();
+        assert_eq!(bytes.len(), OVERFLOW_DESCRIPTOR_SIZE);
+        assert_eq!(OverflowDescriptor::from_bytes(&bytes), Some(desc));
+    }
+
+    #[test]
+    fn descriptor_from_short_bytes_is_none() {
+        // One byte short of a full descriptor → cannot decode.
+        let short = [0u8; OVERFLOW_DESCRIPTOR_SIZE - 1];
+        assert_eq!(OverflowDescriptor::from_bytes(&short), None);
+    }
+
+    #[test]
+    fn descriptor_from_bytes_ignores_trailing_bytes() {
+        // A buffer longer than the descriptor decodes from its 12-byte prefix.
+        let desc = OverflowDescriptor {
+            first_page_id: 7,
+            total_size: 9,
+        };
+        let mut buf = desc.to_bytes().to_vec();
+        buf.extend_from_slice(&[0xAB; 4]);
+        assert_eq!(OverflowDescriptor::from_bytes(&buf), Some(desc));
+    }
+
+    // ── Builder / accessor ────────────────────────────────────────────────────
+
+    #[test]
+    fn builder_stamps_header() {
+        let mut buf = PageBuffer::new();
+        let chunk = [0x5Au8; 100];
+        {
+            let mut b = OverflowPageBuilder::new(42, buf.memory_mut());
+            b.set_next_page_id(Some(43));
+            b.set_chunk(&chunk).unwrap();
+            b.finish();
+        }
+
+        assert_eq!(read_u8(buf.memory(), OFF_PAGE_TYPE), OVERFLOW);
+        let acc = OverflowPageAccessor::new(buf.memory());
+        assert_eq!(acc.page_id(), 42);
+        assert_eq!(acc.next_page_id(), Some(43));
+        assert_eq!(acc.chunk_len() as usize, chunk.len());
+        assert_eq!(acc.payload(), &chunk[..]);
+    }
+
+    #[test]
+    fn accessor_reads_payload_without_zero_tail() {
+        // payload() must return exactly chunk_len bytes, not the zeroed remainder.
+        let mut buf = PageBuffer::new();
+        let chunk = [0xFFu8; 10];
+        {
+            let mut b = OverflowPageBuilder::new(1, buf.memory_mut());
+            b.set_chunk(&chunk).unwrap();
+            b.finish();
+        }
+        let acc = OverflowPageAccessor::new(buf.memory());
+        assert_eq!(acc.payload().len(), 10);
+        assert!(acc.payload().iter().all(|&b| b == 0xFF));
+    }
+
+    #[test]
+    fn next_page_id_none_when_zero() {
+        // A terminal page (next = 0) reports None, not Some(0).
+        let mut buf = PageBuffer::new();
+        {
+            let mut b = OverflowPageBuilder::new(1, buf.memory_mut());
+            b.set_next_page_id(None);
+            b.set_chunk(&[1, 2, 3]).unwrap();
+            b.finish();
+        }
+        assert_eq!(OverflowPageAccessor::new(buf.memory()).next_page_id(), None);
+    }
+
+    // ── Chunk capacity bounds ─────────────────────────────────────────────────
+
+    #[test]
+    fn set_chunk_at_exact_capacity_ok() {
+        let mut buf = PageBuffer::new();
+        let chunk = vec![0xABu8; OVERFLOW_PAYLOAD_SIZE];
+        let mut b = OverflowPageBuilder::new(1, buf.memory_mut());
+        assert!(b.set_chunk(&chunk).is_ok());
+        // Header + full payload exactly fills the page.
+        assert_eq!(OVERFLOW_HEADER_SIZE + OVERFLOW_PAYLOAD_SIZE, PAGE_SIZE);
+    }
+
+    #[test]
+    fn set_chunk_rejects_oversized() {
+        let mut buf = PageBuffer::new();
+        let chunk = vec![0u8; OVERFLOW_PAYLOAD_SIZE + 1];
+        let mut b = OverflowPageBuilder::new(1, buf.memory_mut());
+        match b.set_chunk(&chunk) {
+            Err(PageError::InsufficientSpace { needed, available }) => {
+                assert_eq!(needed, OVERFLOW_PAYLOAD_SIZE + 1);
+                assert_eq!(available, OVERFLOW_PAYLOAD_SIZE);
+            }
+            other => panic!("expected InsufficientSpace, got {:?}", other),
+        }
+    }
+
+    // ── Mutator ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn mutator_set_lsn_and_next_round_trip() {
+        let mut buf = PageBuffer::new();
+        {
+            let mut b = OverflowPageBuilder::new(7, buf.memory_mut());
+            b.set_next_page_id(None);
+            b.set_chunk(&[9, 9, 9]).unwrap();
+            b.finish();
+        }
+        {
+            let mut m = OverflowPageMutator::new(buf.memory_mut());
+            m.set_lsn(12345);
+            m.set_next_page_id(Some(8));
+            // as_accessor sees the in-progress mutations under the same borrow.
+            let acc = m.as_accessor();
+            assert_eq!(acc.lsn(), 12345);
+            assert_eq!(acc.next_page_id(), Some(8));
+        }
+        let acc = OverflowPageAccessor::new(buf.memory());
+        assert_eq!(acc.lsn(), 12345);
+        assert_eq!(acc.next_page_id(), Some(8));
+    }
+
+    #[test]
+    fn mutator_set_chunk_overwrites_payload() {
+        let mut buf = PageBuffer::new();
+        {
+            let mut b = OverflowPageBuilder::new(1, buf.memory_mut());
+            b.set_chunk(&[1, 1, 1, 1]).unwrap();
+            b.finish();
+        }
+        OverflowPageMutator::new(buf.memory_mut())
+            .set_chunk(&[2, 2])
+            .unwrap();
+        let acc = OverflowPageAccessor::new(buf.memory());
+        assert_eq!(acc.chunk_len(), 2);
+        assert_eq!(acc.payload(), &[2, 2]);
+    }
+}

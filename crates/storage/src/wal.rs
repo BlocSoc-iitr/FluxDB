@@ -807,6 +807,7 @@ impl Wal {
 
     /// Appends only — durability is deferred to the buffer pool's flush seam
     /// (WAL-before-page) or to the transaction's commit, never an fsync here.
+    #[allow(clippy::too_many_arguments)]
     pub fn log_insert(
         &self,
         txn_id: u64,
@@ -814,12 +815,14 @@ impl Wal {
         slot: u16,
         key: &[u8],
         value: &[u8],
+        rec_type: u8,
         xmin: u64,
     ) -> Result<Lsn> {
-        let mut payload = Vec::with_capacity(2 + 2 + 2 + 8 + key.len() + value.len());
+        let mut payload = Vec::with_capacity(2 + 2 + 2 + 1 + 8 + key.len() + value.len());
         payload.extend_from_slice(&slot.to_le_bytes());
         payload.extend_from_slice(&(key.len() as u16).to_le_bytes());
         payload.extend_from_slice(&(value.len() as u16).to_le_bytes());
+        payload.push(rec_type);
         payload.extend_from_slice(&xmin.to_le_bytes());
         payload.extend_from_slice(key);
         payload.extend_from_slice(value);
