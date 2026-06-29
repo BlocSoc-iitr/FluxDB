@@ -995,3 +995,165 @@ fn write_chain_logs_one_overflow_write_per_page() {
     }
     assert_eq!(overflow_writes, 3, "one OverflowWrite record per overflow page");
 }
+
+// ── Overflow through the B+Tree (Layer C) ─────────────────────────────
+//
+// End-to-end insert / update / delete / range / split with values that exceed
+// OVERFLOW_THRESHOLD, so the index spills them to a chain and stores a 12-byte
+// descriptor in the leaf record. Values are local Vecs — insert copies the bytes
+// into the page (and the chain), so nothing needs a 'static lifetime.
+
+/// A value comfortably over the inline threshold (spans ~2 overflow pages).
+fn overflow_sized() -> Vec<u8> {
+    big_value(OVERFLOW_THRESHOLD * 2)
+}
+
+#[test]
+fn insert_large_value_get_reconstructs() {
+    let idx = make_index();
+    let k: &[u8] = b"big";
+    let v = big_value(OVERFLOW_THRESHOLD * 2 + 13);
+
+    idx.insert(&k, &v.as_slice(), &auto()).unwrap();
+
+    // A 12-byte descriptor leaking through instead of a reconstructed value
+    // would fail both the length and the equality check.
+    let got = idx.get(&k, &auto()).unwrap().unwrap();
+    assert_eq!(got.len(), v.len());
+    assert_eq!(got, v);
+}
+
+#[test]
+fn insert_large_value_stored_as_overflow_record() {
+    // White-box: the leaf record itself must be tagged overflow and hold only
+    // the 12-byte descriptor, not the inline value bytes.
+    let idx = make_index();
+    let k: &[u8] = b"big";
+    let v = overflow_sized();
+    idx.insert(&k, &v.as_slice(), &auto()).unwrap();
+
+    let leaf_pid = idx.find_leaf(idx.root_page_id(), &k).unwrap();
+    let page = idx.pool.fetch_page(leaf_pid).unwrap();
+    let acc = LeafPageAccessor::<&[u8], &[u8]>::new(&page[..]);
+    let slot = acc.find_key(&k).unwrap();
+    assert!(acc.is_overflow(slot), "large value must be tagged as overflow");
+    assert_eq!(
+        acc.raw_value(slot).len(),
+        12,
+        "leaf stores the OverflowDescriptor, not the value"
+    );
+    drop(page);
+
+    assert_eq!(idx.get(&k, &auto()).unwrap().unwrap(), v);
+}
+
+#[test]
+fn update_inline_to_overflow() {
+    let idx = make_index();
+    let k: &[u8] = b"k";
+    idx.insert(&k, &(&b"small"[..]), &auto()).unwrap();
+
+    let big = overflow_sized();
+    idx.update(&k, &big.as_slice(), &auto()).unwrap();
+    assert_eq!(idx.get(&k, &auto()).unwrap().unwrap(), big);
+}
+
+#[test]
+fn update_overflow_to_inline() {
+    let idx = make_index();
+    let k: &[u8] = b"k";
+    idx.insert(&k, &overflow_sized().as_slice(), &auto()).unwrap();
+
+    idx.update(&k, &(&b"small"[..]), &auto()).unwrap();
+    assert_eq!(idx.get(&k, &auto()).unwrap().unwrap(), b"small");
+}
+
+#[test]
+fn update_overflow_to_larger_overflow() {
+    let idx = make_index();
+    let k: &[u8] = b"k";
+    let first = big_value(OVERFLOW_THRESHOLD * 2); // ~2 pages
+    let second = big_value(OVERFLOW_THRESHOLD * 4); // ~4 pages
+
+    idx.insert(&k, &first.as_slice(), &auto()).unwrap();
+    idx.update(&k, &second.as_slice(), &auto()).unwrap();
+
+    // The live version reconstructs the new chain; the old chain is orphaned
+    // (still on disk until vacuum) but never surfaces through the live read.
+    assert_eq!(idx.get(&k, &auto()).unwrap().unwrap(), second);
+}
+
+#[test]
+fn delete_overflow_then_invisible() {
+    let idx = make_index();
+    let k: &[u8] = b"k";
+    idx.insert(&k, &overflow_sized().as_slice(), &auto()).unwrap();
+    idx.delete(&k, &auto()).unwrap();
+    assert!(idx.get(&k, &auto()).unwrap().is_none());
+}
+
+#[test]
+fn range_scan_mixes_inline_and_overflow() {
+    let idx = make_index();
+    let n = 20u32;
+
+    // Even keys inline, odd keys overflow (size varies per key so a mix-up
+    // between two overflow records is also caught).
+    let expected = |i: u32| -> Vec<u8> {
+        if i.is_multiple_of(2) {
+            big_value(8)
+        } else {
+            big_value(OVERFLOW_THRESHOLD * 2 + i as usize)
+        }
+    };
+
+    for i in 0..n {
+        let k = i.to_be_bytes();
+        idx.insert(&(k.as_ref()), &expected(i).as_slice(), &auto())
+            .unwrap();
+    }
+
+    let results: Vec<(Vec<u8>, Vec<u8>)> = idx
+        .range::<std::ops::RangeFull>(.., &auto())
+        .map(|r| r.unwrap())
+        .collect();
+
+    assert_eq!(results.len(), n as usize);
+    for (i, (k, v)) in results.iter().enumerate() {
+        let i = i as u32;
+        assert_eq!(k.as_slice(), &i.to_be_bytes()[..], "key out of order");
+        assert_eq!(v, &expected(i), "value mismatch at key {i}");
+    }
+}
+
+#[test]
+fn split_preserves_overflow_descriptor() {
+    let idx = make_index();
+    let big_val = overflow_sized();
+
+    // 300 keys force multiple leaf splits; key 150 carries an overflow value, so
+    // its record must survive split_leaf_ly's raw_value/rec_type carry-through.
+    for i in 0u32..300 {
+        let k = i.to_be_bytes();
+        if i == 150 {
+            idx.insert(&(k.as_ref()), &big_val.as_slice(), &auto())
+                .unwrap();
+        } else {
+            let v = i.to_be_bytes();
+            idx.insert(&(k.as_ref()), &(v.as_ref()), &auto()).unwrap();
+        }
+    }
+
+    // The tree really split (root is now internal).
+    assert_eq!(idx.pool.fetch_page(idx.root_page_id()).unwrap()[0], INTERNAL);
+
+    // The overflow value is intact after the split…
+    let big_key = 150u32.to_be_bytes();
+    assert_eq!(idx.get(&(big_key.as_ref()), &auto()).unwrap().unwrap(), big_val);
+    // …and so is an inline neighbour.
+    let neighbour = 149u32.to_be_bytes();
+    assert_eq!(
+        idx.get(&(neighbour.as_ref()), &auto()).unwrap().unwrap(),
+        neighbour.to_vec()
+    );
+}
