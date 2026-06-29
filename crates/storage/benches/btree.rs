@@ -29,7 +29,7 @@ fn auto() -> Transaction {
     Transaction::new(TEST_TXN_ID.fetch_add(1, Relaxed), Snapshot::latest(), tm)
 }
 
-fn setup_index(n: u32) -> (BTreeIndex<&'static [u8], &'static [u8]>, TempDir) {
+fn setup_index(n: u32) -> (BTreeIndex<u32, u32>, TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test.db");
     let wal = make_wal(dir.path());
@@ -37,21 +37,20 @@ fn setup_index(n: u32) -> (BTreeIndex<&'static [u8], &'static [u8]>, TempDir) {
     let pool = make_pool(disk, wal.clone());
     let (index, _) = BTreeIndex::create(pool, wal).unwrap();
     for i in 0..n {
-        let k = Box::leak(i.to_be_bytes().to_vec().into_boxed_slice());
-        let v = Box::leak((i * 7).to_be_bytes().to_vec().into_boxed_slice());
-        index.insert(&(&k[..]), &(&v[..]), &auto()).unwrap();
+        index.insert(&i, &(i * 7), &auto()).unwrap();
     }
     (index, dir)
 }
 
 fn bench_get_random(c: &mut Criterion) {
-    let (idx, _dir) = setup_index(10_000);
+    let (idx, _dir) = setup_index(4_000);
     let txn = auto();
+    let mut i = 0u32;
     c.bench_function("get_random", |b| {
         b.iter(|| {
-            let k = black_box(5000u32);
-            let key = k.to_be_bytes();
-            black_box(idx.get(&(&key[..]), &txn).unwrap())
+            i = i.wrapping_add(1);
+            let k = black_box(i.wrapping_mul(2654435761) % 4_000);
+            black_box(idx.get(&k, &txn).unwrap())
         })
     });
 }
@@ -62,9 +61,9 @@ fn bench_insert_sequential(c: &mut Criterion) {
             || setup_index(0),
             |(idx, _dir)| {
                 for i in 0u32..1000 {
-                    let k = black_box(i).to_be_bytes();
-                    let v = (i * 7).to_be_bytes();
-                    black_box(idx.insert(&(&k[..]), &(&v[..]), &auto()).unwrap());
+                    let k = black_box(i);
+                    let v = i * 7;
+                    black_box(idx.insert(&k, &v, &auto()).unwrap());
                 }
             },
             BatchSize::SmallInput,
@@ -78,9 +77,9 @@ fn bench_insert_random(c: &mut Criterion) {
             || setup_index(0),
             |(idx, _dir)| {
                 for i in 0u32..1000 {
-                    let k = black_box(i.wrapping_mul(2654435761)).to_be_bytes();
-                    let v = (i * 7).to_be_bytes();
-                    black_box(idx.insert(&(&k[..]), &(&v[..]), &auto()).unwrap());
+                    let k = black_box(i.wrapping_mul(2654435761));
+                    let v = i * 7;
+                    black_box(idx.insert(&k, &v, &auto()).unwrap());
                 }
             },
             BatchSize::SmallInput,
@@ -89,7 +88,7 @@ fn bench_insert_random(c: &mut Criterion) {
 }
 
 fn bench_range_full_scan(c: &mut Criterion) {
-    let (idx, _dir) = setup_index(10_000);
+    let (idx, _dir) = setup_index(4_000);
     let txn = auto();
     c.bench_function("range_full_scan", |b| {
         b.iter(|| {
