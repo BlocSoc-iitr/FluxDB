@@ -19,8 +19,11 @@ use common::{IndexError, Key, Value, WalError};
 use db_core::transaction_manager::TransactionManager;
 
 use crate::buffer_pool::BufferPoolManager;
-use crate::page::{InternalPageMutator, LeafPageMutator};
-use crate::wal::{WalIterator, WalRecord, WalRecordType};
+use crate::page::{ChildSide, InternalPageMutator, LeafPageMutator};
+use crate::wal::{
+    UNLINK_KEEP_RIGHT, UNLINK_ROLE_LEFT, UNLINK_ROLE_PARENT, UNLINK_ROLE_RIGHT, WalIterator,
+    WalRecord, WalRecordType,
+};
 
 pub type Result<T> = std::result::Result<T, IndexError>;
 
@@ -174,6 +177,36 @@ impl RecoveryManager {
                     &K::from_bytes(sep_key),
                     right_child,
                 )?;
+            }
+            (WalRecordType::MarkHalfDead, 0) => {
+                // Single page block: mark the target leaf half-dead.
+                crate::page::set_half_dead(page);
+            }
+            (WalRecordType::UnlinkPage, _) => {
+                // Each UnlinkPage block carries a role byte followed by that
+                // page's redo payload, so block order can stay flexible.
+                let d = data.expect("UnlinkPage record missing data block");
+                match d[0] {
+                    UNLINK_ROLE_LEFT => {
+                        let new_rightlink = u64::from_le_bytes(d[1..9].try_into().unwrap());
+                        LeafPageMutator::<K, V>::new(page).set_rightlink(Some(new_rightlink));
+                    }
+                    UNLINK_ROLE_RIGHT => {
+                        let new_prev = u64::from_le_bytes(d[1..9].try_into().unwrap());
+                        LeafPageMutator::<K, V>::new(page)
+                            .set_prev_page((new_prev != 0).then_some(new_prev));
+                    }
+                    UNLINK_ROLE_PARENT => {
+                        let remove_index = u16::from_le_bytes(d[1..3].try_into().unwrap()) as usize;
+                        let keep = if d[3] == UNLINK_KEEP_RIGHT {
+                            ChildSide::Right
+                        } else {
+                            ChildSide::Left
+                        };
+                        InternalPageMutator::<K>::new(page).remove_key_at(remove_index, keep);
+                    }
+                    role => panic!("unknown UnlinkPage block role {role}"),
+                }
             }
             (WalRecordType::InsertDownLink, 1) => {
                 // child block: clear INCOMPLETE_SPLIT (option A).
