@@ -86,7 +86,7 @@ where
             buffer_pool,
             disk_manager,
             transaction_manager,
-            status_guard:RwLock::new(()),
+            status_guard: RwLock::new(()),
         })
     }
     /// Opens an existing database.
@@ -127,7 +127,7 @@ where
             buffer_pool,
             disk_manager,
             transaction_manager,
-            status_guard:RwLock::new(()),
+            status_guard: RwLock::new(()),
         })
     }
 
