@@ -43,6 +43,9 @@ pub(super) const OFF_LSN: usize = 16; // u64
 /// Page split but its parent lacks the downlink yet (cleared on InsertDownlink).
 pub const FLAG_INCOMPLETE_SPLIT: u8 = 0b0000_0001;
 
+/// Leaf page is logically deleted; searches that land here should follow its rightlink.
+pub const FLAG_HALF_DEAD: u8 = 0b0000_0010;
+
 /// Stamp the LSN of the last WAL record that touched the page (any page type).
 pub fn set_lsn(page: &mut [u8], lsn: u64) {
     write_u64(page, OFF_LSN, lsn);
@@ -52,13 +55,30 @@ pub fn is_incomplete_split(page: &[u8]) -> bool {
     read_u8(page, OFF_FLAGS) & FLAG_INCOMPLETE_SPLIT != 0
 }
 
+/// Returns true when a leaf is marked as pending physical unlink.
+pub fn is_half_dead(page: &[u8]) -> bool {
+    read_u8(page, OFF_FLAGS) & FLAG_HALF_DEAD != 0
+}
+
 pub fn set_incomplete_split(page: &mut [u8]) {
     let f = read_u8(page, OFF_FLAGS) | FLAG_INCOMPLETE_SPLIT;
     write_u8(page, OFF_FLAGS, f);
 }
 
+/// Mark an empty leaf as no longer a valid search destination.
+pub fn set_half_dead(page: &mut [u8]) {
+    let f = read_u8(page, OFF_FLAGS) | FLAG_HALF_DEAD;
+    write_u8(page, OFF_FLAGS, f);
+}
+
 pub fn clear_incomplete_split(page: &mut [u8]) {
     let f = read_u8(page, OFF_FLAGS) & !FLAG_INCOMPLETE_SPLIT;
+    write_u8(page, OFF_FLAGS, f);
+}
+
+/// Clear the half-dead marker, used only if a caller aborts before unlinking.
+pub fn clear_half_dead(page: &mut [u8]) {
+    let f = read_u8(page, OFF_FLAGS) & !FLAG_HALF_DEAD;
     write_u8(page, OFF_FLAGS, f);
 }
 
