@@ -16,6 +16,7 @@ use common::{EngineError, Key, Value};
 use db_core::transaction_manager::TransactionManager;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::RwLock;
 use storage::buffer_pool::BufferPoolManager;
 use storage::disk::DiskManager;
 use storage::index::BTreeIndex;
@@ -45,6 +46,7 @@ where
     #[allow(dead_code)]
     pub(crate) buffer_pool: Arc<BufferPoolManager>,
     pub(crate) transaction_manager: Arc<TransactionManager>,
+    pub(crate) status_guard: RwLock<()>,
 }
 
 impl<K, V> Engine<K, V>
@@ -84,6 +86,7 @@ where
             buffer_pool,
             disk_manager,
             transaction_manager,
+            status_guard:RwLock::new(()),
         })
     }
     /// Opens an existing database.
@@ -124,6 +127,7 @@ where
             buffer_pool,
             disk_manager,
             transaction_manager,
+            status_guard:RwLock::new(()),
         })
     }
 

@@ -33,6 +33,8 @@ where
             self.transaction_manager.mark_committed(txn.txn_id);
             return Ok(());
         }
+        //Starting the RwLock which will be active until the its dropped
+        let _guard = self.status_guard.read().unwrap();
 
         let lsn_res = self.wal.log_commit(txn.txn_id);
         if let Ok(lsn) = lsn_res {
