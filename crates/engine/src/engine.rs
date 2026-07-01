@@ -46,6 +46,10 @@ where
     #[allow(dead_code)]
     pub(crate) buffer_pool: Arc<BufferPoolManager>,
     pub(crate) transaction_manager: Arc<TransactionManager>,
+
+    /// Invariant: a checkpoint snapshot never falls between the two steps of a commit or abort.
+    /// Commit and abort hold this in shared mode across their WAL append and CLOG update.
+    /// Checkpoints hold it in exclusive mode while picking a redo point and snapshotting.
     pub(crate) status_guard: RwLock<()>,
 }
 

@@ -64,6 +64,8 @@ where
             return Ok(());
         }
         {
+            let _guard = self.status_guard.read().unwrap();
+
             let _ = self.wal.log_abort(txn.txn_id)?;
 
             self.transaction_manager.mark_aborted(txn.txn_id);
@@ -170,10 +172,10 @@ impl<K: Key, V: Value> Drop for TxnHandle<'_, K, V> {
 
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
-    use std::sync::Arc;
+    use tempfile::tempdir;
 
     // A checkpoint (exclusive write lock) blocks commits until released.
     // Proves the status_guard correctly serializes checkpoint vs commit.
@@ -182,23 +184,23 @@ mod tests {
     fn test_status_guard_checkpoint_blocks_commits() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.db");
-        let engine = Arc::new(Engine::<u32,u32>::create(path).unwrap());
-        
+        let engine = Arc::new(Engine::<u32, u32>::create(path).unwrap());
+
         let engine_clone = Arc::clone(&engine);
-        
+
         // Simulate a checkpoint acquiring the exclusive lock
         let checkpoint_guard = engine.status_guard.write().unwrap();
-        
-         // Spawn a thread that tries to commit a write transaction
+
+        // Spawn a thread that tries to commit a write transaction
         let commit_thread = thread::spawn(move || {
             let mut txn = engine_clone.begin();
-            txn.insert(&1u32,&30u32).unwrap();
+            txn.insert(&1u32, &30u32).unwrap();
             txn.commit().unwrap();
         });
 
         thread::sleep(Duration::from_millis(50));
 
-        assert!(!commit_thread.is_finished(),"Commit failed to block ");
+        assert!(!commit_thread.is_finished(), "Commit failed to block ");
 
         drop(checkpoint_guard);
         commit_thread.join().expect("commit thread panicked");
@@ -207,7 +209,7 @@ mod tests {
     // Two commits can hold the shared lock simultaneously.
     // When status_guard is read only, other concurrent commit can still happen
     #[test]
-    fn concurrent_commits_do_not_deadlock(){
+    fn concurrent_commits_do_not_deadlock() {
         let dir = tempdir().unwrap();
         let engine = Engine::<u32, u32>::create(dir.path()).unwrap();
 
@@ -215,11 +217,10 @@ mod tests {
         let _simulated_guard = engine.status_guard.read().unwrap();
 
         let mut txn = engine.begin();
-        txn.insert(&1u32,&30u32).unwrap();
+        txn.insert(&1u32, &30u32).unwrap();
 
         //read does not block commit
         let result = txn.commit();
-        assert!(result.is_ok(),"");
-
+        assert!(result.is_ok(), "");
     }
 }
