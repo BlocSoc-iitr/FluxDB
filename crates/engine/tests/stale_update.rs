@@ -1,7 +1,13 @@
-//! Deterministic check of the first-writer-wins contract on a stale snapshot.
+//! Deterministic check that a stale writer loses to an ALREADY-COMMITTED writer.
 //!
-//! Project model (CLAUDE.md): "first-writer-wins — if two transactions try to
-//! write the same key, the second gets `WriteConflict`."
+//! FluxDB resolves conflicts between two *in-progress* transactions with
+//! Wait-Die: the check returns `WaitFor`, then the older txn waits on a condvar
+//! (`wait_until_settled`) and retries while the younger dies with
+//! `WriteConflict`. This test targets a different branch of `check_write_conflict`
+//! — the one this PR fixes — where the conflicting writer has already COMMITTED
+//! before the stale txn writes. Nothing is in progress to wait on
+//! (`is_in_progress` is false), so Wait-Die never applies; the stale writer must
+//! simply lose with `WriteConflict` rather than overwrite the committed version.
 //!
 //! Scenario:
 //!   1. K = 0, committed.
@@ -9,9 +15,11 @@
 //!   3. C updates K = 100 and commits — C started AFTER T's snapshot.
 //!   4. T updates K = 200 on its now-stale snapshot.
 //!
-//! C committed first, so T is the second writer → T's update MUST fail with a
-//! conflict, and the durable value MUST stay 100. If T's update returns `Ok`
-//! and the final value is 200, C's committed write was silently lost.
+//! C is already committed when T writes, so T (a stale writer over a superseded
+//! version) MUST fail with `WriteConflict`, and the durable value MUST stay 100.
+//! If T's update returns `Ok` and the final value is 200, C's committed write was
+//! silently lost. Note T is the *older* txn here: it loses not by Wait-Die (an
+//! older txn would wait), but because C has already settled as committed.
 
 use engine::{Engine, EngineError};
 use tempfile::TempDir;
@@ -24,7 +32,7 @@ fn engine() -> (Engine<u32, u32>, TempDir) {
 
 /// The decisive corruption check: after the scenario the key must have EXACTLY
 /// one coherent committed value. It can be either:
-///   - 100, if T correctly conflicted (first-writer-wins), or
+///   - 100, if T correctly lost to the committed writer (WriteConflict), or
 ///   - 200, if the engine chose last-writer-wins and T's commit truly applied.
 /// The bug produces a THIRD, incoherent outcome: T's update returns `Ok` and
 /// commits, yet the read returns 100 — proving T's committed write is a phantom
@@ -68,11 +76,11 @@ fn stale_snapshot_update_must_report_conflict() {
     e.update(&1, &100).unwrap();
 
     match t.update(&1, &200) {
-        Err(EngineError::TransactionConflict) => { /* correct: first-writer-wins */ }
+        Err(EngineError::TransactionConflict) => { /* correct: stale writer loses to committed C */ }
         Err(other) => panic!("expected TransactionConflict, got {other:?}"),
         Ok(()) => panic!(
-            "stale second writer got Ok — first-writer-wins violated \
-             (should be WriteConflict/TransactionConflict)"
+            "stale second writer got Ok — a write over a committed-superseded version \
+             must fail with WriteConflict/TransactionConflict"
         ),
     }
 }
