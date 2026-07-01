@@ -60,7 +60,10 @@ fn stale_snapshot_update_stays_coherent() {
         );
     } else {
         // T conflicted → C's value stands.
-        assert_eq!(final_val, 100, "T conflicted, so C's committed 100 must stand");
+        assert_eq!(
+            final_val, 100,
+            "T conflicted, so C's committed 100 must stand"
+        );
     }
 }
 
@@ -76,7 +79,8 @@ fn stale_snapshot_update_must_report_conflict() {
     e.update(&1, &100).unwrap();
 
     match t.update(&1, &200) {
-        Err(EngineError::TransactionConflict) => { /* correct: stale writer loses to committed C */ }
+        Err(EngineError::TransactionConflict) => { /* correct: stale writer loses to committed C */
+        }
         Err(other) => panic!("expected TransactionConflict, got {other:?}"),
         Ok(()) => panic!(
             "stale second writer got Ok — a write over a committed-superseded version \
