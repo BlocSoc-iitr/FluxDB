@@ -795,9 +795,13 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         if txn.is_in_progress(rec_xmax) {
             return Err(IndexError::WaitFor(rec_xmax));
         }
-        // The modifier committed → version is already dead.
-        // Caller will get KeyNotFound since find_visible_slot won't find it.
-        Ok(())
+        // Settled. An aborted deleter's xmax is void → version still live → proceed.
+        if txn.tm.is_aborted(rec_xmax) {
+            return Ok(());
+        }
+        // A committed deleter superseded this version. Our snapshot is stale;
+        // first-writer-wins makes us the loser.
+        Err(IndexError::WriteConflict)
     }
 
     // ── Tree navigation ───────────────────────────────────────────────────────
