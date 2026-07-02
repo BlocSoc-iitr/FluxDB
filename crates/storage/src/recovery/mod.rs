@@ -101,9 +101,16 @@ impl RecoveryManager {
     /// `main_data`. `delete_page` is idempotent on pages absent from the pool,
     /// so replaying an already-applied free is harmless.
     fn redo_overflow_free(&self, record: &WalRecord) -> Result<()> {
-        let data = record
-            .main_data
-            .expect("OverflowFree record missing main data");
+        let data = record.main_data.ok_or_else(|| {
+            WalError::CorruptedLog("OverflowFree record missing main data".to_string())
+        })?;
+        if data.len() % 8 != 0 {
+            return Err(WalError::CorruptedLog(format!(
+                "OverflowFree main data length {} is not a multiple of 8",
+                data.len()
+            ))
+            .into());
+        }
         for chunk in data.chunks_exact(8) {
             let page_id = u64::from_le_bytes(chunk.try_into().unwrap());
             self.pool.delete_page(page_id)?;
