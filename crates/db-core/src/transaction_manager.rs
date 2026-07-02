@@ -65,10 +65,7 @@ pub struct TransactionManager {
     pub next_txn_id: AtomicU64,
     pub clog: RwLock<HashMap<u64, TransactionStatus>>,
     pub vacuum_horizon: AtomicU64,
-    /// Maps each in-flight `txn_id` → its snapshot's `xmin`. The value is what
-    /// `global_xmin` (the vacuum horizon) must be computed from: a snapshot can
-    /// be arbitrarily older than its holder's ID, so min-of-IDs would let
-    /// vacuum remove versions an old snapshot still needs to see.
+    /// In-flight `txn_id` → its snapshot's `xmin` (feeds `global_xmin`).
     pub active_txns: RwLock<HashMap<u64, u64>>,
     waiters: Mutex<HashMap<u64, WaiterEntry>>,
 }
@@ -91,16 +88,9 @@ impl TransactionManager {
         }
     }
 
-    /// Returns the oldest snapshot `xmin` among all in-flight transactions —
-    /// the vacuum horizon. A superseded version (`xmax = W`, committed) may
-    /// only be physically removed once `W < global_xmin()`: below that bound,
-    /// every live snapshot has `W < snap.xmin ≤ snap.xmax` and `W ∉ active`,
-    /// so every live snapshot already sees W's deletion as committed.
-    ///
-    /// NOT the min active txn ID: a snapshot can be much older than its
-    /// holder's ID (holder began late, while older txns were still running),
-    /// and min-of-IDs would let vacuum remove versions that snapshot still
-    /// needs (transiently missing committed keys).
+    /// The vacuum horizon: oldest snapshot `xmin` among in-flight txns (NOT
+    /// min txn id — a snapshot can be older than its holder's id). Versions
+    /// deleted below this bound are invisible to every live snapshot.
     pub fn global_xmin(&self) -> u64 {
         let active = self.active_txns.read().unwrap();
         active
@@ -152,9 +142,7 @@ impl TransactionManager {
         let mut active = self.active_txns.write().unwrap();
 
         let txn_id = self.next_txn_id.fetch_add(1, AcqRel);
-        // Snapshot xmin = oldest in-flight txn (self is always the newest).
-        // Stored alongside the ID: global_xmin() derives the vacuum horizon
-        // from these snapshot xmins, not from the IDs.
+        // Snapshot xmin = oldest in-flight txn; stored for global_xmin().
         let xmin = active.keys().min().copied().unwrap_or(txn_id);
         active.insert(txn_id, xmin);
 

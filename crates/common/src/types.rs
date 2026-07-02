@@ -495,9 +495,7 @@ impl Value for &str {
 
 impl Key for &str {
     fn compare(data1: &[u8], data2: &[u8]) -> Ordering {
-        // UTF-8 sorts byte-lexicographically (str::cmp is defined as byte order),
-        // so a raw slice compare matches `from_utf8(..).cmp(..)` without the
-        // per-comparison UTF-8 revalidation of already-valid stored bytes.
+        // UTF-8 sorts byte-lexicographically; no need to revalidate.
         data1.cmp(data2)
     }
 }
@@ -537,9 +535,7 @@ impl Value for String {
 
 impl Key for String {
     fn compare(data1: &[u8], data2: &[u8]) -> Ordering {
-        // UTF-8 sorts byte-lexicographically (str::cmp is defined as byte order),
-        // so a raw slice compare matches `from_utf8(..).cmp(..)` without the
-        // per-comparison UTF-8 revalidation of already-valid stored bytes.
+        // UTF-8 sorts byte-lexicographically; no need to revalidate.
         data1.cmp(data2)
     }
 }
