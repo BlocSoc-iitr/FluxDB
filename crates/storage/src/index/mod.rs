@@ -44,6 +44,18 @@ struct BTStackEntry {
 
 type BTStack = Vec<BTStackEntry>;
 
+// ── ChainSearch ───────────────────────────────────────────────────────────────
+
+/// Result of a version-chain visibility search (see `find_visible_chain_mut`).
+enum ChainSearch<'a> {
+    /// Visible version found: the exclusively-latched page holding it + slot.
+    Found(PageWriteGuard<'a>, usize),
+    /// No visible version exists anywhere on the chain.
+    NotFound,
+    /// The chain changed while unlatched — caller must restart its search.
+    Restart,
+}
+
 // ── BTreeIndex ────────────────────────────────────────────────────────────────
 
 pub struct BTreeIndex<K: Key, V: Value> {
@@ -138,32 +150,70 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
 
     /// Look up `key` and return the value visible to `txn`, or `None`.
     pub fn get(&self, key: &K::SelfType<'_>, txn: &Transaction) -> Result<Option<Vec<u8>>> {
-        let root_pid = *self.root.lock().unwrap();
-        let leaf_pid = self.find_leaf(root_pid, key)?;
         let key_bytes = K::as_bytes(key);
+        'restart: loop {
+            let root_pid = *self.root.lock().unwrap();
+            let leaf_pid = self.find_leaf(root_pid, key)?;
 
-        // Shared latch on leaf + rightlink correction.
-        let mut page = self.pool.fetch_page(leaf_pid)?;
-        loop {
-            let acc = LeafPageAccessor::<K, V>::new(&page[..]);
-            if let Some(hk) = acc.high_key_bytes()
-                && K::compare(key_bytes.as_ref(), hk) != Ordering::Less
-            {
-                let right = acc.rightlink().unwrap();
+            // Shared latch on leaf + rightlink correction.
+            let mut page = self.pool.fetch_page(leaf_pid)?;
+            loop {
+                let acc = LeafPageAccessor::<K, V>::new(&page[..]);
+                if let Some(hk) = acc.high_key_bytes()
+                    && K::compare(key_bytes.as_ref(), hk) != Ordering::Less
+                {
+                    let right = acc.rightlink().unwrap();
+                    drop(page);
+                    page = self.pool.fetch_page(right)?;
+                    continue;
+                }
+                break;
+            }
+
+            // Scan this page, then walk LEFT across a version-chain split:
+            // a split inside one key's duplicate run leaves `high_key == key`
+            // on the left page, so rightlink correction (`key >= high_key` →
+            // right) lands every lookup on the rightmost chain page while the
+            // visible version may sit on a left sibling.
+            loop {
+                {
+                    let acc = LeafPageAccessor::<K, V>::new(&page[..]);
+                    if let Some(slot) = self.find_visible_slot(&acc, key, txn) {
+                        let val = acc.get_value(slot);
+                        return Ok(Some(V::as_bytes(&val).as_ref().to_vec()));
+                    }
+                }
+                let (chain_continues, prev) = {
+                    let acc = LeafPageAccessor::<K, V>::new(&page[..]);
+                    // Continue left while this page starts with `key` — or is
+                    // EMPTY (compaction can vacuum every version off a chain-
+                    // middle page while its high_key/prev links remain).
+                    let cont = acc.num_pairs() == 0
+                        || K::compare(K::as_bytes(&acc.get_key(0)).as_ref(), key_bytes.as_ref())
+                            == Ordering::Equal;
+                    (cont, acc.prev_page())
+                };
+                if !chain_continues {
+                    return Ok(None);
+                }
+                let Some(prev_pid) = prev else {
+                    return Ok(None);
+                };
+                // Drop before latching left: holding right while latching left
+                // deadlocks against the split path's left→right latch order.
                 drop(page);
-                page = self.pool.fetch_page(right)?;
-                continue;
+                page = self.pool.fetch_page(prev_pid)?;
+                let sig_ok = {
+                    let acc = LeafPageAccessor::<K, V>::new(&page[..]);
+                    matches!(acc.high_key_bytes(), Some(hk)
+                        if K::compare(hk, key_bytes.as_ref()) == Ordering::Equal)
+                };
+                if !sig_ok {
+                    // Chain shape changed while unlatched — redo the descent.
+                    drop(page);
+                    continue 'restart;
+                }
             }
-            break;
-        }
-
-        let acc = LeafPageAccessor::<K, V>::new(&page[..]);
-        match self.find_visible_slot(&acc, key, txn) {
-            Some(slot) => {
-                let val = acc.get_value(slot);
-                Ok(Some(V::as_bytes(&val).as_ref().to_vec()))
-            }
-            None => Ok(None),
         }
     }
 
@@ -297,7 +347,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                     LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
                     Ok(())
                 }
-                Err(_) => self.split_and_insert(leaf_guard, key, value, txn, &mut stack),
+                Err(_) => self.split_and_insert(leaf_guard, key, value, txn, &stack),
             };
         }
     }
@@ -341,7 +391,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
 
         // Exclusive latch + rightlink correction + conflict retry loop.
         let mut leaf_guard = self.pool.fetch_page_mut(leaf_pid)?;
-        loop {
+        'retry: loop {
             // Rightlink correction: follow splits that happened during descent.
             loop {
                 let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
@@ -356,33 +406,39 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 break;
             }
 
-            // Find visible version.
-            let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
-            let visible_slot = self
-                .find_visible_slot(&acc, key, txn)
-                .ok_or(IndexError::KeyNotFound)?;
+            // Find the visible version — on this page or, after a version-
+            // chain split, on a left sibling (see `find_visible_chain_mut`).
+            let (mut vis_guard, visible_slot) =
+                match self.find_visible_chain_mut(leaf_guard, key, txn)? {
+                    ChainSearch::Found(g, s) => (g, s),
+                    ChainSearch::NotFound => return Err(IndexError::KeyNotFound),
+                    ChainSearch::Restart => {
+                        leaf_guard = self.pool.fetch_page_mut(leaf_pid)?;
+                        continue 'retry;
+                    }
+                };
 
             // Conflict check: if another in-progress txn holds xmax, wait for
             // it to settle then retry — same Wait-Die protocol as insert.
-            let rec_xmax = acc.get_xmax(visible_slot);
+            let rec_xmax = LeafPageAccessor::<K, V>::new(&vis_guard[..]).get_xmax(visible_slot);
             match self.check_write_conflict(rec_xmax, txn) {
                 Ok(()) => {}
                 Err(IndexError::WaitFor(blocking_txn)) => {
-                    drop(leaf_guard);
+                    drop(vis_guard);
                     Self::wait_for_txn(&txn.tm, blocking_txn, txn.txn_id)?;
                     leaf_guard = self.pool.fetch_page_mut(leaf_pid)?;
-                    continue;
+                    continue 'retry;
                 }
                 Err(e) => return Err(e),
             }
 
             // Set xmax to mark this version as deleted by our transaction.
-            let page_id = leaf_guard.page_id;
+            let page_id = vis_guard.page_id;
             let lsn =
                 self.wal
                     .log_set_xmax(txn.txn_id, page_id, visible_slot as u16, txn.txn_id)?;
-            LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmax(visible_slot, txn.txn_id);
-            LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
+            LeafPageMutator::<K, V>::new(&mut vis_guard[..]).set_xmax(visible_slot, txn.txn_id);
+            LeafPageMutator::<K, V>::new(&mut vis_guard[..]).set_lsn(lsn);
             return Ok(());
         }
     }
@@ -452,7 +508,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
 
         // Exclusive latch + rightlink correction + conflict retry loop.
         let mut leaf_guard = self.pool.fetch_page_mut(leaf_pid)?;
-        loop {
+        'retry: loop {
             // Rightlink correction: follow splits that happened during descent.
             loop {
                 let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
@@ -466,35 +522,67 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 }
                 break;
             }
+            let landing_pid = leaf_guard.page_id;
 
-            // Find visible version under same exclusive latch.
-            let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
-            let visible_slot = self
-                .find_visible_slot(&acc, key, txn)
-                .ok_or(IndexError::KeyNotFound)?;
+            // Find the visible version — on this page or, after a version-
+            // chain split, on a left sibling (see `find_visible_chain_mut`).
+            let (mut vis_guard, visible_slot) =
+                match self.find_visible_chain_mut(leaf_guard, key, txn)? {
+                    ChainSearch::Found(g, s) => (g, s),
+                    ChainSearch::NotFound => return Err(IndexError::KeyNotFound),
+                    ChainSearch::Restart => {
+                        leaf_guard = self.pool.fetch_page_mut(leaf_pid)?;
+                        continue 'retry;
+                    }
+                };
 
             // Conflict check: if another in-progress txn holds xmax, wait for
             // it to settle then retry — same Wait-Die protocol as insert.
-            let rec_xmax = acc.get_xmax(visible_slot);
+            let rec_xmax = LeafPageAccessor::<K, V>::new(&vis_guard[..]).get_xmax(visible_slot);
             match self.check_write_conflict(rec_xmax, txn) {
                 Ok(()) => {}
                 Err(IndexError::WaitFor(blocking_txn)) => {
-                    drop(leaf_guard);
+                    drop(vis_guard);
                     Self::wait_for_txn(&txn.tm, blocking_txn, txn.txn_id)?;
                     leaf_guard = self.pool.fetch_page_mut(leaf_pid)?;
-                    continue;
+                    continue 'retry;
                 }
                 Err(e) => return Err(e),
             }
 
-            // ── ATOMIC: set xmax on old + insert new (same latch) ────────────
-            let page_id = leaf_guard.page_id;
+            // ── Set xmax on the old version ──────────────────────────────────
+            let vis_pid = vis_guard.page_id;
             let _lsn_xmax =
                 self.wal
-                    .log_set_xmax(txn.txn_id, page_id, visible_slot as u16, txn.txn_id)?;
-            LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmax(visible_slot, txn.txn_id);
-            // Find insert position for the new version.
-            let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
+                    .log_set_xmax(txn.txn_id, vis_pid, visible_slot as u16, txn.txn_id)?;
+            LeafPageMutator::<K, V>::new(&mut vis_guard[..]).set_xmax(visible_slot, txn.txn_id);
+
+            if vis_pid != landing_pid {
+                // Chain case: the old version sits on a left chain page; the
+                // new version goes on the landing page, where corrected
+                // lookups arrive. Not single-latch atomic, but never zero-
+                // visible: until we settle, the old version stays visible
+                // (xmax in-progress) and concurrent writers Wait-Die on us.
+                drop(vis_guard);
+                let mut ins_guard = self.pool.fetch_page_mut(landing_pid)?;
+                loop {
+                    let acc = LeafPageAccessor::<K, V>::new(&ins_guard[..]);
+                    if let Some(hk) = acc.high_key_bytes()
+                        && K::compare(key_bytes.as_ref(), hk) != Ordering::Less
+                    {
+                        let right = acc.rightlink().unwrap();
+                        drop(ins_guard);
+                        ins_guard = self.pool.fetch_page_mut(right)?;
+                        continue;
+                    }
+                    break;
+                }
+                vis_guard = ins_guard;
+            }
+
+            // ── Insert the new version (same latch as xmax in the common case)
+            let page_id = vis_guard.page_id;
+            let acc = LeafPageAccessor::<K, V>::new(&vis_guard[..]);
             let (slot, _) = acc.position(key);
             let val_bytes = V::as_bytes(value);
 
@@ -509,7 +597,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                     val_bytes.as_ref(),
                     txn.txn_id,
                 )?;
-                let mut m = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]);
+                let mut m = LeafPageMutator::<K, V>::new(&mut vis_guard[..]);
                 m.insert(slot, key, value)
                     .expect("insert must succeed: can_fit_direct checked above");
                 m.set_xmin(slot, txn.txn_id);
@@ -518,7 +606,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             }
 
             // Doesn't fit → split.
-            return self.split_and_insert(leaf_guard, key, value, txn, &mut stack);
+            return self.split_and_insert(vis_guard, key, value, txn, &stack);
         }
     }
 
@@ -716,6 +804,57 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             i += 1;
         }
         None
+    }
+
+    /// `find_visible_slot` extended across a version-chain split, under
+    /// exclusive latches: starting from the (rightlink-corrected) landing
+    /// page, walk `prev_page` left while the chain signature holds — the
+    /// page starts with `key` and the left sibling's `high_key == key`.
+    /// The latch is dropped before each leftward step (holding right while
+    /// latching left deadlocks against the split path's left→right order),
+    /// so a failed signature check means the structure moved: `Restart`.
+    fn find_visible_chain_mut<'a>(
+        &'a self,
+        mut guard: PageWriteGuard<'a>,
+        key: &K::SelfType<'_>,
+        txn: &Transaction,
+    ) -> Result<ChainSearch<'a>> {
+        let key_bytes = K::as_bytes(key);
+        loop {
+            let found = {
+                let acc = LeafPageAccessor::<K, V>::new(&guard[..]);
+                self.find_visible_slot(&acc, key, txn)
+            };
+            if let Some(slot) = found {
+                return Ok(ChainSearch::Found(guard, slot));
+            }
+            let (chain_continues, prev) = {
+                let acc = LeafPageAccessor::<K, V>::new(&guard[..]);
+                // Continue left while this page starts with `key` — or is
+                // EMPTY (compaction can vacuum every version off a chain-
+                // middle page while its high_key/prev links remain).
+                let cont = acc.num_pairs() == 0
+                    || K::compare(K::as_bytes(&acc.get_key(0)).as_ref(), key_bytes.as_ref())
+                        == Ordering::Equal;
+                (cont, acc.prev_page())
+            };
+            if !chain_continues {
+                return Ok(ChainSearch::NotFound);
+            }
+            let Some(prev_pid) = prev else {
+                return Ok(ChainSearch::NotFound);
+            };
+            drop(guard);
+            guard = self.pool.fetch_page_mut(prev_pid)?;
+            let sig_ok = {
+                let acc = LeafPageAccessor::<K, V>::new(&guard[..]);
+                matches!(acc.high_key_bytes(), Some(hk)
+                    if K::compare(hk, key_bytes.as_ref()) == Ordering::Equal)
+            };
+            if !sig_ok {
+                return Ok(ChainSearch::Restart);
+            }
+        }
     }
 
     /// Check for insert conflicts among duplicate versions of `key`.
