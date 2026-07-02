@@ -552,11 +552,12 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
 
             // ── Set xmax on the old version ──────────────────────────────────
             let vis_pid = vis_guard.page_id;
-            let _lsn_xmax =
+            let lsn_xmax =
                 self.wal
                     .log_set_xmax(txn.txn_id, vis_pid, visible_slot as u16, txn.txn_id)?;
-            LeafPageMutator::<K, V>::new(&mut vis_guard[..]).set_xmax(visible_slot, txn.txn_id);
-
+            let mut m = LeafPageMutator::<K, V>::new(&mut vis_guard[..]);
+            m.set_xmax(visible_slot, txn.txn_id);
+            m.set_lsn(lsn_xmax);
             if vis_pid != landing_pid {
                 // Chain case: the old version sits on a left chain page; the
                 // new version goes on the landing page, where corrected
