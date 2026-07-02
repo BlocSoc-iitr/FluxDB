@@ -197,6 +197,8 @@ struct WalShared {
     durable: Condvar,
     segment_size: u64,
     buffer_capacity: usize,
+    /// Allocated at buffer entry, under the state lock: LSN order, buffer
+    /// order, and disk order are the same order by construction.
     next_lsn: AtomicU64,
 }
 
@@ -1135,12 +1137,10 @@ impl Wal {
             });
         }
 
-        let lsn = self.shared.next_lsn.fetch_add(1, Ordering::Relaxed);
-
         let mut record = Vec::with_capacity(record_size);
-        record.reserve(record_size);
 
-        record.extend_from_slice(&lsn.to_le_bytes());
+        // LSN placeholder — allocated at buffer entry, patched in below.
+        record.extend_from_slice(&0u64.to_le_bytes());
         record.extend_from_slice(&(record_size as u32).to_le_bytes());
         record.push(entry_type as u8);
         record.push(blocks.len() as u8);
@@ -1167,16 +1167,33 @@ impl Wal {
             record.extend_from_slice(data);
         }
 
-        let mut hasher = Hasher::new();
-        hasher.update(&record);
-        let checksum = hasher.finalize();
-
-        record.extend_from_slice(&checksum.to_le_bytes());
+        // CRC of everything after the LSN, computed outside the lock; the
+        // final checksum is CRC(lsn) ⊕-combined with this under the lock.
+        let mut rest_hasher = Hasher::new();
+        rest_hasher.update(&record[8..]);
 
         let mut state = self.shared.state.lock().unwrap();
         if let Some(err) = state.flush_error.as_ref() {
             return Err(WalError::FlushFailed(err.clone()));
         }
+        // Reject BEFORE allocating: a failed append must not leave an LSN gap.
+        if record.len() + 4 > state.buffer.free_space() {
+            return Err(WalError::BufferFull {
+                needed: record.len() + 4,
+                available: state.buffer.free_space(),
+            });
+        }
+
+        // Allocate at buffer entry: whoever gets here first gets the lower
+        // LSN, so LSN order and buffer order can never diverge.
+        let lsn = self.shared.next_lsn.fetch_add(1, Ordering::Relaxed);
+        record[0..8].copy_from_slice(&lsn.to_le_bytes());
+
+        let mut hasher = Hasher::new();
+        hasher.update(&record[0..8]);
+        hasher.combine(&rest_hasher);
+        let checksum = hasher.finalize();
+        record.extend_from_slice(&checksum.to_le_bytes());
 
         state.buffer.push_record(lsn, &record)?;
 
@@ -1220,14 +1237,17 @@ impl Wal {
             } else {
                 state.is_flushing = true;
 
-                let (records, bytes_to_consume, durable_lsn) =
-                    if let Some((bytes, dur_lsn)) = state.buffer.buffered_prefix_len() {
-                        (state.buffer.copy_records(), bytes, dur_lsn)
-                    } else {
-                        state.is_flushing = false;
-                        self.shared.durable.notify_all();
-                        return Ok(());
-                    };
+                let Some((bytes_to_consume, durable_lsn)) = state.buffer.buffered_prefix_len()
+                else {
+                    // Unreachable: LSNs are allocated at buffer entry, so any
+                    // allocated LSN is buffered or already flushed — an empty
+                    // buffer means flushed_lsn covers the target (caught above).
+                    debug_assert!(false, "flushed_lsn behind target with empty buffer");
+                    state.is_flushing = false;
+                    self.shared.durable.notify_all();
+                    return Ok(());
+                };
+                let records = state.buffer.copy_records();
 
                 drop(state);
 
@@ -1812,6 +1832,64 @@ mod tests {
 
         assert_eq!(wal.next_lsn(), (total + 1) as u64);
 
+        Ok(())
+    }
+
+    /// LSN order must equal disk order, and `flushed_lsn` must never cover a
+    /// record that isn't durable. LSNs are allocated at buffer entry, so
+    /// concurrent appenders of wildly different record sizes must still land
+    /// on disk strictly LSN-sorted with nothing missing below the watermark.
+    #[test]
+    fn concurrent_appends_land_on_disk_in_lsn_order() -> Result<()> {
+        let dir = tempdir().map_err(WalError::Io)?;
+        let wal_dir = dir.path().join("ordered-wal");
+        let wal = Arc::new(Wal::new(&wal_dir)?);
+
+        let threads = 8;
+        let per_thread = 200;
+        let fpi = [7u8; PAGE_SIZE];
+
+        thread::scope(|s| {
+            for t in 0..threads {
+                let wal = Arc::clone(&wal);
+                let fpi = &fpi;
+                s.spawn(move || {
+                    for i in 0..per_thread {
+                        // Alternate tiny and FPI-sized records so serialization
+                        // times diverge — the exact recipe for reordering.
+                        let lsn = if i % 2 == 0 {
+                            wal.log_commit(t).unwrap()
+                        } else {
+                            let block = Block {
+                                page_id: t,
+                                blk_flags: 1,
+                                fpi: Some(fpi),
+                                data: None,
+                            };
+                            wal.append(WalRecordType::Insert, t, &[block], None)
+                                .unwrap()
+                        };
+                        wal.flush_up_to(lsn).unwrap();
+                    }
+                });
+            }
+        });
+
+        let last = wal.next_lsn() - 1;
+        wal.flush_up_to(last)?;
+        assert_eq!(wal.flushed_lsn(), Some(last));
+        drop(wal);
+
+        // Reopen and verify the durable artifact: every LSN present, strictly
+        // ascending, CRCs valid.
+        let mut iter = WalIterator::new(&wal_dir)?;
+        let mut expect = 1;
+        while let Some(rec) = iter.next_record() {
+            let rec = rec?;
+            assert_eq!(rec.lsn, expect, "disk order broke at lsn {expect}");
+            expect += 1;
+        }
+        assert_eq!(expect - 1, last, "records missing below flushed_lsn");
         Ok(())
     }
 }

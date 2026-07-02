@@ -495,9 +495,8 @@ impl Value for &str {
 
 impl Key for &str {
     fn compare(data1: &[u8], data2: &[u8]) -> Ordering {
-        let value1 = Self::from_bytes(data1);
-        let value2 = Self::from_bytes(data2);
-        value1.cmp(value2)
+        // UTF-8 sorts byte-lexicographically; no need to revalidate.
+        data1.cmp(data2)
     }
 }
 
@@ -536,9 +535,8 @@ impl Value for String {
 
 impl Key for String {
     fn compare(data1: &[u8], data2: &[u8]) -> Ordering {
-        let value1 = std::str::from_utf8(data1).unwrap();
-        let value2 = std::str::from_utf8(data2).unwrap();
-        value1.cmp(value2)
+        // UTF-8 sorts byte-lexicographically; no need to revalidate.
+        data1.cmp(data2)
     }
 }
 

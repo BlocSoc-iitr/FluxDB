@@ -15,7 +15,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         key: &K::SelfType<'_>,
         value: &V::SelfType<'_>,
         txn: &Transaction,
-        stack: &mut BTStack,
+        stack: &BTStack,
     ) -> Result<()> {
         let leaf_pid_actual = leaf_guard.page_id;
 
@@ -92,20 +92,54 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             drop(leaf_guard);
         } else {
             drop(leaf_guard);
+            // Propagate our split's downlink FIRST: the insert below runs
+            // unlatched-then-relatched and may need another split, which must
+            // find a well-formed tree (and the same ancestor stack).
+            self.insert_separator_via_stack(
+                stack,
+                split.separator_key,
+                split.new_page_id,
+                leaf_pid_actual,
+            )?;
+
+            // Between the latch drop above and here, concurrent inserts can
+            // refill (or re-split) the new right page. Correct along
+            // rightlinks and, if the tuple no longer fits, split again
+            // instead of letting InsufficientSpace escape to the caller.
             let mut right = self.pool.fetch_page_mut(target_pid)?;
+            loop {
+                let acc = LeafPageAccessor::<K, V>::new(&right[..]);
+                if let Some(hk) = acc.high_key_bytes()
+                    && K::compare(key_bytes.as_ref(), hk) != Ordering::Less
+                {
+                    let r = acc.rightlink().unwrap();
+                    drop(right);
+                    right = self.pool.fetch_page_mut(r)?;
+                    continue;
+                }
+                break;
+            }
+            {
+                let acc = LeafPageAccessor::<K, V>::new(&right[..]);
+                if !acc.can_fit_direct(key_bytes.as_ref().len(), val_bytes.as_ref().len()) {
+                    return self.split_and_insert(right, key, value, txn, stack);
+                }
+            }
+            let right_pid = right.page_id;
             let (s, _) = LeafPageAccessor::<K, V>::new(&right[..]).position(key);
             let mut mutator = LeafPageMutator::<K, V>::new(&mut right[..]);
             mutator.insert(s, key, value)?;
             mutator.set_xmin(s, txn.txn_id);
             let lsn = self.wal.log_insert(
                 txn.txn_id,
-                target_pid,
+                right_pid,
                 s as u16,
                 key_bytes.as_ref(),
                 val_bytes.as_ref(),
                 txn.txn_id,
             )?;
             LeafPageMutator::<K, V>::new(&mut right[..]).set_lsn(lsn);
+            return Ok(());
         }
 
         self.insert_separator_via_stack(
@@ -254,13 +288,16 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
     /// no-op that still clears the flag.
     fn insert_separator_via_stack(
         &self,
-        stack: &mut BTStack,
+        stack: &BTStack,
         mut sep_key: Vec<u8>,
         mut right_pid: PageId,
         mut left_child: PageId,
     ) -> Result<()> {
+        // Walk the ancestor path bottom-up by index — never consume the
+        // stack: callers (recursive splits, finish_split) still need it.
+        let mut depth = stack.len();
         loop {
-            if stack.is_empty() {
+            if depth == 0 {
                 // The splitting page is the root unless one was created concurrently.
                 if *self.root.lock().unwrap() != left_child {
                     crate::page::clear_incomplete_split(
@@ -304,8 +341,8 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 return Ok(());
             }
 
-            let entry = stack.pop().unwrap();
-            let mut parent_pid = entry.page_id;
+            depth -= 1;
+            let mut parent_pid = stack[depth].page_id;
 
             let mut parent_guard = self.pool.fetch_page_mut(parent_pid)?;
             loop {
@@ -392,7 +429,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         };
         if let (Some(sep_key), Some(right_pid)) = (sep_key, right_pid) {
             drop(guard);
-            self.insert_separator_via_stack(&mut stack.clone(), sep_key, right_pid, child_pid)
+            self.insert_separator_via_stack(stack, sep_key, right_pid, child_pid)
         } else {
             // Spurious flag (no right sibling) — clear it so descent can proceed.
             crate::page::clear_incomplete_split(&mut guard[..]);

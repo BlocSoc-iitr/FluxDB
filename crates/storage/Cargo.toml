@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 common.workspace = true
 crc32fast = "1.5.0"
+rustc-hash = "2"
 db-core.workspace = true
 [dev-dependencies]
 tempfile = "3.10.1"

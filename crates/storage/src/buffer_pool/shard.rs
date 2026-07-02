@@ -10,7 +10,7 @@ use crate::page::Lsn;
 use crate::wal::Wal;
 use common::BufferPoolError;
 use common::{INVALID_FRAME_ID, MAX_PAGE_SIZE};
-use std::collections::HashMap;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -148,7 +148,7 @@ pub struct FrameMetadata {
 /// Internal state of a buffer pool shard, protected by a mutex.
 pub struct ShardInner {
     pub metadata: Vec<FrameMetadata>,
-    pub page_table: HashMap<u64, usize>,
+    pub page_table: FxHashMap<u64, usize>,
     pub free_list: Vec<usize>,
     pub replacer: ClockReplacer,
     pub min_rec_lsn: Option<Lsn>,
@@ -185,7 +185,7 @@ impl BufferPoolShard {
             pages: (0..size).map(|_| RwLock::new(PageData::new())).collect(),
             inner: Mutex::new(ShardInner {
                 metadata,
-                page_table: HashMap::with_capacity(size),
+                page_table: FxHashMap::with_capacity_and_hasher(size, FxBuildHasher),
                 free_list,
                 replacer: ClockReplacer::new(size),
                 min_rec_lsn: None,
