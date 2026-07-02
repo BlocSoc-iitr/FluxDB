@@ -377,6 +377,18 @@ still bounded by the redo point.
    redo point is deletable, full stop (§7.3).
 6. **Status-guard exclusion.** A checkpoint's snapshot moment is mutually
    exclusive with any commit/abort's two-step window (§7.2).
+7. **Point lookups are version-chain-aware.** When one key's MVCC versions
+   fill a leaf, the split lands *inside* the duplicate run (no key-change
+   split point exists), leaving the left page with `high_key == key`. The
+   "move right on `key >= high_key`" rule then routes every lookup to the
+   rightmost chain page, so `get`/`update`/`delete` must walk `prev_page`
+   left when a page has no visible version but starts with the key — or is
+   empty (compaction may strip a chain-middle page bare while its
+   `high_key`/links remain). The walk **drops its latch before each leftward
+   step** (holding right while latching left inverts the split path's
+   left→right order — deadlock) and revalidates the chain signature
+   (`left.high_key == key`) after re-latching, restarting the descent if the
+   structure moved.
 
 ---
 
@@ -475,14 +487,20 @@ pass**:
 - **Split without downlink** (crash between `LeafSplit`/`InternalSplit` and
   `InsertDownlink`): the new right page is reachable via the right-link;
   searches "move right." Completion is **lazy** — the next descent crossing an
-  `INCOMPLETE_SPLIT` page inserts the downlink. *Decision still open:* (a)
-  maintain the flag for real (set on split, clear on `InsertDownlink`, check
-  on descent), or (b) drop the flag and rely purely on rightlinks. Today the
-  code maintains no flag and relies on rightlinks — (b) is the current
-  reality. If (a): completion must be concurrency-safe — child write latch as
-  the linearization point, re-descend for the parent stack,
-  insert-separator-if-absent; redo of `InsertDownlink` likewise
+  `INCOMPLETE_SPLIT` page inserts the downlink. Option (a) is the current
+  reality: the flag is maintained (set by the split rebuild, cleared by
+  `insert_separator_via_stack`, checked on the insert descent), and
+  completion is insert-separator-if-absent; redo of `InsertDownlink` likewise
   insert-if-absent. (Read/delete descents build no parent stack today.)
+
+  **Right-target insert order:** when the splitting txn's own tuple belongs
+  in the new right page, the separator is propagated *before* the tuple
+  insert, and the re-latched target is rightlink-corrected and fit-checked —
+  concurrent inserts can refill (or re-split) the new page in the unlatched
+  window, so a failed fit recurses into another split rather than letting
+  `InsufficientSpace` escape to the caller. Separator propagation walks the
+  parent stack **without consuming it** (index cursor, not pops) so recursive
+  splits and `finish_split` always see the original ancestors.
 
   **Latch-order rule for whatever protocol is chosen:** never hold a
   descendant latch while acquiring an ancestor outside the established
@@ -490,11 +508,11 @@ pass**:
   discipline the tree relies on. The safe pattern (PostgreSQL's
   `_bt_insert_parent`): release the child latch, relocate the parent via the
   right-link / parent stack, then latch the parent and
-  insert-the-separator-if-absent. Known fragility to clean up when this is
-  built: `split_and_insert`'s left-target branch (`index.rs:743–746`)
-  currently holds the leaf latch across the parent fetch inside
-  `insert_separator_via_stack` — safe today only because everything else is
-  strictly bottom-up.
+  insert-the-separator-if-absent. (The historical fragility here — the
+  left-target branch holding the leaf latch across the parent fetch — is
+  resolved: both `split_and_insert` branches release the leaf before
+  propagation, which also lets the downlink step latch the leaf to clear its
+  `INCOMPLETE_SPLIT` flag.)
 - **Page deletion** (crash between `MarkHalfDead` and `UnlinkPage`): the next
   vacuum pass completes it. Recycling is horizon-gated (§8.5), so a deleted
   page is never handed out mid-recovery.
@@ -613,19 +631,31 @@ A version is definitely dead iff:
 2. `settled_status(xmax) == Committed && xmax < horizon` — deleted by a
    committed txn older than every live snapshot.
 
-`horizon = global_xmin` (oldest active txn id, else `next_txn_id`). Routing
-through `settled_status` is load-bearing: with committed entries truncated, a
-bare CLOG lookup on `xmax` returns false forever and the tuple becomes
-invisible-yet-unvacuumable — a permanent leak.
+`horizon = global_xmin` — the **oldest live snapshot's `xmin`** (min over
+active txns of their snapshot's xmin; `next_txn_id` when none). NOT the oldest
+active txn *id*: a snapshot can be arbitrarily older than its holder's id
+(the holder began while older txns were in flight), and an id-based horizon
+lets vacuum remove the version an old snapshot still needs — a committed key
+then transiently reads as missing. `W < min(snap.xmin)` implies
+`W < snap.xmax ∧ W ∉ snap.active` for every live snapshot, so only below that
+bound is every deleter provably committed for all observers. To support this,
+the TM's active set maps `txn_id → snapshot.xmin`. (Matches §3.2's "below
+every live snapshot's xmin"; this section previously said "oldest active txn
+id", and the implementation faithfully reproduced that bug.)
+
+Routing through `settled_status` is load-bearing: with committed entries
+truncated, a bare CLOG lookup on `xmax` returns false forever and the tuple
+becomes invisible-yet-unvacuumable — a permanent leak.
 
 ### 8.4 Two-tier CLOG truncation
 
 - **Committed** entries below `global_xmin`: droppable anytime — the
   presumed-commit default re-derives them (§3.2).
 - **Aborted** entries: droppable only below **`vacuum_horizon`** — the
-  oldest-active-txn-id captured at the *start* of the most recent **completed**
-  full vacuum sweep (`AtomicU64`, `fetch_max` published only when the sweep
-  reaches the last leaf; partial progress publishes nothing). After a full
+  `global_xmin` (oldest live snapshot xmin, §8.3) captured at the *start* of
+  the most recent **completed** full vacuum sweep (`AtomicU64`, `fetch_max`
+  published only when the sweep reaches the last leaf; partial progress
+  publishes nothing). After a full
   sweep, no tuple with an aborted `xmin < vacuum_horizon` survives anywhere,
   so the entries carry no information.
 
