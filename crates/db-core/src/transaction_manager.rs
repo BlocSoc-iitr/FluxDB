@@ -29,7 +29,7 @@ use std::sync::atomic::{
     Ordering::{AcqRel, Acquire},
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, Condvar, Mutex, RwLock},
 };
 
@@ -65,7 +65,11 @@ pub struct TransactionManager {
     pub next_txn_id: AtomicU64,
     pub clog: RwLock<HashMap<u64, TransactionStatus>>,
     pub vacuum_horizon: AtomicU64,
-    pub active_txns: RwLock<HashSet<u64>>,
+    /// Maps each in-flight `txn_id` → its snapshot's `xmin`. The value is what
+    /// `global_xmin` (the vacuum horizon) must be computed from: a snapshot can
+    /// be arbitrarily older than its holder's ID, so min-of-IDs would let
+    /// vacuum remove versions an old snapshot still needs to see.
+    pub active_txns: RwLock<HashMap<u64, u64>>,
     waiters: Mutex<HashMap<u64, WaiterEntry>>,
 }
 
@@ -82,21 +86,25 @@ impl TransactionManager {
             next_txn_id: AtomicU64::new(1),
             clog: RwLock::new(HashMap::new()),
             vacuum_horizon: AtomicU64::new(0),
-            active_txns: RwLock::new(HashSet::new()),
+            active_txns: RwLock::new(HashMap::new()),
             waiters: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Returns the minimum `txn_id` currently in the active set (the global
-    /// minimum transaction ID that is still executing).
+    /// Returns the oldest snapshot `xmin` among all in-flight transactions —
+    /// the vacuum horizon. A superseded version (`xmax = W`, committed) may
+    /// only be physically removed once `W < global_xmin()`: below that bound,
+    /// every live snapshot has `W < snap.xmin ≤ snap.xmax` and `W ∉ active`,
+    /// so every live snapshot already sees W's deletion as committed.
     ///
-    /// This is used to determine the lower bound for visibility checks in
-    /// read operations (e.g., in B+-tree scans), ensuring that transactions
-    /// which have not yet begun do not affect the visibility of committed data.
+    /// NOT the min active txn ID: a snapshot can be much older than its
+    /// holder's ID (holder began late, while older txns were still running),
+    /// and min-of-IDs would let vacuum remove versions that snapshot still
+    /// needs (transiently missing committed keys).
     pub fn global_xmin(&self) -> u64 {
         let active = self.active_txns.read().unwrap();
         active
-            .iter()
+            .values()
             .min()
             .copied()
             .unwrap_or_else(|| self.next_txn_id.load(Acquire))
@@ -144,11 +152,14 @@ impl TransactionManager {
         let mut active = self.active_txns.write().unwrap();
 
         let txn_id = self.next_txn_id.fetch_add(1, AcqRel);
-        active.insert(txn_id);
+        // Snapshot xmin = oldest in-flight txn (self is always the newest).
+        // Stored alongside the ID: global_xmin() derives the vacuum horizon
+        // from these snapshot xmins, not from the IDs.
+        let xmin = active.keys().min().copied().unwrap_or(txn_id);
+        active.insert(txn_id, xmin);
 
-        let xmin = *active.iter().min().unwrap_or(&txn_id);
         let xmax = self.next_txn_id.load(Acquire);
-        let active_vec: Vec<u64> = active.iter().cloned().collect();
+        let active_vec: Vec<u64> = active.keys().cloned().collect();
 
         drop(active);
 
@@ -262,7 +273,7 @@ impl TransactionManager {
 
     /// Returns `true` if the transaction is currently in the active set.
     pub fn is_active(&self, txn_id: u64) -> bool {
-        self.active_txns.read().unwrap().contains(&txn_id)
+        self.active_txns.read().unwrap().contains_key(&txn_id)
     }
 
     /// Generates a "latest" snapshot from the current manager state.
@@ -274,9 +285,9 @@ impl TransactionManager {
         let active = self.active_txns.read().unwrap();
         let xmax = self.next_txn_id.load(Acquire);
         Snapshot {
-            xmin: *active.iter().min().unwrap_or(&xmax),
+            xmin: active.keys().min().copied().unwrap_or(xmax),
             xmax,
-            active: active.iter().cloned().collect(),
+            active: active.keys().cloned().collect(),
         }
     }
 
@@ -564,10 +575,14 @@ mod tests {
         //when a sweep runs
         let txc1 = tm.begin();
         let tx_abort = tm.begin();
-        let _txc2 = tm.begin();
 
         tm.mark_committed(txc1.txn_id);
         tm.mark_aborted(tx_abort.txn_id);
+
+        // Begin AFTER the first two settle: global_xmin is the min snapshot
+        // xmin of live txns, so txc2's snapshot must postdate the aborted txn
+        // for the horizon to rise above it.
+        let _txc2 = tm.begin();
 
         //now, we run a full sweep
         tm.publish_vacuum_horizon(tx_abort.txn_id - 1); // so that the horizon is below the aborted txn's id 
