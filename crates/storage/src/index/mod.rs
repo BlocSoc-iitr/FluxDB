@@ -336,110 +336,106 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             // drop the latch before waiting — holding it while sleeping would
             // block every other reader/writer on this page.
             let mut leaf_guard = self.pool.fetch_page_mut(leaf_pid)?;
+            // Rightlink correction: follow splits that happened during descent.
             loop {
-                // Rightlink correction: follow splits that happened during descent.
-                loop {
-                    let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
-                    if let Some(hk) = acc.high_key_bytes()
-                        && K::compare(key_bytes.as_ref(), hk) != Ordering::Less
-                    {
-                        let right = acc.rightlink().unwrap();
-                        drop(leaf_guard);
-                        leaf_guard = self.pool.fetch_page_mut(right)?;
-                        continue;
-                    }
-                    break;
-                }
-
-                let landing_pid = leaf_guard.page_id;
-                let landing_lsn;
-                let prev_page;
-                let needs_left_chain_scan;
-
+                let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
+                if let Some(hk) = acc.high_key_bytes()
+                    && K::compare(key_bytes.as_ref(), hk) != Ordering::Less
                 {
-                    let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
-                    landing_lsn = acc.lsn();
-                    prev_page = acc.prev_page();
-
-                    let (slot, exact) = acc.position(key);
-                    needs_left_chain_scan = prev_page.is_some() && (exact || slot == 0);
-
-                    if exact {
-                        match self.check_insert_conflict(&acc, slot, key, txn) {
-                            Ok(()) => {}
-                            Err(IndexError::WaitFor(blocking_txn)) => {
-                                drop(leaf_guard);
-                                Self::wait_for_txn(&txn.tm, blocking_txn, txn.txn_id)?;
-                                continue 'restart;
-                            }
-                            Err(e) => return Err(e),
-                        }
-                    }
-                }
-
-                if needs_left_chain_scan {
-                    // A version-chain split can leave same-key versions on
-                    // left pages. Validate the landing page's LSN after the
-                    // latch-free left walk so the conflict verdict still holds
-                    // at insert time.
+                    let right = acc.rightlink().unwrap();
                     drop(leaf_guard);
-                    match self.check_insert_conflict_left_chain(prev_page, key, txn) {
+                    leaf_guard = self.pool.fetch_page_mut(right)?;
+                    continue;
+                }
+                break;
+            }
+
+            let landing_pid = leaf_guard.page_id;
+            let landing_lsn;
+            let prev_page;
+            let needs_left_chain_scan;
+
+            {
+                let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
+                landing_lsn = acc.lsn();
+                prev_page = acc.prev_page();
+
+                let (slot, exact) = acc.position(key);
+                needs_left_chain_scan = prev_page.is_some() && (exact || slot == 0);
+
+                if exact {
+                    match self.check_insert_conflict(&acc, slot, key, txn) {
                         Ok(()) => {}
                         Err(IndexError::WaitFor(blocking_txn)) => {
+                            drop(leaf_guard);
                             Self::wait_for_txn(&txn.tm, blocking_txn, txn.txn_id)?;
                             continue 'restart;
                         }
                         Err(e) => return Err(e),
                     }
+                }
+            }
 
-                    leaf_guard = self.pool.fetch_page_mut(landing_pid)?;
-                    let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
-                    if acc.lsn() != landing_lsn {
+            if needs_left_chain_scan {
+                // A version-chain split can leave same-key versions on
+                // left pages. Validate the landing page's LSN after the
+                // latch-free left walk so the conflict verdict still holds
+                // at insert time.
+                drop(leaf_guard);
+                match self.check_insert_conflict_left_chain(prev_page, key, txn) {
+                    Ok(()) => {}
+                    Err(IndexError::WaitFor(blocking_txn)) => {
+                        Self::wait_for_txn(&txn.tm, blocking_txn, txn.txn_id)?;
                         continue 'restart;
                     }
+                    Err(e) => return Err(e),
                 }
 
-                let (slot, _) = LeafPageAccessor::<K, V>::new(&leaf_guard[..]).position(key);
-                let val_bytes = V::as_bytes(value);
-                let (stored_val, rec_type) =
-                    self.materialize_value(val_bytes.as_ref(), txn.txn_id)?;
-
-                let result = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).insert_raw(
-                    slot,
-                    key_bytes.as_ref(),
-                    &stored_val,
-                    rec_type,
-                );
-                return match result {
-                    Ok(()) => {
-                        let page_id = leaf_guard.page_id;
-                        LeafPageMutator::<K, V>::new(&mut leaf_guard[..])
-                            .set_xmin(slot, txn.txn_id);
-                        // WAL: physiological Insert (DESIGN §4.2). Append-only here — durability
-                        // is enforced lazily by the buffer pool's WAL-before-page gate or at
-                        // commit, never fsynced at insert time. Stamp the record's LSN as the
-                        // page LSN so the gate flushes the WAL through it before the page lands.
-                        // For overflow records `stored_val` is the descriptor; the
-                        // overflow pages get their own WAL records via
-                        // write_overflow_chain. rec_type is logged so recovery
-                        // replays the record with the right inline/overflow tag.
-                        let lsn = self.wal.log_insert(
-                            txn.txn_id,
-                            page_id,
-                            slot as u16,
-                            key_bytes.as_ref(),
-                            &stored_val,
-                            rec_type,
-                            txn.txn_id,
-                        )?;
-                        LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
-                        Ok(())
-                    }
-                    Err(_) => {
-                        self.split_and_insert(leaf_guard, key, &stored_val, rec_type, txn, &stack)
-                    }
-                };
+                leaf_guard = self.pool.fetch_page_mut(landing_pid)?;
+                let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
+                if acc.lsn() != landing_lsn {
+                    continue 'restart;
+                }
             }
+
+            let (slot, _) = LeafPageAccessor::<K, V>::new(&leaf_guard[..]).position(key);
+            let val_bytes = V::as_bytes(value);
+            let (stored_val, rec_type) = self.materialize_value(val_bytes.as_ref(), txn.txn_id)?;
+
+            let result = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).insert_raw(
+                slot,
+                key_bytes.as_ref(),
+                &stored_val,
+                rec_type,
+            );
+            return match result {
+                Ok(()) => {
+                    let page_id = leaf_guard.page_id;
+                    LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_xmin(slot, txn.txn_id);
+                    // WAL: physiological Insert (DESIGN §4.2). Append-only here — durability
+                    // is enforced lazily by the buffer pool's WAL-before-page gate or at
+                    // commit, never fsynced at insert time. Stamp the record's LSN as the
+                    // page LSN so the gate flushes the WAL through it before the page lands.
+                    // For overflow records `stored_val` is the descriptor; the
+                    // overflow pages get their own WAL records via
+                    // write_overflow_chain. rec_type is logged so recovery
+                    // replays the record with the right inline/overflow tag.
+                    let lsn = self.wal.log_insert(
+                        txn.txn_id,
+                        page_id,
+                        slot as u16,
+                        key_bytes.as_ref(),
+                        &stored_val,
+                        rec_type,
+                        txn.txn_id,
+                    )?;
+                    LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
+                    Ok(())
+                }
+                Err(_) => {
+                    self.split_and_insert(leaf_guard, key, &stored_val, rec_type, txn, &stack)
+                }
+            };
         }
     }
 
