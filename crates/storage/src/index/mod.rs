@@ -11,7 +11,7 @@ use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 use std::sync::{Arc, Mutex};
 
-use common::{Key, MAX_KEY_SIZE, MAX_VALUE_SIZE, Value};
+use common::{Key, MAX_KEY_SIZE, Value};
 use db_core::transaction_manager::TransactionManager;
 
 use crate::buffer_pool::{BufferPoolManager, PageReadGuard, PageWriteGuard};
@@ -272,15 +272,6 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             return Err(IndexError::KeyTooLarge {
                 size: key_len,
                 max: MAX_KEY_SIZE,
-            });
-        }
-
-        let val_bytes_check = V::as_bytes(value);
-        let val_len = val_bytes_check.as_ref().len();
-        if val_len > MAX_VALUE_SIZE {
-            return Err(IndexError::ValueTooLarge {
-                size: val_len,
-                max: MAX_VALUE_SIZE,
             });
         }
 
