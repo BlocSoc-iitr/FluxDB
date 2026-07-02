@@ -962,9 +962,11 @@ fn reify_value<K: Key, V: Value>(
     pool: &BufferPoolManager,
 ) -> Result<Vec<u8>> {
     if acc.is_overflow(slot) {
-        let desc = acc
-            .overflow_descriptor(slot)
-            .expect("overflow record must carry a 12-byte descriptor");
+        let desc = acc.overflow_descriptor(slot).ok_or_else(|| {
+            common::BufferPoolError::InternalError(
+                "overflow record missing or malformed OverflowDescriptor".to_string(),
+            )
+        })?;
         read_overflow_chain(desc, pool)
     } else {
         Ok(acc.raw_value(slot).to_vec())

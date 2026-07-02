@@ -155,7 +155,7 @@ impl<'a> OverflowPageMutator<'a> {
         assert_eq!(
             read_u8(data, OFF_PAGE_TYPE),
             OVERFLOW,
-            "OverflowPageAccessor: page type byte is not OVERFLOW"
+            "OverflowPageMutator: page type byte is not OVERFLOW"
         );
         Self { data }
     }
