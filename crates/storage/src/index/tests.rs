@@ -679,27 +679,21 @@ fn compact_prevents_split() {
     let result = idx.get(&(k.as_ref()), &tm.begin()).unwrap();
     assert!(result.is_some(), "Inserted record should be readable");
 }
-// ── ValueTooLarge guard ──────────────────────────────────────────────
+// ── Overflow spill: large values are accepted, not rejected ───────────
 
 #[test]
-fn insert_and_update_reject_oversized_value() {
+fn insert_and_update_accept_oversized_value() {
     let idx = make_index();
     let k: &[u8] = b"key";
-    let oversized = vec![0xFFu8; MAX_VALUE_SIZE + 1];
+    // Larger than the inline threshold → spills to an overflow page chain.
+    let oversized = vec![0xFFu8; OVERFLOW_THRESHOLD + 1];
 
-    // insert should reject
-    let err = idx.insert(&k, &oversized.as_slice(), &auto()).unwrap_err();
-    assert!(matches!(err, IndexError::ValueTooLarge { size, max }
-        if size == MAX_VALUE_SIZE + 1 && max == MAX_VALUE_SIZE));
+    // insert no longer rejects — it allocates an overflow chain.
+    idx.insert(&k, &oversized.as_slice(), &auto()).unwrap();
 
-    // insert a small value so we have something to update
-    let v: &[u8] = b"small";
-    idx.insert(&k, &v, &auto()).unwrap();
-
-    // update should also reject
-    let err = idx.update(&k, &oversized.as_slice(), &auto()).unwrap_err();
-    assert!(matches!(err, IndexError::ValueTooLarge { size, max }
-        if size == MAX_VALUE_SIZE + 1 && max == MAX_VALUE_SIZE));
+    // update to an even larger value also succeeds.
+    let bigger = vec![0xABu8; OVERFLOW_THRESHOLD * 3];
+    idx.update(&k, &bigger.as_slice(), &auto()).unwrap();
 }
 
 // ── WAL: physiological Insert logging brings the flush gate to life ───────
@@ -883,4 +877,506 @@ fn clog_reconstructed_after_crash() {
         TransactionStatus::Committed
     );
     assert_eq!(tm.settled_status(inflight_id), TransactionStatus::Aborted);
+}
+
+// ── Overflow chain helpers (Layer B) ──────────────────────────────────
+//
+// These exercise write_overflow_chain / read_overflow_chain /
+// collect_overflow_page_ids / free_overflow_chain directly against a real
+// buffer pool + WAL, independent of the B+Tree. They bypass OVERFLOW_THRESHOLD
+// (the helpers always spill), so values smaller than the threshold are fine here.
+
+/// Bytes per overflow page payload. Mirrors the private OVERFLOW_PAYLOAD_SIZE in
+/// page::overflow; kept in sync by `chain_length_matches_value_size` below, which
+/// would fail if the real constant ever diverges from this value.
+const OVERFLOW_PAYLOAD: usize = 4048;
+
+/// A value with a non-repeating, page-boundary-crossing byte pattern so a
+/// mis-assembled chain (wrong order, dropped/duplicated page) is detected.
+fn big_value(n: usize) -> Vec<u8> {
+    (0..n).map(|i| (i % 251) as u8).collect()
+}
+
+#[test]
+fn write_read_single_page_chain() {
+    let dir = tempdir().unwrap();
+    let (pool, wal, _tm, _idx) = build_db(dir.path());
+
+    let value = big_value(1000); // < one page
+    let desc = write_overflow_chain(&value, &pool, &wal, 1).unwrap();
+
+    assert_eq!(desc.total_size as usize, value.len());
+    assert_eq!(
+        collect_overflow_page_ids(desc.first_page_id, &pool)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(read_overflow_chain(desc, &pool).unwrap(), value);
+}
+
+#[test]
+fn write_read_multi_page_chain() {
+    let dir = tempdir().unwrap();
+    let (pool, wal, _tm, _idx) = build_db(dir.path());
+
+    // 6 pages: five full payloads plus a 7-byte tail.
+    let value = big_value(OVERFLOW_PAYLOAD * 5 + 7);
+    let desc = write_overflow_chain(&value, &pool, &wal, 1).unwrap();
+
+    let ids = collect_overflow_page_ids(desc.first_page_id, &pool).unwrap();
+    assert_eq!(ids.len(), 6, "expected six pages in the chain");
+    // Page IDs are distinct (no self-link / cycle).
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        ids.len(),
+        "chain contains a duplicate page id"
+    );
+
+    assert_eq!(read_overflow_chain(desc, &pool).unwrap(), value);
+}
+
+#[test]
+fn chain_length_matches_value_size() {
+    let dir = tempdir().unwrap();
+    let (pool, wal, _tm, _idx) = build_db(dir.path());
+
+    // Boundary sizes around the payload limit: empty-ish, exact, one-over, multi.
+    for &len in &[
+        1usize,
+        OVERFLOW_PAYLOAD,
+        OVERFLOW_PAYLOAD + 1,
+        OVERFLOW_PAYLOAD * 3,
+    ] {
+        let value = big_value(len);
+        let desc = write_overflow_chain(&value, &pool, &wal, 1).unwrap();
+        let pages = collect_overflow_page_ids(desc.first_page_id, &pool).unwrap();
+        assert_eq!(
+            pages.len(),
+            len.div_ceil(OVERFLOW_PAYLOAD),
+            "wrong page count for value of {len} bytes"
+        );
+        assert_eq!(read_overflow_chain(desc, &pool).unwrap(), value);
+    }
+}
+
+#[test]
+fn free_chain_then_rewrite_roundtrips() {
+    let dir = tempdir().unwrap();
+    let (pool, wal, _tm, _idx) = build_db(dir.path());
+
+    let value = big_value(OVERFLOW_PAYLOAD * 3);
+    let desc = write_overflow_chain(&value, &pool, &wal, 1).unwrap();
+    let freed = collect_overflow_page_ids(desc.first_page_id, &pool).unwrap();
+    assert_eq!(freed.len(), 3);
+
+    // Freeing must succeed and leave the pool usable: a fresh chain of the same
+    // value writes and reads back identically (no corrupted frame bookkeeping).
+    free_overflow_chain(desc.first_page_id, &pool).unwrap();
+
+    let desc2 = write_overflow_chain(&value, &pool, &wal, 2).unwrap();
+    assert_eq!(read_overflow_chain(desc2, &pool).unwrap(), value);
+}
+
+#[test]
+fn write_chain_logs_one_overflow_write_per_page() {
+    let dir = tempdir().unwrap();
+    let (pool, wal, _tm, _idx) = build_db(dir.path());
+
+    // `create` logs nothing, so every record below is from write_overflow_chain.
+    let value = big_value(OVERFLOW_PAYLOAD * 3 - 10); // 3 pages
+    let desc = write_overflow_chain(&value, &pool, &wal, 1).unwrap();
+    assert_eq!(
+        collect_overflow_page_ids(desc.first_page_id, &pool)
+            .unwrap()
+            .len(),
+        3
+    );
+
+    // Make the records durable so the iterator can read them off disk.
+    wal.flush_up_to(wal.next_lsn()).unwrap();
+
+    let mut it = WalIterator::new(dir.path().join("wal")).unwrap();
+    let mut overflow_writes = 0;
+    while let Some(rec) = it.next_record() {
+        let rec = rec.unwrap();
+        if rec.entry_type == WalRecordType::OverflowWrite {
+            overflow_writes += 1;
+            assert_eq!(rec.blocks.len(), 1, "OverflowWrite carries one block");
+            assert!(
+                rec.blocks[0].fpi.is_some(),
+                "OverflowWrite block must carry a full-page image"
+            );
+        }
+    }
+    assert_eq!(
+        overflow_writes, 3,
+        "one OverflowWrite record per overflow page"
+    );
+}
+
+// ── Overflow through the B+Tree (Layer C) ─────────────────────────────
+//
+// End-to-end insert / update / delete / range / split with values that exceed
+// OVERFLOW_THRESHOLD, so the index spills them to a chain and stores a 12-byte
+// descriptor in the leaf record. Values are local Vecs — insert copies the bytes
+// into the page (and the chain), so nothing needs a 'static lifetime.
+
+/// A value comfortably over the inline threshold (spans ~2 overflow pages).
+fn overflow_sized() -> Vec<u8> {
+    big_value(OVERFLOW_THRESHOLD * 2)
+}
+
+#[test]
+fn insert_large_value_get_reconstructs() {
+    let idx = make_index();
+    let k: &[u8] = b"big";
+    let v = big_value(OVERFLOW_THRESHOLD * 2 + 13);
+
+    idx.insert(&k, &v.as_slice(), &auto()).unwrap();
+
+    // A 12-byte descriptor leaking through instead of a reconstructed value
+    // would fail both the length and the equality check.
+    let got = idx.get(&k, &auto()).unwrap().unwrap();
+    assert_eq!(got.len(), v.len());
+    assert_eq!(got, v);
+}
+
+#[test]
+fn insert_large_value_stored_as_overflow_record() {
+    // White-box: the leaf record itself must be tagged overflow and hold only
+    // the 12-byte descriptor, not the inline value bytes.
+    let idx = make_index();
+    let k: &[u8] = b"big";
+    let v = overflow_sized();
+    idx.insert(&k, &v.as_slice(), &auto()).unwrap();
+
+    let leaf_pid = idx.find_leaf(idx.root_page_id(), &k).unwrap();
+    let page = idx.pool.fetch_page(leaf_pid).unwrap();
+    let acc = LeafPageAccessor::<&[u8], &[u8]>::new(&page[..]);
+    let slot = acc.find_key(&k).unwrap();
+    assert!(
+        acc.is_overflow(slot),
+        "large value must be tagged as overflow"
+    );
+    assert_eq!(
+        acc.raw_value(slot).len(),
+        12,
+        "leaf stores the OverflowDescriptor, not the value"
+    );
+    drop(page);
+
+    assert_eq!(idx.get(&k, &auto()).unwrap().unwrap(), v);
+}
+
+#[test]
+fn update_inline_to_overflow() {
+    let idx = make_index();
+    let k: &[u8] = b"k";
+    idx.insert(&k, &(&b"small"[..]), &auto()).unwrap();
+
+    let big = overflow_sized();
+    idx.update(&k, &big.as_slice(), &auto()).unwrap();
+    assert_eq!(idx.get(&k, &auto()).unwrap().unwrap(), big);
+}
+
+#[test]
+fn update_overflow_to_inline() {
+    let idx = make_index();
+    let k: &[u8] = b"k";
+    idx.insert(&k, &overflow_sized().as_slice(), &auto())
+        .unwrap();
+
+    idx.update(&k, &(&b"small"[..]), &auto()).unwrap();
+    assert_eq!(idx.get(&k, &auto()).unwrap().unwrap(), b"small");
+}
+
+#[test]
+fn update_overflow_to_larger_overflow() {
+    let idx = make_index();
+    let k: &[u8] = b"k";
+    let first = big_value(OVERFLOW_THRESHOLD * 2); // ~2 pages
+    let second = big_value(OVERFLOW_THRESHOLD * 4); // ~4 pages
+
+    idx.insert(&k, &first.as_slice(), &auto()).unwrap();
+    idx.update(&k, &second.as_slice(), &auto()).unwrap();
+
+    // The live version reconstructs the new chain; the old chain is orphaned
+    // (still on disk until vacuum) but never surfaces through the live read.
+    assert_eq!(idx.get(&k, &auto()).unwrap().unwrap(), second);
+}
+
+#[test]
+fn delete_overflow_then_invisible() {
+    let idx = make_index();
+    let k: &[u8] = b"k";
+    idx.insert(&k, &overflow_sized().as_slice(), &auto())
+        .unwrap();
+    idx.delete(&k, &auto()).unwrap();
+    assert!(idx.get(&k, &auto()).unwrap().is_none());
+}
+
+#[test]
+fn range_scan_mixes_inline_and_overflow() {
+    let idx = make_index();
+    let n = 20u32;
+
+    // Even keys inline, odd keys overflow (size varies per key so a mix-up
+    // between two overflow records is also caught).
+    let expected = |i: u32| -> Vec<u8> {
+        if i.is_multiple_of(2) {
+            big_value(8)
+        } else {
+            big_value(OVERFLOW_THRESHOLD * 2 + i as usize)
+        }
+    };
+
+    for i in 0..n {
+        let k = i.to_be_bytes();
+        idx.insert(&(k.as_ref()), &expected(i).as_slice(), &auto())
+            .unwrap();
+    }
+
+    let results: Vec<(Vec<u8>, Vec<u8>)> = idx
+        .range::<std::ops::RangeFull>(.., &auto())
+        .map(|r| r.unwrap())
+        .collect();
+
+    assert_eq!(results.len(), n as usize);
+    for (i, (k, v)) in results.iter().enumerate() {
+        let i = i as u32;
+        assert_eq!(k.as_slice(), &i.to_be_bytes()[..], "key out of order");
+        assert_eq!(v, &expected(i), "value mismatch at key {i}");
+    }
+}
+
+#[test]
+fn split_preserves_overflow_descriptor() {
+    let idx = make_index();
+    let big_val = overflow_sized();
+
+    // 300 keys force multiple leaf splits; key 150 carries an overflow value, so
+    // its record must survive split_leaf_ly's raw_value/rec_type carry-through.
+    for i in 0u32..300 {
+        let k = i.to_be_bytes();
+        if i == 150 {
+            idx.insert(&(k.as_ref()), &big_val.as_slice(), &auto())
+                .unwrap();
+        } else {
+            let v = i.to_be_bytes();
+            idx.insert(&(k.as_ref()), &(v.as_ref()), &auto()).unwrap();
+        }
+    }
+
+    // The tree really split (root is now internal).
+    assert_eq!(
+        idx.pool.fetch_page(idx.root_page_id()).unwrap()[0],
+        INTERNAL
+    );
+
+    // The overflow value is intact after the split…
+    let big_key = 150u32.to_be_bytes();
+    assert_eq!(
+        idx.get(&(big_key.as_ref()), &auto()).unwrap().unwrap(),
+        big_val
+    );
+    // …and so is an inline neighbour.
+    let neighbour = 149u32.to_be_bytes();
+    assert_eq!(
+        idx.get(&(neighbour.as_ref()), &auto()).unwrap().unwrap(),
+        neighbour.to_vec()
+    );
+}
+
+// ── Overflow vacuuming (Layer D) ──────────────────────────────────────
+//
+// When a record holding an overflow value is vacuumed, its chain must be
+// released and the freed page IDs logged (log-before-delete) so recovery can
+// re-apply the free. These tests read the freed set straight from the WAL.
+
+/// Every overflow page ID logged by `OverflowFree` records under `wal_dir`.
+fn logged_overflow_free_ids(wal_dir: &Path) -> Vec<u64> {
+    let mut it = WalIterator::new(wal_dir).unwrap();
+    let mut ids = Vec::new();
+    while let Some(rec) = it.next_record() {
+        let rec = rec.unwrap();
+        if rec.entry_type == WalRecordType::OverflowFree {
+            let data = rec.main_data.expect("OverflowFree carries page IDs");
+            for chunk in data.chunks_exact(8) {
+                ids.push(u64::from_le_bytes(chunk.try_into().unwrap()));
+            }
+        }
+    }
+    ids
+}
+
+/// Read the overflow chain's first page ID from the live record at `key`.
+fn overflow_first_page(idx: &Idx, pool: &BufferPoolManager, key: &&[u8]) -> PageId {
+    let leaf = idx.find_leaf(idx.root_page_id(), key).unwrap();
+    let page = pool.fetch_page(leaf).unwrap();
+    let acc = LeafPageAccessor::<&[u8], &[u8]>::new(&page[..]);
+    let slot = acc.find_key(key).unwrap();
+    acc.overflow_descriptor(slot)
+        .expect("record is overflow")
+        .first_page_id
+}
+
+#[test]
+fn vacuum_frees_overflow_chain() {
+    let dir = tempdir().unwrap();
+    let (pool, wal, tm, idx) = build_db(dir.path());
+    let k: &[u8] = b"k";
+    let v = overflow_sized();
+
+    let t1 = tm.begin();
+    idx.insert(&k, &v.as_slice(), &t1).unwrap();
+    tm.mark_committed(t1.txn_id);
+
+    // Capture the chain while the record still references it.
+    let first = overflow_first_page(&idx, &pool, &k);
+    let mut chain = collect_overflow_page_ids(first, &pool).unwrap();
+    assert_eq!(chain.len(), 2, "two-page overflow value");
+
+    let t2 = tm.begin();
+    idx.delete(&k, &t2).unwrap();
+    tm.mark_committed(t2.txn_id);
+
+    let removed = idx.vacuum(&tm).unwrap();
+    assert_eq!(removed, 1);
+    assert!(idx.get(&k, &tm.begin()).unwrap().is_none());
+
+    // The freed page IDs are logged before the physical delete.
+    wal.flush_up_to(wal.next_lsn()).unwrap();
+    let mut logged = logged_overflow_free_ids(&dir.path().join("wal"));
+    chain.sort_unstable();
+    logged.sort_unstable();
+    assert_eq!(logged, chain, "vacuum logs exactly the freed chain");
+}
+
+#[test]
+fn vacuum_frees_only_orphaned_chain_after_update() {
+    let dir = tempdir().unwrap();
+    let (pool, wal, tm, idx) = build_db(dir.path());
+    let k: &[u8] = b"k";
+    let first_val = big_value(OVERFLOW_THRESHOLD * 2); // 2-page chain
+    let second_val = big_value(OVERFLOW_THRESHOLD * 4); // 4-page chain
+
+    let t1 = tm.begin();
+    idx.insert(&k, &first_val.as_slice(), &t1).unwrap();
+    tm.mark_committed(t1.txn_id);
+
+    // The old chain, captured before the update orphans it.
+    let old_first = overflow_first_page(&idx, &pool, &k);
+    let mut old_chain = collect_overflow_page_ids(old_first, &pool).unwrap();
+    assert_eq!(old_chain.len(), 2);
+
+    let t2 = tm.begin();
+    idx.update(&k, &second_val.as_slice(), &t2).unwrap();
+    tm.mark_committed(t2.txn_id);
+
+    // Vacuum removes the dead old version and frees only its chain.
+    let removed = idx.vacuum(&tm).unwrap();
+    assert_eq!(removed, 1);
+    // The new (live) value still reconstructs from its untouched chain.
+    assert_eq!(idx.get(&k, &tm.begin()).unwrap().unwrap(), second_val);
+
+    wal.flush_up_to(wal.next_lsn()).unwrap();
+    let mut logged = logged_overflow_free_ids(&dir.path().join("wal"));
+    old_chain.sort_unstable();
+    logged.sort_unstable();
+    assert_eq!(logged, old_chain, "only the orphaned old chain is freed");
+}
+
+// ── Overflow crash recovery (Layer E) ─────────────────────────────────
+//
+// Pages are intentionally left unflushed before the "crash" (the pool does not
+// flush on drop), so recovery must rebuild both the leaf record and the overflow
+// pages from the WAL.
+
+#[test]
+fn recover_overflow_insert_reconstructs_value() {
+    // Regression guard: the leaf Insert record must carry rec_type so redo tags
+    // the record overflow. Without it, recovery would replay the record inline
+    // and get() would return the 12-byte descriptor instead of the value.
+    let dir = tempdir().unwrap();
+    let big = big_value(OVERFLOW_THRESHOLD * 2);
+    {
+        let (_pool, wal, tm, index) = build_db(dir.path());
+        let t = tm.begin();
+        index.insert(&(&b"k"[..]), &big.as_slice(), &t).unwrap();
+        wal.log_commit(t.txn_id).unwrap();
+        tm.mark_committed(t.txn_id);
+        // Durable WAL, unflushed pages → recovery redoes the leaf Insert and the
+        // OverflowWrite FPIs.
+        wal.flush_up_to(wal.next_lsn()).unwrap();
+        // crash
+    }
+
+    let (_pool, _wal, tm, index) = reopen_db(dir.path());
+    let got = index.get(&(&b"k"[..]), &tm.begin()).unwrap();
+    assert_eq!(
+        got.as_deref(),
+        Some(big.as_slice()),
+        "recovered overflow value must reconstruct, not return the descriptor"
+    );
+}
+
+#[test]
+fn recover_overflow_free_is_idempotent() {
+    let dir = tempdir().unwrap();
+    let big = big_value(OVERFLOW_THRESHOLD * 2);
+    {
+        let (pool, wal, tm, index) = build_db(dir.path());
+        let t1 = tm.begin();
+        index.insert(&(&b"k"[..]), &big.as_slice(), &t1).unwrap();
+        wal.log_commit(t1.txn_id).unwrap();
+        tm.mark_committed(t1.txn_id);
+
+        let t2 = tm.begin();
+        index.delete(&(&b"k"[..]), &t2).unwrap();
+        wal.log_commit(t2.txn_id).unwrap();
+        tm.mark_committed(t2.txn_id);
+
+        index.vacuum(&tm).unwrap(); // logs OverflowFree + frees the chain
+        wal.flush_up_to(wal.next_lsn()).unwrap();
+        pool.flush_all_pages().unwrap();
+        // crash
+    }
+
+    // First recovery replays OverflowFree once.
+    {
+        let (_pool, _wal, tm, index) = reopen_db(dir.path());
+        assert!(index.get(&(&b"k"[..]), &tm.begin()).unwrap().is_none());
+    }
+    // Second recovery replays it again on already-absent pages — delete_page is
+    // idempotent, so recovery must not error and the key stays gone.
+    let (_pool, _wal, tm, index) = reopen_db(dir.path());
+    assert!(index.get(&(&b"k"[..]), &tm.begin()).unwrap().is_none());
+}
+
+#[test]
+fn crash_victim_overflow_insert_invisible_after_reopen() {
+    let dir = tempdir().unwrap();
+    let big = big_value(OVERFLOW_THRESHOLD * 2);
+    {
+        let (pool, wal, tm, index) = build_db(dir.path());
+        let victim = tm.begin();
+        index
+            .insert(&(&b"ghost"[..]), &big.as_slice(), &victim)
+            .unwrap();
+        // Durable Insert + overflow pages, but NO commit record.
+        wal.flush_up_to(wal.next_lsn()).unwrap();
+        pool.flush_all_pages().unwrap();
+        // crash
+    }
+
+    let (_pool, _wal, tm, index) = reopen_db(dir.path());
+    let reader = tm.begin();
+    // The in-flight writer is presumed aborted, so its overflow record is invisible.
+    assert!(index.get(&(&b"ghost"[..]), &reader).unwrap().is_none());
+    let all: Vec<(Vec<u8>, Vec<u8>)> = index.range(.., &reader).map(|r| r.unwrap()).collect();
+    assert!(all.is_empty());
 }

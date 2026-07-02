@@ -65,6 +65,9 @@ pub enum WalError {
 pub enum PageError {
     #[error("insufficient space: needed {needed} bytes but only {available} available")]
     InsufficientSpace { needed: usize, available: usize },
+
+    #[error("unexpected page type: expected {expected}, found {found}")]
+    UnexpectedPageType { expected: u8, found: u8 },
 }
 
 // === BUFFER POOL ERRORS =======================================================

@@ -9,11 +9,15 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
     /// Split a full leaf then insert `(key, value)` into the correct half.
     /// Takes ownership of `leaf_guard` so it can be dropped when inserting
     /// into the right page. Propagates the new separator up via `stack`.
+    /// `stored_val` is the bytes to place in the leaf record — either the inline
+    /// value or a serialized `OverflowDescriptor`; `rec_type` distinguishes the
+    /// two. The caller has already spilled large values via `materialize_value`.
     pub(super) fn split_and_insert(
         &self,
         mut leaf_guard: PageWriteGuard<'_>,
         key: &K::SelfType<'_>,
-        value: &V::SelfType<'_>,
+        stored_val: &[u8],
+        rec_type: u8,
         txn: &Transaction,
         stack: &BTStack,
     ) -> Result<()> {
@@ -21,7 +25,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
 
         // ── Try compaction first (design doc 25: bottom-up deletion) ──
         let global_xmin = txn.tm.global_xmin();
-        let dead_count = LeafPageMutator::<K, V>::compact(
+        let (dead_count, chains) = LeafPageMutator::<K, V>::compact(
             leaf_pid_actual,
             &mut leaf_guard[..],
             global_xmin,
@@ -36,15 +40,21 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 .log_page_compact(SYSTEM_TXN_ID, leaf_pid_actual, fpi)?;
             LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
 
+            // Free overflow chains orphaned by the compaction (log-before-delete).
+            for first_page_id in &chains {
+                let ids = collect_overflow_page_ids(*first_page_id, &self.pool)?;
+                self.wal.log_overflow_free(SYSTEM_TXN_ID, &ids)?;
+                free_overflow_chain(*first_page_id, &self.pool)?;
+            }
+
             let key_bytes = K::as_bytes(key);
-            let val_bytes = V::as_bytes(value);
             let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
 
-            if acc.can_fit_direct(key_bytes.as_ref().len(), val_bytes.as_ref().len()) {
+            if acc.can_fit_direct(key_bytes.as_ref().len(), stored_val.len()) {
                 let (slot, _) = acc.position(key);
 
                 let mut mutator = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]);
-                mutator.insert(slot, key, value)?;
+                mutator.insert_raw(slot, key_bytes.as_ref(), stored_val, rec_type)?;
                 mutator.set_xmin(slot, txn.txn_id);
 
                 // Insert logged separately under the real txn; compact avoided the split.
@@ -53,7 +63,8 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                     leaf_pid_actual,
                     slot as u16,
                     key_bytes.as_ref(),
-                    val_bytes.as_ref(),
+                    stored_val,
+                    rec_type,
                     txn.txn_id,
                 )?;
                 LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
@@ -72,18 +83,18 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             };
 
         // Insert the new tuple into its target half and log it under the real txn.
-        let val_bytes = V::as_bytes(value);
         if target_pid == leaf_pid_actual {
             let (s, _) = LeafPageAccessor::<K, V>::new(&leaf_guard[..]).position(key);
             let mut mutator = LeafPageMutator::<K, V>::new(&mut leaf_guard[..]);
-            mutator.insert(s, key, value)?;
+            mutator.insert_raw(s, key_bytes.as_ref(), stored_val, rec_type)?;
             mutator.set_xmin(s, txn.txn_id);
             let lsn = self.wal.log_insert(
                 txn.txn_id,
                 leaf_pid_actual,
                 s as u16,
                 key_bytes.as_ref(),
-                val_bytes.as_ref(),
+                stored_val,
+                rec_type,
                 txn.txn_id,
             )?;
             LeafPageMutator::<K, V>::new(&mut leaf_guard[..]).set_lsn(lsn);
@@ -121,21 +132,22 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             }
             {
                 let acc = LeafPageAccessor::<K, V>::new(&right[..]);
-                if !acc.can_fit_direct(key_bytes.as_ref().len(), val_bytes.as_ref().len()) {
-                    return self.split_and_insert(right, key, value, txn, stack);
+                if !acc.can_fit_direct(key_bytes.as_ref().len(), stored_val.len()) {
+                    return self.split_and_insert(right, key, stored_val, rec_type, txn, stack);
                 }
             }
             let right_pid = right.page_id;
             let (s, _) = LeafPageAccessor::<K, V>::new(&right[..]).position(key);
             let mut mutator = LeafPageMutator::<K, V>::new(&mut right[..]);
-            mutator.insert(s, key, value)?;
+            mutator.insert_raw(s, key_bytes.as_ref(), stored_val, rec_type)?;
             mutator.set_xmin(s, txn.txn_id);
             let lsn = self.wal.log_insert(
                 txn.txn_id,
                 right_pid,
                 s as u16,
                 key_bytes.as_ref(),
-                val_bytes.as_ref(),
+                stored_val,
+                rec_type,
                 txn.txn_id,
             )?;
             LeafPageMutator::<K, V>::new(&mut right[..]).set_lsn(lsn);
@@ -198,11 +210,14 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         let old_high_key: Option<Vec<u8>> = acc.high_key_bytes().map(|b| b.to_vec());
 
         // Snapshot ALL entries (including dead versions) to preserve MVCC history.
-        let left_entries: Vec<(Vec<u8>, Vec<u8>, u64, u64)> = (0..mid)
+        // Value bytes and rec_type are captured verbatim so overflow pointers in
+        // existing records survive the split unchanged.
+        type LeftEntry = (Vec<u8>, Vec<u8>, u8, u64, u64);
+        let left_entries: Vec<LeftEntry> = (0..mid)
             .map(|i| {
                 let k = K::as_bytes(&acc.get_key(i)).as_ref().to_vec();
-                let v = V::as_bytes(&acc.get_value(i)).as_ref().to_vec();
-                (k, v, acc.get_xmin(i), acc.get_xmax(i))
+                let v = acc.raw_value(i).to_vec();
+                (k, v, acc.get_rec_type(i), acc.get_xmin(i), acc.get_xmax(i))
             })
             .collect();
 
@@ -219,9 +234,10 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             builder.set_rightlink(old_rightlink);
             builder.set_prev_page(Some(leaf_pid));
             for i in mid..n {
-                builder.push_with_mvcc(
-                    &acc.get_key(i),
-                    &acc.get_value(i),
+                builder.push_with_mvcc_raw(
+                    K::as_bytes(&acc.get_key(i)).as_ref(),
+                    acc.raw_value(i),
+                    acc.get_rec_type(i),
                     acc.get_xmin(i),
                     acc.get_xmax(i),
                 );
@@ -247,8 +263,8 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             builder.set_high_key(&separator_key);
             builder.set_rightlink(Some(right_pid));
             builder.set_prev_page(prev);
-            for (k, v, xmin, xmax) in &left_entries {
-                builder.push_with_mvcc(&K::from_bytes(k), &V::from_bytes(v), *xmin, *xmax);
+            for (k, v, rt, xmin, xmax) in &left_entries {
+                builder.push_with_mvcc_raw(k, v, *rt, *xmin, *xmax);
             }
             builder.finish();
         }

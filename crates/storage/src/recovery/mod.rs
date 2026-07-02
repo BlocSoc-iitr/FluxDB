@@ -72,6 +72,12 @@ impl RecoveryManager {
             match record.entry_type {
                 WalRecordType::Commit => self.tm.mark_committed(record.txn_id),
                 WalRecordType::Abort => self.tm.mark_aborted(record.txn_id),
+                // OverflowFree carries no page blocks — it lists freed overflow
+                // page IDs in main_data. Re-delete each (idempotent on absent
+                // pages)
+                WalRecordType::OverflowFree => self.redo_overflow_free(&record)?,
+                // OverflowWrite carries a full-page image and is replayed by the
+                // generic FPI path in redo_record — no physiological apply needed.
                 _ => self.redo_record::<K, V>(&record)?,
             }
         }
@@ -88,6 +94,27 @@ impl RecoveryManager {
         self.tm.next_txn_id.fetch_max(max_txn + 1, Ordering::AcqRel);
 
         self.pool.flush_all_pages()?;
+        Ok(())
+    }
+
+    /// Replay an `OverflowFree` record: delete every overflow page listed in
+    /// `main_data`. `delete_page` is idempotent on pages absent from the pool,
+    /// so replaying an already-applied free is harmless.
+    fn redo_overflow_free(&self, record: &WalRecord) -> Result<()> {
+        let data = record.main_data.ok_or_else(|| {
+            WalError::CorruptedLog("OverflowFree record missing main data".to_string())
+        })?;
+        if data.len() % 8 != 0 {
+            return Err(WalError::CorruptedLog(format!(
+                "OverflowFree main data length {} is not a multiple of 8",
+                data.len()
+            ))
+            .into());
+        }
+        for chunk in data.chunks_exact(8) {
+            let page_id = u64::from_le_bytes(chunk.try_into().unwrap());
+            self.pool.delete_page(page_id)?;
+        }
         Ok(())
     }
 
@@ -121,16 +148,21 @@ impl RecoveryManager {
     ) -> Result<()> {
         match (entry_type, block_idx) {
             (WalRecordType::Insert, 0) => {
-                // slot u16, key_len u16, val_len u16, xmin u64, key, val
+                // slot u16, key_len u16, val_len u16, rec_type u8, xmin u64, key, val
                 let d = data.expect("Insert record missing data block");
                 let slot = u16::from_le_bytes(d[0..2].try_into().unwrap()) as usize;
                 let key_len = u16::from_le_bytes(d[2..4].try_into().unwrap()) as usize;
                 let val_len = u16::from_le_bytes(d[4..6].try_into().unwrap()) as usize;
-                let xmin = u64::from_le_bytes(d[6..14].try_into().unwrap());
-                let key = &d[14..14 + key_len];
-                let val = &d[14 + key_len..14 + key_len + val_len];
+                let rec_type = d[6];
+                let xmin = u64::from_le_bytes(d[7..15].try_into().unwrap());
+                let key = &d[15..15 + key_len];
+                // `val` is the stored payload verbatim — inline value bytes or a
+                // serialized OverflowDescriptor. Replay via insert_raw so the
+                // record's rec_type is preserved (a typed insert would force
+                // REC_TYPE_INLINE and corrupt overflow records on redo).
+                let val = &d[15 + key_len..15 + key_len + val_len];
                 let mut m = LeafPageMutator::<K, V>::new(page);
-                m.insert(slot, &K::from_bytes(key), &V::from_bytes(val))?;
+                m.insert_raw(slot, key, val, rec_type)?;
                 m.set_xmin(slot, xmin);
             }
             (WalRecordType::SetXMax, 0) => {

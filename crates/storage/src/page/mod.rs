@@ -9,8 +9,15 @@
 pub mod internal;
 pub mod leaf;
 pub mod meta;
+pub mod overflow;
 pub use internal::{InternalPageAccessor, InternalPageBuilder, InternalPageMutator};
-pub use leaf::{LeafPageAccessor, LeafPageBuilder, LeafPageMutator};
+pub use leaf::{
+    LeafPageAccessor, LeafPageBuilder, LeafPageMutator, REC_TYPE_INLINE, REC_TYPE_OVERFLOW,
+};
+pub use overflow::{
+    OverflowDescriptor, collect_overflow_page_ids, free_overflow_chain, read_overflow_chain,
+    write_overflow_chain,
+};
 
 pub use common::PageError;
 
@@ -28,12 +35,16 @@ pub const LEAF: u8 = 1;
 pub const INTERNAL: u8 = 2;
 /// Marker byte stored at offset 0 of metadata page
 pub const META: u8 = 3;
+/// Marker byte stored at offset 0 of every overflow page.
+pub const OVERFLOW: u8 = 4;
 // ── Page size ─────────────────────────────────────────────────────────────────
 
 /// Canonical page size used throughout the storage engine (4 KB).
 pub const PAGE_SIZE: usize = 4096;
 
-// ── Shared header offsets (present in both page types) ───────────────────────
+pub const OVERFLOW_THRESHOLD: usize = 2048;
+
+// ── Shared header offsets (present in all three page types) ───────────────────────
 
 pub(super) const OFF_PAGE_TYPE: usize = 0; // u8
 pub(super) const OFF_FLAGS: usize = 1; // u8 — page-header flag bits
@@ -89,6 +100,8 @@ const OFF_LEAF_CHECKSUM: usize = 44;
 const OFF_INT_CHECKSUM: usize = 32;
 /// checksum offset for metadata page
 const OFF_META_CHECKSUM: usize = 56;
+/// checksum offset for overflow page
+const OFF_OVERFLOW_CHECKSUM: usize = 44;
 /// Byte offset of the CRC32 field for the given page-type marker, or `None` for
 /// an unrecognised type (e.g. a never-initialised, all-zero page) which carries
 /// no checksum to verify.
@@ -98,6 +111,8 @@ fn checksum_offset(page_type: u8) -> Option<usize> {
         LEAF => Some(OFF_LEAF_CHECKSUM),
         INTERNAL => Some(OFF_INT_CHECKSUM),
         META => Some(OFF_META_CHECKSUM),
+        OVERFLOW => Some(OFF_OVERFLOW_CHECKSUM),
+
         _ => None,
     }
 }
