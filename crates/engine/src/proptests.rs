@@ -902,6 +902,36 @@ fn single_key_version_chain_spans_pages() {
     keeper.abort();
 }
 
+#[test]
+fn insert_conflict_checks_left_pages_of_split_version_chain() {
+    let (_dir, engine) = tmp_engine::<u32, u32>();
+    engine.insert(&7u32, &0u32).unwrap();
+
+    // This transaction's snapshot sees the original version. Keeping it open
+    // also pins old versions so the hot-key chain cannot be compacted away
+    // before it splits across leaves.
+    let mut old = engine.begin();
+
+    for v in 1..=300u32 {
+        engine.update(&7u32, &v).unwrap();
+    }
+
+    let h = tree_height::<u32>(&engine.buffer_pool, engine.index.root_page_id());
+    assert!(
+        h >= 1,
+        "expected the version chain to split into multiple leaves, height={h}"
+    );
+    check_invariants(&engine.index, &engine.buffer_pool).unwrap();
+
+    let err = old.insert(&7u32, &999u32).unwrap_err();
+    assert!(
+        matches!(err, EngineError::Index(IndexError::DuplicateKey)),
+        "insert must see the visible left-chain version, got {err:?}"
+    );
+
+    old.abort();
+}
+
 /// Deterministic deep-tree coverage: ~25k distinct keys forces a **3-level**
 /// tree (height ≥ 2), exercising `split_internal_ly` / cascading internal splits
 /// that the small-key-space oracle can't reach. Three insertion orders stress

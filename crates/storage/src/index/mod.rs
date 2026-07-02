@@ -275,58 +275,58 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             });
         }
 
-        let root_pid = *self.root.lock().unwrap();
-        let mut stack = BTStack::new();
-        let mut pid = root_pid;
+        'restart: loop {
+            let root_pid = *self.root.lock().unwrap();
+            let mut stack = BTStack::new();
+            let mut pid = root_pid;
 
-        // ── Phase 1: Optimistic descent (shared latches only) ────────────
-        let leaf_pid = loop {
-            let page = self.pool.fetch_page(pid)?;
-            // Lazily finish a split left incomplete (crash window / concurrent
-            // split), then restart from the root.
-            if crate::page::is_incomplete_split(&page[..]) {
-                drop(page);
-                self.finish_split(pid, &stack)?;
-                stack.clear();
-                pid = *self.root.lock().unwrap();
-                continue;
-            }
-            match page[0] {
-                INTERNAL => {
-                    let acc = InternalPageAccessor::<K>::new(&page[..]);
-                    if let Some(hk) = acc.high_key_bytes()
-                        && K::compare(key_bytes.as_ref(), hk) != Ordering::Less
-                    {
-                        let right = acc.rightlink().unwrap();
+            // ── Phase 1: Optimistic descent (shared latches only) ────────────
+            let leaf_pid = loop {
+                let page = self.pool.fetch_page(pid)?;
+                // Lazily finish a split left incomplete (crash window / concurrent
+                // split), then restart from the root.
+                if crate::page::is_incomplete_split(&page[..]) {
+                    drop(page);
+                    self.finish_split(pid, &stack)?;
+                    stack.clear();
+                    pid = *self.root.lock().unwrap();
+                    continue;
+                }
+                match page[0] {
+                    INTERNAL => {
+                        let acc = InternalPageAccessor::<K>::new(&page[..]);
+                        if let Some(hk) = acc.high_key_bytes()
+                            && K::compare(key_bytes.as_ref(), hk) != Ordering::Less
+                        {
+                            let right = acc.rightlink().unwrap();
+                            drop(page);
+                            pid = right;
+                            continue;
+                        }
+                        let (_, child_pid) = acc.find_child(key);
+                        stack.push(BTStackEntry { page_id: pid });
                         drop(page);
-                        pid = right;
-                        continue;
+                        pid = child_pid;
                     }
-                    let (_, child_pid) = acc.find_child(key);
-                    stack.push(BTStackEntry { page_id: pid });
-                    drop(page);
-                    pid = child_pid;
+                    LEAF => {
+                        drop(page);
+                        break pid;
+                    }
+                    found => {
+                        return Err(IndexError::UnexpectedPageType {
+                            expected: LEAF,
+                            found,
+                        });
+                    }
                 }
-                LEAF => {
-                    drop(page);
-                    break pid;
-                }
-                found => {
-                    return Err(IndexError::UnexpectedPageType {
-                        expected: LEAF,
-                        found,
-                    });
-                }
-            }
-        };
+            };
 
-        // ── Phase 2+3: Latch, conflict check, insert (retry on WaitFor) ──
-        //
-        // If check_insert_conflict returns WaitFor(blocking_txn), we must
-        // drop the latch before waiting — holding it while sleeping would
-        // block every other reader/writer on this page.
-        let mut leaf_guard = self.pool.fetch_page_mut(leaf_pid)?;
-        loop {
+            // ── Phase 2+3: Latch, conflict check, insert (retry on WaitFor) ──
+            //
+            // If check_insert_conflict returns WaitFor(blocking_txn), we must
+            // drop the latch before waiting — holding it while sleeping would
+            // block every other reader/writer on this page.
+            let mut leaf_guard = self.pool.fetch_page_mut(leaf_pid)?;
             // Rightlink correction: follow splits that happened during descent.
             loop {
                 let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
@@ -341,23 +341,55 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 break;
             }
 
-            let (slot, exact) = LeafPageAccessor::<K, V>::new(&leaf_guard[..]).position(key);
+            let landing_pid = leaf_guard.page_id;
+            let landing_lsn;
+            let prev_page;
+            let needs_left_chain_scan;
 
-            if exact {
+            {
                 let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
-                match self.check_insert_conflict(&acc, slot, key, txn) {
-                    Ok(()) => {}
-                    Err(IndexError::WaitFor(blocking_txn)) => {
-                        drop(leaf_guard);
-                        Self::wait_for_txn(&txn.tm, blocking_txn, txn.txn_id)?;
-                        leaf_guard = self.pool.fetch_page_mut(leaf_pid)?;
-                        continue;
+                landing_lsn = acc.lsn();
+                prev_page = acc.prev_page();
+
+                let (slot, exact) = acc.position(key);
+                needs_left_chain_scan = prev_page.is_some() && (exact || slot == 0);
+
+                if exact {
+                    match self.check_insert_conflict(&acc, slot, key, txn) {
+                        Ok(()) => {}
+                        Err(IndexError::WaitFor(blocking_txn)) => {
+                            drop(leaf_guard);
+                            Self::wait_for_txn(&txn.tm, blocking_txn, txn.txn_id)?;
+                            continue 'restart;
+                        }
+                        Err(e) => return Err(e),
                     }
-                    Err(e) => return Err(e),
                 }
             }
 
-            // Spill the value to an overflow chain now if it exceeds the inline threshold;
+            if needs_left_chain_scan {
+                // A version-chain split can leave same-key versions on
+                // left pages. Validate the landing page's LSN after the
+                // latch-free left walk so the conflict verdict still holds
+                // at insert time.
+                drop(leaf_guard);
+                match self.check_insert_conflict_left_chain(prev_page, key, txn) {
+                    Ok(()) => {}
+                    Err(IndexError::WaitFor(blocking_txn)) => {
+                        Self::wait_for_txn(&txn.tm, blocking_txn, txn.txn_id)?;
+                        continue 'restart;
+                    }
+                    Err(e) => return Err(e),
+                }
+
+                leaf_guard = self.pool.fetch_page_mut(landing_pid)?;
+                let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
+                if acc.lsn() != landing_lsn {
+                    continue 'restart;
+                }
+            }
+
+            let (slot, _) = LeafPageAccessor::<K, V>::new(&leaf_guard[..]).position(key);
             let val_bytes = V::as_bytes(value);
             let (stored_val, rec_type) = self.materialize_value(val_bytes.as_ref(), txn.txn_id)?;
 
@@ -941,6 +973,35 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             }
 
             i += 1;
+        }
+        Ok(())
+    }
+
+    fn check_insert_conflict_left_chain(
+        &self,
+        mut prev_pid: Option<PageId>,
+        key: &K::SelfType<'_>,
+        txn: &Transaction,
+    ) -> Result<()> {
+        let key_bytes = K::as_bytes(key);
+        let key_ref = key_bytes.as_ref();
+
+        while let Some(pid) = prev_pid {
+            let next_prev = {
+                let page = self.pool.fetch_page(pid)?;
+                let acc = LeafPageAccessor::<K, V>::new(&page[..]);
+                match acc.high_key_bytes() {
+                    Some(hk) if K::compare(hk, key_ref) == Ordering::Equal => {}
+                    _ => return Ok(()),
+                }
+
+                let (slot, exact) = acc.position(key);
+                if exact {
+                    self.check_insert_conflict(&acc, slot, key, txn)?;
+                }
+                acc.prev_page()
+            };
+            prev_pid = next_prev;
         }
         Ok(())
     }
