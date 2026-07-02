@@ -106,7 +106,9 @@ impl<'a> OverflowPageBuilder<'a> {
     }
 
     pub fn finish(self) -> OverflowPageMutator<'a> {
-        OverflowPageMutator::new(self.data)
+        // The builder just stamped the OVERFLOW type byte, so the page is known
+        // valid — construct the mutator directly without re-validating.
+        OverflowPageMutator { data: self.data }
     }
 }
 pub struct OverflowPageAccessor<'a> {
@@ -114,13 +116,20 @@ pub struct OverflowPageAccessor<'a> {
 }
 
 impl<'a> OverflowPageAccessor<'a> {
-    pub fn new(data: &'a [u8]) -> Self {
-        assert_eq!(
-            read_u8(data, OFF_PAGE_TYPE),
-            OVERFLOW,
-            "OverflowPageAccessor: page type byte is not OVERFLOW"
-        );
-        Self { data }
+    /// Wraps a raw page buffer, verifying the page-type byte.
+    ///
+    /// Returns [`PageError::UnexpectedPageType`] if `data` is not an overflow
+    /// page — a corrupt or mis-linked page must surface as an error rather than
+    /// panic and take down the process.
+    pub fn new(data: &'a [u8]) -> Result<Self, PageError> {
+        let found = read_u8(data, OFF_PAGE_TYPE);
+        if found != OVERFLOW {
+            return Err(PageError::UnexpectedPageType {
+                expected: OVERFLOW,
+                found,
+            });
+        }
+        Ok(Self { data })
     }
 
     pub fn page_id(&self) -> PageId {
@@ -151,13 +160,20 @@ pub struct OverflowPageMutator<'a> {
 }
 
 impl<'a> OverflowPageMutator<'a> {
-    pub fn new(data: &'a mut [u8]) -> Self {
-        assert_eq!(
-            read_u8(data, OFF_PAGE_TYPE),
-            OVERFLOW,
-            "OverflowPageMutator: page type byte is not OVERFLOW"
-        );
-        Self { data }
+    /// Wraps a raw page buffer, verifying the page-type byte.
+    ///
+    /// Returns [`PageError::UnexpectedPageType`] if `data` is not an overflow
+    /// page — a corrupt or mis-linked page must surface as an error rather than
+    /// panic and take down the process.
+    pub fn new(data: &'a mut [u8]) -> Result<Self, PageError> {
+        let found = read_u8(data, OFF_PAGE_TYPE);
+        if found != OVERFLOW {
+            return Err(PageError::UnexpectedPageType {
+                expected: OVERFLOW,
+                found,
+            });
+        }
+        Ok(Self { data })
     }
 
     pub fn set_lsn(&mut self, lsn: Lsn) {
@@ -165,7 +181,7 @@ impl<'a> OverflowPageMutator<'a> {
     }
 
     pub fn as_accessor(&self) -> OverflowPageAccessor<'_> {
-        OverflowPageAccessor::new(self.data)
+        OverflowPageAccessor { data: self.data }
     }
 
     pub fn set_next_page_id(&mut self, next_page: Option<PageId>) {
@@ -200,35 +216,39 @@ pub fn write_overflow_chain(
     let total_size = value.len() as u32;
     let chunks: Vec<&[u8]> = value.chunks(OVERFLOW_PAYLOAD_SIZE).collect();
 
-    // Allocate all pages first so we know their IDs before linking
-    let mut guards = Vec::with_capacity(chunks.len());
-    for _ in &chunks {
-        guards.push(pool.new_page()?);
-    }
+    // Build the chain back to front so each page's `next_page_id` is already
+    // known when we write it. Page IDs bear no relation to link order, so we
+    // don't need every page allocated at once — allocating from the tail lets
+    // us hold only ONE guard (one pinned buffer-pool frame) at a time. Holding
+    // all N guards would pin N frames idle while the rest of the pool competes
+    // for what's left.
+    let mut next_page_id: Option<PageId> = None;
+    let mut first_page_id: Option<PageId> = None;
 
-    let first_page_id = guards[0].page_id;
+    for chunk in chunks.iter().rev() {
+        let mut guard = pool.new_page()?;
+        let page_id = guard.page_id;
 
-    // Build pages back to front so next_page_id is known when we write each page
-    for i in (0..chunks.len()).rev() {
-        let next_page_id = if i + 1 < chunks.len() {
-            Some(guards[i + 1].page_id)
-        } else {
-            None
-        };
-
-        let page_id = guards[i].page_id;
-        let mut builder = OverflowPageBuilder::new(page_id, &mut guards[i][..]);
+        let mut builder = OverflowPageBuilder::new(page_id, &mut guard[..]);
         builder.set_next_page_id(next_page_id);
-        builder.set_chunk(chunks[i])?;
+        builder.set_chunk(chunk)?;
         builder.finish();
 
-        let image: &[u8; PAGE_SIZE] = (&guards[i][..]).try_into().unwrap();
+        let image: &[u8; PAGE_SIZE] = (&guard[..]).try_into().unwrap();
         let lsn = wal.log_overflow_write(txn_id, page_id, image)?;
-        OverflowPageMutator::new(&mut guards[i][..]).set_lsn(lsn);
+        OverflowPageMutator::new(&mut guard[..])?.set_lsn(lsn);
+
+        // The page we just wrote becomes the successor of the next (earlier)
+        // chunk, and — on the final iteration (chunk 0) — the chain head.
+        next_page_id = Some(page_id);
+        first_page_id = Some(page_id);
+        // `guard` drops here, unpinning the frame before we allocate the next.
     }
 
     Ok(OverflowDescriptor {
-        first_page_id,
+        // `write_overflow_chain` is only called for values that exceed the
+        // inline threshold, so there is always at least one chunk.
+        first_page_id: first_page_id.expect("overflow value must have >= 1 chunk"),
         total_size,
     })
 }
@@ -242,7 +262,7 @@ pub fn read_overflow_chain(
 
     while let Some(pid) = current_page_id {
         let guard = pool.fetch_page(pid)?;
-        let acc = OverflowPageAccessor::new(&guard[..]);
+        let acc = OverflowPageAccessor::new(&guard[..])?;
         result.extend_from_slice(acc.payload());
         current_page_id = acc.next_page_id();
     }
@@ -263,7 +283,7 @@ pub fn collect_overflow_page_ids(
 
     while let Some(pid) = current_page_id {
         let guard = pool.fetch_page(pid)?;
-        let acc = OverflowPageAccessor::new(&guard[..]);
+        let acc = OverflowPageAccessor::new(&guard[..])?;
         ids.push(pid);
         current_page_id = acc.next_page_id();
     }
@@ -281,7 +301,7 @@ pub fn free_overflow_chain(
         // Fetch to read next_page_id before deleting
         let next = {
             let guard = pool.fetch_page(pid)?;
-            let acc = OverflowPageAccessor::new(&guard[..]);
+            let acc = OverflowPageAccessor::new(&guard[..])?;
             acc.next_page_id()
         };
 
@@ -345,7 +365,7 @@ mod tests {
         }
 
         assert_eq!(read_u8(buf.memory(), OFF_PAGE_TYPE), OVERFLOW);
-        let acc = OverflowPageAccessor::new(buf.memory());
+        let acc = OverflowPageAccessor::new(buf.memory()).unwrap();
         assert_eq!(acc.page_id(), 42);
         assert_eq!(acc.next_page_id(), Some(43));
         assert_eq!(acc.chunk_len() as usize, chunk.len());
@@ -362,7 +382,7 @@ mod tests {
             b.set_chunk(&chunk).unwrap();
             b.finish();
         }
-        let acc = OverflowPageAccessor::new(buf.memory());
+        let acc = OverflowPageAccessor::new(buf.memory()).unwrap();
         assert_eq!(acc.payload().len(), 10);
         assert!(acc.payload().iter().all(|&b| b == 0xFF));
     }
@@ -377,7 +397,12 @@ mod tests {
             b.set_chunk(&[1, 2, 3]).unwrap();
             b.finish();
         }
-        assert_eq!(OverflowPageAccessor::new(buf.memory()).next_page_id(), None);
+        assert_eq!(
+            OverflowPageAccessor::new(buf.memory())
+                .unwrap()
+                .next_page_id(),
+            None
+        );
     }
 
     // ── Chunk capacity bounds ─────────────────────────────────────────────────
@@ -418,7 +443,7 @@ mod tests {
             b.finish();
         }
         {
-            let mut m = OverflowPageMutator::new(buf.memory_mut());
+            let mut m = OverflowPageMutator::new(buf.memory_mut()).unwrap();
             m.set_lsn(12345);
             m.set_next_page_id(Some(8));
             // as_accessor sees the in-progress mutations under the same borrow.
@@ -426,7 +451,7 @@ mod tests {
             assert_eq!(acc.lsn(), 12345);
             assert_eq!(acc.next_page_id(), Some(8));
         }
-        let acc = OverflowPageAccessor::new(buf.memory());
+        let acc = OverflowPageAccessor::new(buf.memory()).unwrap();
         assert_eq!(acc.lsn(), 12345);
         assert_eq!(acc.next_page_id(), Some(8));
     }
@@ -440,9 +465,10 @@ mod tests {
             b.finish();
         }
         OverflowPageMutator::new(buf.memory_mut())
+            .unwrap()
             .set_chunk(&[2, 2])
             .unwrap();
-        let acc = OverflowPageAccessor::new(buf.memory());
+        let acc = OverflowPageAccessor::new(buf.memory()).unwrap();
         assert_eq!(acc.chunk_len(), 2);
         assert_eq!(acc.payload(), &[2, 2]);
     }
