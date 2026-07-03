@@ -181,6 +181,9 @@ where
         let root_pid = self.index.root_page_id();
         let next_page_id = self.buffer_pool.next_page_id();
 
+        // Drop the guard before performing disk I/O to avoid blocking concurrent transactions.
+        drop(_guard);
+
         let lsn = self.wal.log_checkpoint(
             redo_point,
             next_txn_id,
