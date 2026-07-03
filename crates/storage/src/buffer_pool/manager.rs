@@ -46,6 +46,11 @@ impl BufferPoolManager {
         }
     }
 
+    /// Returns the next page id that will be allocated.
+    pub fn next_page_id(&self) -> u64 {
+        *self.next_page_id.lock().unwrap()
+    }
+
     /// Creates a new page in the buffer pool.
     ///
     /// This will allocate a new `PageId`, find a free frame (potentially evicting

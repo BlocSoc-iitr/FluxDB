@@ -1125,6 +1125,49 @@ impl Wal {
         self.append(WalRecordType::OverflowFree, txn_id, &[], Some(&payload))
     }
 
+    /// Appends a Checkpoint record to the WAL.
+    ///
+    /// The checkpoint is not transactional (`txn_id = 0`). Its main-data
+    /// payload carries the consistent snapshot needed by recovery to start
+    /// replay from the redo point instead of the beginning of the log:
+    ///
+    /// ```text
+    /// redo_point(8) | next_txn_id(8) | vacuum_horizon(8) | root_pid(8)
+    /// | next_page_id(8) | active_len(4) | active_txns(8×N)
+    /// | aborted_len(4) | pinned_aborted(8×M)
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_checkpoint(
+        &self,
+        redo_point: Lsn,
+        next_txn_id: u64,
+        active_txns: &[u64],
+        pinned_aborted: &[u64],
+        vacuum_horizon: u64,
+        root_pid: u64,
+        next_page_id: u64,
+    ) -> Result<Lsn> {
+        let capacity = 40 + 4 + active_txns.len() * 8 + 4 + pinned_aborted.len() * 8;
+        let mut main_data = Vec::with_capacity(capacity);
+        main_data.extend_from_slice(&redo_point.to_le_bytes());
+        main_data.extend_from_slice(&next_txn_id.to_le_bytes());
+        main_data.extend_from_slice(&vacuum_horizon.to_le_bytes());
+        main_data.extend_from_slice(&root_pid.to_le_bytes());
+        main_data.extend_from_slice(&next_page_id.to_le_bytes());
+
+        main_data.extend_from_slice(&(active_txns.len() as u32).to_le_bytes());
+        for txn in active_txns {
+            main_data.extend_from_slice(&txn.to_le_bytes());
+        }
+
+        main_data.extend_from_slice(&(pinned_aborted.len() as u32).to_le_bytes());
+        for txn in pinned_aborted {
+            main_data.extend_from_slice(&txn.to_le_bytes());
+        }
+
+        self.append(WalRecordType::Checkpoint, 0, &[], Some(&main_data))
+    }
+
     /// Appends a new physiological record to the WAL buffer.
     ///
     /// This method assigns the next available LSN, serializes the record according to the
