@@ -1,0 +1,8 @@
+repos:
+  - repo: local
+    hooks:
+      - id: make-pr
+        name: make pr
+        language: system
+        entry: make pr
+        pass_filenames: false

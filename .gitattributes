@@ -1,0 +1,19 @@
+# Force LF line endings for all text files, prevent CRLF on Windows checkouts.
+* text=auto eol=lf
+
+# Explicitly mark common text types.
+*.rs      text eol=lf
+*.toml    text eol=lf
+*.yaml    text eol=lf
+*.yml     text eol=lf
+*.md      text eol=lf
+*.json    text eol=lf
+*.sh      text eol=lf
+Makefile  text eol=lf
+
+# Binary files — never touch line endings.
+*.png     binary
+*.jpg     binary
+*.gif     binary
+*.ico     binary
+*.pdf     binary
