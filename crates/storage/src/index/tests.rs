@@ -1380,3 +1380,91 @@ fn crash_victim_overflow_insert_invisible_after_reopen() {
     let all: Vec<(Vec<u8>, Vec<u8>)> = index.range(.., &reader).map(|r| r.unwrap()).collect();
     assert!(all.is_empty());
 }
+
+// ── Unlink crash recovery ─────────────────────────────────────────────
+//
+// The index does not drive page deletion yet, so the pre-unlink tree is staged
+// by hand at page level: parent = [left] "m" [dead], leaf chain left = dead.
+
+#[test]
+fn recover_unlink_rightmost_leaf_ends_chain_at_left_sibling() {
+    // Extreme case: the unlinked leaf is the rightmost one (right_sibling =
+    // None), so the LEFT block's payload carries the 0 sentinel. Replay must
+    // decode it as rightlink, None, which is also Some(0), would splice the meta page into
+    // the leaf chain.
+    let dir = tempdir().unwrap();
+    let (left_pid, dead_pid, parent_pid);
+    {
+        let disk = Arc::new(DiskManager::new(dir.path().join("test.db"), MAX_PAGE_SIZE).unwrap());
+        let wal = make_wal(dir.path());
+        let pool = make_pool(disk, wal.clone());
+
+        // Burn page 0 as a meta stand-in so no real page id collides with the
+        // no_sibling sentinel.
+        drop(pool.new_page().unwrap());
+        left_pid = pool.new_page().unwrap().page_id;
+        dead_pid = pool.new_page().unwrap().page_id;
+        parent_pid = pool.new_page().unwrap().page_id;
+
+        {
+            let mut g = pool.fetch_page_mut(left_pid).unwrap();
+            let mut b = LeafPageBuilder::<&[u8], &[u8]>::new(left_pid, &mut g[..]);
+            b.set_prev_page(None);
+            b.set_rightlink(Some(dead_pid));
+            b.finish();
+        }
+        {
+            let mut g = pool.fetch_page_mut(dead_pid).unwrap();
+            let mut b = LeafPageBuilder::<&[u8], &[u8]>::new(dead_pid, &mut g[..]);
+            b.set_prev_page(Some(left_pid));
+            b.set_rightlink(None);
+            b.finish();
+            crate::page::set_half_dead(&mut g[..]);
+        }
+        {
+            let mut g = pool.fetch_page_mut(parent_pid).unwrap();
+            let mut b = InternalPageBuilder::<&[u8]>::new(parent_pid, &mut g[..]);
+            b.push_first_child(left_pid);
+            b.push_key_and_right_child(&(&b"m"[..]), dead_pid);
+            b.finish();
+        }
+        // The pre-unlink tree is durable, page lsn 0, the splice itself is
+        // WAL-only, so recovery must redo it.
+        pool.flush_all_pages().unwrap();
+
+        let txn = 1;
+        wal.log_unlink_page(txn, dead_pid, Some(left_pid), None, parent_pid, 0, false)
+            .unwrap();
+        wal.log_commit(txn).unwrap();
+        wal.flush_up_to(wal.next_lsn()).unwrap();
+        // crash
+    }
+
+    let disk = Arc::new(DiskManager::new(dir.path().join("test.db"), MAX_PAGE_SIZE).unwrap());
+    let wal = make_wal(dir.path());
+    let pool = make_pool(disk, wal.clone());
+    let tm = Arc::new(TM::new());
+    RecoveryManager::new(pool.clone(), dir.path().join("wal"), tm)
+        .recover::<&[u8], &[u8]>()
+        .unwrap();
+
+    {
+        let g = pool.fetch_page(left_pid).unwrap();
+        let left = LeafPageAccessor::<&[u8], &[u8]>::new(&g[..]);
+        assert_eq!(
+            left.rightlink(),
+            None,
+            "left sibling must become the end of the chain, not point at page 0"
+        );
+    }
+    {
+        let g = pool.fetch_page(parent_pid).unwrap();
+        let parent = InternalPageAccessor::<&[u8]>::new(&g[..]);
+        assert_eq!(parent.num_keys(), 0, "separator key must be removed");
+        assert_eq!(
+            parent.child_page_at(0),
+            left_pid,
+            "surviving child must be the left sibling"
+        );
+    }
+}

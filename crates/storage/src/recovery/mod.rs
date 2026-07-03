@@ -196,7 +196,8 @@ impl RecoveryManager {
                 match d[0] {
                     UNLINK_ROLE_LEFT => {
                         let new_rightlink = u64::from_le_bytes(d[1..9].try_into().unwrap());
-                        LeafPageMutator::<K, V>::new(page).set_rightlink(Some(new_rightlink));
+                        LeafPageMutator::<K, V>::new(page)
+                            .set_rightlink((new_rightlink != 0).then_some(new_rightlink));
                     }
                     UNLINK_ROLE_RIGHT => {
                         let new_prev = u64::from_le_bytes(d[1..9].try_into().unwrap());
