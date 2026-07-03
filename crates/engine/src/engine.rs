@@ -13,7 +13,7 @@
 //! transaction CLOG have been rebuilt.
 
 use common::{EngineError, Key, Value};
-use db_core::transaction_manager::TransactionManager;
+use db_core::transaction_manager::{TransactionManager, TransactionStatus};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -136,6 +136,68 @@ where
     }
 
     // implement close() when checkpoint lands.
+
+    /// Writes a Checkpoint record to the WAL.
+    ///
+    /// Snapshots the redo point, active-transaction set, pinned-aborted set,
+    /// and page/txn counters under the status guard (exclusive), then appends
+    /// and flushes the record so recovery can start from the redo point.
+    pub fn checkpoint(&self) -> Result<(), EngineError> {
+        use std::sync::atomic::Ordering::Acquire;
+
+        // Take the status guard in exclusive mode so that no commit/abort
+        // can transition a transaction while we are snapshotting.
+        let _guard = self.status_guard.write().unwrap();
+
+        let redo_point = self
+            .buffer_pool
+            .min_rec_lsn()
+            .unwrap_or_else(|| self.wal.next_lsn());
+        let next_txn_id = self.transaction_manager.next_txn_id.load(Acquire);
+
+        let active_txns: Vec<u64> = self
+            .transaction_manager
+            .active_txns
+            .read()
+            .unwrap()
+            .keys()
+            .copied()
+            .collect();
+
+        let vacuum_horizon = self.transaction_manager.vacuum_horizon();
+
+        let pinned_aborted: Vec<u64> = self
+            .transaction_manager
+            .clog
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(txn_id, status)| {
+                **status == TransactionStatus::Aborted && **txn_id >= vacuum_horizon
+            })
+            .map(|(txn_id, _)| *txn_id)
+            .collect();
+
+        let root_pid = self.index.root_page_id();
+        let next_page_id = self.buffer_pool.next_page_id();
+
+        // Drop the guard before performing disk I/O to avoid blocking concurrent transactions.
+        drop(_guard);
+
+        let lsn = self.wal.log_checkpoint(
+            redo_point,
+            next_txn_id,
+            &active_txns,
+            &pinned_aborted,
+            vacuum_horizon,
+            root_pid,
+            next_page_id,
+        )?;
+
+        self.wal.flush_up_to(lsn)?;
+
+        Ok(())
+    }
 
     // ── PUBLIC API ─────────────────────────────────────────────
     pub fn insert(
