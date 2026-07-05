@@ -5,6 +5,7 @@ use crate::wal::Wal;
 use common::{BufferPoolError, MAX_FRAMES, NUM_SHARDS, SHARD_MASK};
 use std::cmp::max;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering::Release;
 
 pub type Result<T> = std::result::Result<T, BufferPoolError>;
 
@@ -354,5 +355,12 @@ impl BufferPoolManager {
             .iter()
             .filter_map(|shard| shard.inner.lock().unwrap().min_rec_lsn)
             .min()
+    }
+
+    /// Notifies every shard of new checkpoint redo point
+    pub fn update_checkpoint_redo_point(&self , redo_point:Lsn) {
+        for shard in &self.shards {
+            shard.last_checkpoint_redo_point.store(redo_point,Release);
+        }
     }
 }

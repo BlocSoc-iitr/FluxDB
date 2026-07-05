@@ -34,7 +34,7 @@ where
             return Ok(());
         }
         //Starting the RwLock which will be active until the its dropped
-        // Ignore poison: lock holds no data, and doing this ensures checkpoint panics never crash user commits.
+        // Ignore poison: lock holds no data, and doing this ensures checkpoint panics never crash user commit
         let _guard = self.status_guard.read().unwrap_or_else(|e| e.into_inner());
 
         let lsn_res = self.wal.log_commit(txn.txn_id);

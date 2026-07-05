@@ -196,6 +196,9 @@ where
         )?;
 
         self.wal.flush_up_to(lsn)?;
+        
+        //flush all dirty pages to buffer_pool
+        self.buffer_pool.flush_all_pages()?;
 
         // Notify buffer pool of the new checkpoint redo point for recovery optimization
         self.buffer_pool.update_checkpoint_redo_point(redo_point);
