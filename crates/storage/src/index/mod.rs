@@ -16,7 +16,7 @@ use db_core::transaction_manager::TransactionManager;
 
 use crate::buffer_pool::{BufferPoolManager, PageReadGuard, PageWriteGuard};
 use crate::page::{
-    INTERNAL, InternalPageAccessor, InternalPageBuilder, InternalPageMutator, LEAF,
+    self, INTERNAL, InternalPageAccessor, InternalPageBuilder, InternalPageMutator, LEAF,
     LeafPageAccessor, LeafPageBuilder, LeafPageMutator, OVERFLOW_THRESHOLD, PAGE_SIZE, PageId,
     REC_TYPE_INLINE, REC_TYPE_OVERFLOW, collect_overflow_page_ids, free_overflow_chain,
     read_overflow_chain, write_overflow_chain,
@@ -64,6 +64,7 @@ pub struct BTreeIndex<K: Key, V: Value> {
     pool: Arc<BufferPoolManager>,
     wal: Arc<Wal>,
     root: Mutex<PageId>,
+    pending_recycle: Mutex<Vec<(PageId, u64)>>,
     _key: PhantomData<K>,
     _val: PhantomData<V>,
 }
@@ -79,6 +80,12 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             IndexError::CorruptMetadata("page 0 is not a FluxDB superblock".into())
         })?;
         drop(meta);
+        let free_space_id = *pool.free_page.lock().unwrap();
+        if free_space_id != 0 {
+            let guard = pool.fetch_page(free_space_id)?;
+            let vec = crate::page::free_space::scan_free(&guard[..]);
+            *pool.free_pool.lock().unwrap() = vec;
+        }
         Ok(Self::from_root(pool, wal, root))
     }
 
@@ -115,6 +122,8 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             }
 
             let acc = LeafPageAccessor::<K, V>::new(&guard[..]);
+            let leaf_count = acc.num_pairs();
+            let was_half_dead = page::is_half_dead(&guard[..]);
             let next = acc.rightlink();
             drop(guard);
 
@@ -128,10 +137,55 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 free_overflow_chain(first_page_id, &self.pool)?;
             }
 
+            if (leaf_count == 0 || was_half_dead) && leaf_pid != self.root_page_id() {
+                self.delete_empty_leaf(leaf_pid, tm)?;
+            }
+
             match next {
                 Some(pid) => leaf_pid = pid,
                 None => break,
             }
+        }
+
+        //this fetches the page id of the free space page
+        let free_space_id = *self.pool.free_page.lock().unwrap();
+        if free_space_id != 0 {
+            //guard over page mutation - exclusive latch
+            let mut fs_guard = self.pool.fetch_page_mut(free_space_id)?;
+            //checks how many ids are to be marked empty
+            let mut pending = self.pending_recycle.lock().unwrap();
+            let mut graduated = Vec::new();
+            pending.retain(|&(pid, stamp)| {
+                if stamp < global_xmin {
+                    graduated.push(pid);
+                    false // remove from waiting area
+                } else {
+                    true // not safe yet — keep waiting
+                }
+            });
+            drop(pending);
+            // journal after mutating - the fpi is a photograph of the page, so taking
+            // it earlier would make recovery restore the pre-drain bitmap. the lsn
+            // stamp keeps the ordering safe since the wal record is forced to disk
+            // before the mutated page can be
+
+            //sets the pages free
+            graduated.retain(|&pid| crate::page::free_space::set_free(&mut fs_guard[..], pid));
+
+            //writes a wal record if the graduation vector was not empty
+            if !graduated.is_empty() {
+                let image: &[u8; PAGE_SIZE] = (&fs_guard[..]).try_into().unwrap();
+                let lsn = self
+                    .wal
+                    .log_page_compact(SYSTEM_TXN_ID, free_space_id, image)?;
+                crate::page::set_lsn(&mut fs_guard[..], lsn);
+            }
+            drop(fs_guard);
+            self.pool
+                .free_pool
+                .lock()
+                .unwrap()
+                .extend_from_slice(&graduated);
         }
 
         tm.publish_vacuum_horizon(global_xmin);
@@ -146,10 +200,19 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         let root_pid = root_guard.page_id;
         LeafPageBuilder::<K, V>::new(root_pid, &mut root_guard[..]);
         drop(root_guard);
-        // Make the root durable BEFORE the superblock that points to it, so a
-        // crash can never leave page 0 referencing a not-yet-written root page.
+        // Free-space bitmap page, allocated right after the root.
+        let mut fs_guard = pool.new_page()?;
+        let fs_pid = fs_guard.page_id;
+        crate::page::free_space::init(&mut fs_guard[..], fs_pid);
+        drop(fs_guard);
+        // make the root and bitmap durable BEFORE the superblock that points
+        // at them, so a crash can never leave page 0 referencing pages that
+        // were never written
         pool.flush_page(root_pid)?;
+        pool.flush_page(fs_pid)?;
         crate::page::meta::init(&mut meta_guard[..], root_pid);
+        crate::page::meta::set_free_space(&mut meta_guard[..], fs_pid);
+        *pool.free_page.lock().unwrap() = fs_pid;
         drop(meta_guard);
         pool.flush_page(meta_pid)?;
 
@@ -165,6 +228,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             pool,
             wal,
             root: Mutex::new(root),
+            pending_recycle: Mutex::new(Vec::new()),
             _val: PhantomData,
             _key: PhantomData,
         }
@@ -329,6 +393,10 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             let mut leaf_guard = self.pool.fetch_page_mut(leaf_pid)?;
             // Rightlink correction: follow splits that happened during descent.
             loop {
+                if page::is_half_dead(&leaf_guard[..]) {
+                    drop(leaf_guard);
+                    continue 'restart;
+                }
                 let acc = LeafPageAccessor::<K, V>::new(&leaf_guard[..]);
                 if let Some(hk) = acc.high_key_bytes()
                     && K::compare(key_bytes.as_ref(), hk) != Ordering::Less

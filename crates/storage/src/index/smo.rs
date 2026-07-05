@@ -1,6 +1,9 @@
 //! Structure-modification operations: leaf/internal splits, downlink
 //! propagation, and lazy split completion (self-heal).
 
+use crate::page::ChildSide::{Left, Right};
+use db_core::transaction_manager::TransactionManager;
+
 use super::*;
 
 impl<K: Key, V: Value> BTreeIndex<K, V> {
@@ -160,6 +163,183 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             split.new_page_id,
             leaf_pid_actual,
         )
+    }
+
+    pub(super) fn delete_empty_leaf(
+        &self,
+        leaf_pid: PageId,
+        tm: &TransactionManager,
+    ) -> Result<()> {
+        // links and high key under a shared latch
+        let (left_sibling, right_sibling, high_key) = {
+            let guard = self.pool.fetch_page(leaf_pid)?;
+            let acc = LeafPageAccessor::<K, V>::new(&guard[..]);
+            (
+                acc.prev_page(),
+                acc.rightlink(),
+                acc.high_key_bytes().map(|b| b.to_vec()),
+            )
+        };
+
+        // re-descend from the root toward the leaf's key range, collecting the
+        // ancestor stack, same pattern as insert's phase 1
+        // target is "just below high_key" — high_key
+        // == None means rightmost spine
+        let mut stack = BTStack::new();
+        let mut pid = *self.root.lock().unwrap();
+        loop {
+            let page = self.pool.fetch_page(pid)?;
+            if crate::page::is_incomplete_split(&page[..]) {
+                drop(page);
+                self.finish_split(pid, &stack)?;
+                stack.clear();
+                pid = *self.root.lock().unwrap();
+                continue;
+            }
+            match page[0] {
+                INTERNAL => {
+                    let acc = InternalPageAccessor::<K>::new(&page[..]);
+                    // move right only when the leaf's range can't sit under this
+                    // node, strictly greater for a keyed target, always for the
+                    // rightmost target while a rightlink exists
+                    let move_right = match (&high_key, acc.high_key_bytes()) {
+                        (Some(hk), Some(node_hk)) => K::compare(hk, node_hk) == Ordering::Greater,
+                        (None, _) => acc.rightlink().is_some(),
+                        (_, None) => false,
+                    };
+                    if move_right {
+                        let right = acc.rightlink().unwrap();
+                        drop(page);
+                        pid = right;
+                        continue;
+                    }
+                    let n = acc.num_keys() as usize;
+                    let child_idx = match &high_key {
+                        // Route left on equality- the leaf's high key is its
+                        // separator in the parent, and the leaf sits left of it
+                        // (find_child would route to the right sibling)
+                        Some(hk) => (0..n)
+                            .find(|&i| {
+                                K::compare(K::as_bytes(&acc.key_at(i)).as_ref(), hk)
+                                    != Ordering::Less
+                            })
+                            .unwrap_or(n),
+                        None => n,
+                    };
+                    let child = acc.child_page_at(child_idx);
+                    stack.push(BTStackEntry { page_id: pid });
+                    drop(page);
+                    pid = child;
+                }
+                LEAF => {
+                    drop(page);
+                    break;
+                }
+                found => {
+                    return Err(IndexError::UnexpectedPageType {
+                        expected: LEAF,
+                        found,
+                    });
+                }
+            }
+        }
+
+        // parent is last internal on the stack, empty stack means
+        //the leaf is the root
+        let Some(entry) = stack.last() else {
+            return Ok(());
+        };
+        let mut parent_pid = entry.page_id;
+
+        // find the downlink index j, moving right if the parent split after the
+        // stack was collected
+        let (child_idx, parent_keys) = loop {
+            let guard = self.pool.fetch_page(parent_pid)?;
+            let acc = InternalPageAccessor::<K>::new(&guard[..]);
+            let n = acc.num_keys() as usize;
+            if let Some(j) = (0..=n).find(|&i| acc.child_page_at(i) == leaf_pid) {
+                break (j, n);
+            }
+            match acc.rightlink() {
+                Some(right) => {
+                    drop(guard);
+                    parent_pid = right;
+                }
+                // downlink gone, now a concurrent completer already unlinked the
+                // leaf (or it was never linked), nothing to do this sweep
+                None => return Ok(()),
+            }
+        };
+
+        //only-child leaves are skipped, removing the downlink
+        // would leave a degenerate empty internal
+        if parent_keys == 0 {
+            return Ok(());
+        }
+
+        //parent removal mapping for remove_key_at(index, ChildSide)
+        let (remove_index, keep_right_child) = if child_idx == 0 {
+            (0u16, true) // UNLINK_KEEP_RIGHT
+        } else {
+            ((child_idx - 1) as u16, false) // UNLINK_KEEP_LEFT
+        };
+
+        // ── A3: emit MarkHalfDead + UnlinkPage and apply, one latch at a time,
+        //        using left_sibling / right_sibling / parent_pid / remove_index /
+        //        keep_right_child. ──
+
+        let mut guard = self.pool.fetch_page_mut(leaf_pid)?;
+        let acc = LeafPageAccessor::<K, V>::new(&guard[..]);
+        if !page::is_half_dead(&guard[..]) {
+            if acc.num_pairs() != 0 {
+                return Ok(());
+            } else {
+                let lsn = self.wal.log_mark_half_dead(SYSTEM_TXN_ID, leaf_pid)?;
+                page::set_half_dead(&mut guard[..]);
+                let mut mutator = LeafPageMutator::<K, V>::new(&mut guard[..]);
+                mutator.set_lsn(lsn);
+            }
+        }
+        drop(guard);
+
+        let unlink_lsn = self.wal.log_unlink_page(
+            SYSTEM_TXN_ID,
+            leaf_pid,
+            left_sibling,
+            right_sibling,
+            parent_pid,
+            remove_index,
+            keep_right_child,
+        )?;
+
+        if let Some(left) = &left_sibling {
+            let mut guard = self.pool.fetch_page_mut(*left)?;
+            let mut mutator = LeafPageMutator::<K, V>::new(&mut guard[..]);
+            mutator.set_lsn(unlink_lsn);
+            mutator.set_rightlink(right_sibling);
+        }
+        if let Some(right) = &right_sibling {
+            let mut guard = self.pool.fetch_page_mut(*right)?;
+            let mut mutator = LeafPageMutator::<K, V>::new(&mut guard[..]);
+            mutator.set_lsn(unlink_lsn);
+            mutator.set_prev_page(left_sibling);
+        }
+        {
+            let mut guard = self.pool.fetch_page_mut(parent_pid)?;
+            let mut mutator = InternalPageMutator::<K>::new(&mut guard[..]);
+            mutator.set_lsn(unlink_lsn);
+            mutator.remove_key_at(
+                remove_index as usize,
+                if keep_right_child { Right } else { Left },
+            );
+        }
+        // snapshot that could still walk to it has drained
+        self.pending_recycle
+            .lock()
+            .unwrap()
+            .push((leaf_pid, tm.global_xmin()));
+
+        Ok(())
     }
 
     fn split_leaf_ly(

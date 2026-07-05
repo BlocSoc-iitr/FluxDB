@@ -29,6 +29,7 @@ pub const FORMAT_VERSION: u32 = 1;
 const OFF_MAGIC: usize = 4;
 const OFF_VERSION: usize = 24;
 const OFF_ROOT: usize = 32;
+const OFF_FREE_SPACE: usize = 48;
 // 40..56 reserved (next_page_id, free_list_head) — issue #2.
 // The checksum at offset 56 is owned by `super::OFF_META_CHECKSUM` (the CRC is
 // stamped/verified centrally by the buffer pool, like leaf/internal pages).
@@ -57,4 +58,12 @@ pub fn read_root(page: &[u8]) -> Option<PageId> {
         return None;
     }
     Some(read_u64(page, OFF_ROOT))
+}
+
+pub fn set_free_space(page: &mut [u8], pid: PageId) {
+    write_u64(page, OFF_FREE_SPACE, pid);
+}
+
+pub fn read_free_space(page: &[u8]) -> PageId {
+    read_u64(page, OFF_FREE_SPACE)
 }

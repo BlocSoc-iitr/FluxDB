@@ -889,7 +889,11 @@ impl Wal {
         remove_index: u16,
         keep_right_child: bool,
     ) -> Result<Lsn> {
-        let mut blocks = Vec::with_capacity(if left_sibling.is_some() && right_sibling.is_some() { 3 } else { 2 });
+        let mut blocks = Vec::with_capacity(if left_sibling.is_some() && right_sibling.is_some() {
+            3
+        } else {
+            2
+        });
 
         let left_payload;
         if let Some(left_page) = left_sibling {
