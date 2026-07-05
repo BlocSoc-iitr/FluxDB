@@ -8,9 +8,6 @@ common = { path = "crates/common" }
 storage = {path = "crates/storage"}
 thiserror = "1"
 db-core = { path = "crates/db-core"}
-# Observability: libraries depend on the `tracing` facade only and emit
-# events/spans. The subscriber is the caller's job (add `tracing-subscriber`
-# in whatever binary eventually runs the DB). See observability.md.
 tracing = "0.1"
 
 # Bench what you ship: cross-crate inlining on, debug symbols kept for flamegraphs.
