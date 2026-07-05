@@ -149,6 +149,130 @@ pub struct WalRecord<'a> {
     pub main_data: Option<&'a [u8]>,
 }
 
+/// Parsed checkpoint record payload.
+///
+/// A checkpoint snapshots the consistent state needed by recovery to start
+/// replay from the redo point instead of the beginning of the log.
+#[derive(Debug, Clone)]
+pub struct CheckpointData {
+    pub redo_point: Lsn,
+    pub next_txn_id: u64,
+    pub vacuum_horizon: u64,
+    pub root_pid: u64,
+    pub next_page_id: u64,
+    pub active_txns: Vec<u64>,
+    pub pinned_aborted: Vec<u64>,
+}
+
+impl CheckpointData {
+    /// Parse a checkpoint record's main_data payload.
+    ///
+    /// Format: redo_point(8) | next_txn_id(8) | vacuum_horizon(8) | root_pid(8)
+    ///         | next_page_id(8) | active_len(4) | active_txns(8×N)
+    ///         | aborted_len(4) | pinned_aborted(8×M)
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        if data.len() < 48 {
+            return Err(WalError::CorruptedLog(
+                "Checkpoint data too short (need >= 48 bytes)".to_string()
+            ));
+        }
+
+        let mut pos = 0;
+
+        let redo_point = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        let next_txn_id = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        let vacuum_horizon = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        let root_pid = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        let next_page_id = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+
+        // Parse active_txns array
+        if pos + 4 > data.len() {
+            return Err(WalError::CorruptedLog("Missing active_txns count".to_string()));
+        }
+        let active_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+
+        let mut active_txns = Vec::with_capacity(active_count);
+        for _ in 0..active_count {
+            if pos + 8 > data.len() {
+                return Err(WalError::CorruptedLog("Truncated active_txns array".to_string()));
+            }
+            active_txns.push(u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()));
+            pos += 8;
+        }
+
+        // Parse pinned_aborted array
+        if pos + 4 > data.len() {
+            return Err(WalError::CorruptedLog("Missing pinned_aborted count".to_string()));
+        }
+        let aborted_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+
+        let mut pinned_aborted = Vec::with_capacity(aborted_count);
+        for _ in 0..aborted_count {
+            if pos + 8 > data.len() {
+                return Err(WalError::CorruptedLog("Truncated pinned_aborted array".to_string()));
+            }
+            pinned_aborted.push(u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()));
+            pos += 8;
+        }
+
+        if pos != data.len() {
+            return Err(WalError::CorruptedLog(format!(
+                "Unparsed trailing bytes in checkpoint: expected {}, got {}",
+                pos,
+                data.len()
+            )));
+        }
+
+        Ok(CheckpointData {
+            redo_point,
+            next_txn_id,
+            vacuum_horizon,
+            root_pid,
+            next_page_id,
+            active_txns,
+            pinned_aborted,
+        })
+    }
+
+    /// Helper for recovery fallback: create empty checkpoint data.
+    pub fn empty() -> Self {
+        Self {
+            redo_point: 0,
+            next_txn_id: 1,
+            vacuum_horizon: 0,
+            root_pid: 0,
+            next_page_id: 0,
+            active_txns: Vec::new(),
+            pinned_aborted: Vec::new(),
+        }
+    }
+}
+
+impl<'a> WalRecord<'a> {
+    /// Parse this record as a Checkpoint, returning the structured data.
+    ///
+    /// Returns `Err` if this is not a Checkpoint record or the payload is corrupt.
+    pub fn parse_checkpoint(&self) -> Result<CheckpointData> {
+        if self.entry_type != WalRecordType::Checkpoint {
+            return Err(WalError::CorruptedLog(format!(
+                "Expected Checkpoint record, got {:?}",
+                self.entry_type
+            )));
+        }
+        let data = self.main_data.ok_or_else(|| {
+            WalError::CorruptedLog("Checkpoint record missing main_data".to_string())
+        })?;
+        CheckpointData::from_bytes(data)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct WalLayout {
     dir: PathBuf,
@@ -1372,6 +1496,43 @@ impl Wal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_checkpoint_data_roundtrip() {
+        let original = CheckpointData {
+            redo_point: 100,
+            next_txn_id: 42,
+            vacuum_horizon: 30,
+            root_pid: 1,
+            next_page_id: 50,
+            active_txns: vec![35, 38, 41],
+            pinned_aborted: vec![20, 25],
+        };
+        
+        // Serialize
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&original.redo_point.to_le_bytes());
+        bytes.extend_from_slice(&original.next_txn_id.to_le_bytes());
+        bytes.extend_from_slice(&original.vacuum_horizon.to_le_bytes());
+        bytes.extend_from_slice(&original.root_pid.to_le_bytes());
+        bytes.extend_from_slice(&original.next_page_id.to_le_bytes());
+        bytes.extend_from_slice(&(original.active_txns.len() as u32).to_le_bytes());
+        for &id in &original.active_txns {
+            bytes.extend_from_slice(&id.to_le_bytes());
+        }
+        bytes.extend_from_slice(&(original.pinned_aborted.len() as u32).to_le_bytes());
+        for &id in &original.pinned_aborted {
+            bytes.extend_from_slice(&id.to_le_bytes());
+        }
+        
+        // Deserialize
+        let parsed = CheckpointData::from_bytes(&bytes).unwrap();
+        
+        assert_eq!(parsed.redo_point, original.redo_point);
+        assert_eq!(parsed.next_txn_id, original.next_txn_id);
+        assert_eq!(parsed.active_txns, original.active_txns);
+        assert_eq!(parsed.pinned_aborted, original.pinned_aborted);
+    }
     use std::io::{Seek, SeekFrom};
     use std::sync::Arc;
     use std::thread;

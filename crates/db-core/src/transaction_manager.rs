@@ -326,6 +326,18 @@ impl TransactionManager {
             TransactionStatus::Active
         }
     }
+
+    /// Seed the CLOG from a checkpoint's pinned-aborted set.
+    ///
+    /// Called by recovery before the redo scan. Each txn in the list is
+    /// marked Aborted in the CLOG, providing the durable shadow of the
+    /// aborted entries that existed at checkpoint time.
+    pub fn seed_clog_from_checkpoint(&self, pinned_aborted: &[u64]) {
+        let mut clog = self.clog.write().unwrap();
+        for &txn_id in pinned_aborted {
+            clog.insert(txn_id, TransactionStatus::Aborted);
+        }
+    }
 }
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -343,6 +355,19 @@ mod tests {
         assert!(tm.is_active(txn.txn_id));
         assert!(!tm.is_committed(txn.txn_id));
         assert!(!tm.is_aborted(txn.txn_id));
+    }
+
+    #[test]
+    fn test_seed_clog_from_checkpoint() {
+        let tm = TransactionManager::new();
+        
+        let pinned = vec![10, 15, 20];
+        tm.seed_clog_from_checkpoint(&pinned);
+        
+        assert!(tm.is_aborted(10));
+        assert!(tm.is_aborted(15));
+        assert!(tm.is_aborted(20));
+        assert!(!tm.is_committed(10));
     }
 
     #[test]
