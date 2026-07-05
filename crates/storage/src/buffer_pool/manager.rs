@@ -34,10 +34,10 @@ impl BufferPoolManager {
             free_pool: Mutex::new(Vec::new()),
             free_page: Mutex::new(0),
         };
-        if existing_pages > 0 {
-            if let Ok(meta) = pool.fetch_page(0) {
-                *pool.free_page.lock().unwrap() = crate::page::meta::read_free_space(&meta[..]);
-            }
+        if existing_pages > 0
+            && let Ok(meta) = pool.fetch_page(0)
+        {
+            *pool.free_page.lock().unwrap() = crate::page::meta::read_free_space(&meta[..]);
         }
 
         pool
@@ -74,9 +74,9 @@ impl BufferPoolManager {
     pub fn new_page(&self) -> Result<PageWriteGuard<'_>> {
         let page_id = {
             if let Some(pid) = self.free_pool.lock().unwrap().pop() {
-                //this fetches the page id of the free space page
+                // Recycle: claim the id in the bitmap page and journal the
+                // allocation, so a replayed bitmap never re-offers it.
                 let free_space_id = *self.free_page.lock().unwrap();
-                //guard over page mutation - exclusive latch
                 let mut fs_guard = self.fetch_page_mut(free_space_id)?;
                 crate::page::free_space::clear_free(&mut fs_guard[..], pid);
                 let image: &[u8; PAGE_SIZE] = (&fs_guard[..]).try_into().unwrap();
@@ -95,7 +95,9 @@ impl BufferPoolManager {
         };
 
         let shard = self.get_shard(page_id);
-        // (needs_load = true): the frame is published in the loading state
+        // A fresh id is always a miss; a recycled id may hit a frame still
+        // caching the page's previous life. Either way the fill(0) below
+        // starts the page from a clean slate.
         let (frame_id, _needs_load) = shard.acquire_frame(page_id)?;
 
         let mut data = shard.pages[frame_id].write().unwrap();

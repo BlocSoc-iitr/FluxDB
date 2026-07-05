@@ -47,19 +47,7 @@ pub fn clear_free(page: &mut [u8], pid: PageId) {
     page[byte] &= !(1 << bit);
 }
 
-/// Take one free page id out of the bitmap, or `None` when nothing is free.
-pub fn pop_free(page: &mut [u8]) -> Option<PageId> {
-    for (byte, b) in page.iter_mut().enumerate().skip(BITMAP_START) {
-        if *b != 0 {
-            let bit = b.trailing_zeros();
-            *b &= !(1 << bit);
-            return Some(((byte - BITMAP_START) as u64) * 8 + bit as u64);
-        }
-    }
-    None
-}
-
-/// Take one free page id out of the bitmap, or `None` when nothing is free.
+/// All free page ids currently set in the bitmap.
 pub fn scan_free(page: &[u8]) -> Vec<PageId> {
     let mut free = Vec::new();
     for (byte, b) in page.iter().enumerate().skip(BITMAP_START) {

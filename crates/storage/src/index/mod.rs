@@ -11,7 +11,7 @@ use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 use std::sync::{Arc, Mutex};
 
-use common::{Key, MAX_KEY_SIZE, Value};
+use common::{Key, MAX_KEY_SIZE, VACUUM_BATCH_MAX_LEAVES, Value};
 use db_core::transaction_manager::TransactionManager;
 
 use crate::buffer_pool::{BufferPoolManager, PageReadGuard, PageWriteGuard};
@@ -65,6 +65,7 @@ pub struct BTreeIndex<K: Key, V: Value> {
     wal: Arc<Wal>,
     root: Mutex<PageId>,
     pending_recycle: Mutex<Vec<(PageId, u64)>>,
+    vacuum_lock: Mutex<()>,
     _key: PhantomData<K>,
     _val: PhantomData<V>,
 }
@@ -98,12 +99,36 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
     ///
     /// Returns the total number of records removed across all pages.
     pub fn vacuum(&self, tm: &TransactionManager) -> Result<usize> {
-        let global_xmin = tm.global_xmin();
-        let root = self.root_page_id();
-        let mut leaf_pid = self.find_leftmost_leaf(root)?;
-        let mut total_dead = 0;
+        self.vacuum_paced(tm, |_| true)
+    }
 
-        loop {
+    /// Returns `(records removed, pages touched, next cursor)`. "Pages
+    /// touched" counts the pages this batch dirtied — compacted leaves, freed
+    /// overflow pages, deleted leaves — and feeds the pacer's cost throttling.
+    fn vacuum_batch(
+        &self,
+        tm: &TransactionManager,
+        global_xmin: u64,
+        cursor: Option<PageId>,
+        max_leaves: usize,
+    ) -> Result<(usize, usize, Option<PageId>)> {
+        let mut leaf_pid = match cursor {
+            Some(pid) => {
+                let guard = self.pool.fetch_page(pid)?;
+                let still_leaf = guard[0] == page::LEAF;
+                drop(guard);
+                if still_leaf {
+                    pid
+                } else {
+                    self.find_leftmost_leaf(self.root_page_id())?
+                }
+            }
+            None => self.find_leftmost_leaf(self.root_page_id())?,
+        };
+        let mut total_dead = 0;
+        let mut touched = 0;
+
+        for _ in 0..max_leaves {
             let mut guard = self.pool.fetch_page_mut(leaf_pid)?;
 
             let (dead, chains) =
@@ -119,6 +144,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 let image: &[u8; PAGE_SIZE] = (&guard[..]).try_into().unwrap();
                 let lsn = self.wal.log_page_compact(SYSTEM_TXN_ID, leaf_pid, image)?;
                 LeafPageMutator::<K, V>::new(&mut guard[..]).set_lsn(lsn);
+                touched += 1;
             }
 
             let acc = LeafPageAccessor::<K, V>::new(&guard[..]);
@@ -135,24 +161,57 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 let ids = collect_overflow_page_ids(first_page_id, &self.pool)?;
                 self.wal.log_overflow_free(SYSTEM_TXN_ID, &ids)?;
                 free_overflow_chain(first_page_id, &self.pool)?;
+                touched += ids.len();
             }
 
             if (leaf_count == 0 || was_half_dead) && leaf_pid != self.root_page_id() {
                 self.delete_empty_leaf(leaf_pid, tm)?;
+                // An unlink dirties the leaf, both siblings, and the parent;
+                // count the attempt as one — close enough for throttling.
+                touched += 1;
             }
 
             match next {
                 Some(pid) => leaf_pid = pid,
-                None => break,
+                // End of the leaf chain: the pass is complete.
+                None => return Ok((total_dead, touched, None)),
+            }
+        }
+        // Budget exhausted mid-chain: hand back where the next batch starts.
+        Ok((total_dead, touched, Some(leaf_pid)))
+    }
+
+    pub fn vacuum_paced(
+        &self,
+        tm: &TransactionManager,
+        mut pacer: impl FnMut(usize) -> bool,
+    ) -> Result<usize> {
+        let _sweep = self.vacuum_lock.lock().unwrap();
+        let global_xmin = tm.global_xmin();
+        let mut cursor = None;
+        let mut total_dead = 0;
+
+        loop {
+            let (dead, touched, next) =
+                self.vacuum_batch(tm, global_xmin, cursor, VACUUM_BATCH_MAX_LEAVES)?;
+            total_dead += dead;
+            if next.is_none() {
+                break;
+            }
+            cursor = next;
+            // Nap between batches, scaled by how many pages the batch dirtied;
+            // a `false` pacer abandons the pass. Return WITHOUT draining or
+            // publishing — a partial pass covers nothing.
+            if !pacer(touched) {
+                return Ok(total_dead);
             }
         }
 
-        //this fetches the page id of the free space page
+        // Pass complete: graduate parked ids whose stamp the horizon has
+        // passed — no live snapshot can still walk to those pages.
         let free_space_id = *self.pool.free_page.lock().unwrap();
         if free_space_id != 0 {
-            //guard over page mutation - exclusive latch
             let mut fs_guard = self.pool.fetch_page_mut(free_space_id)?;
-            //checks how many ids are to be marked empty
             let mut pending = self.pending_recycle.lock().unwrap();
             let mut graduated = Vec::new();
             pending.retain(|&(pid, stamp)| {
@@ -164,15 +223,16 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 }
             });
             drop(pending);
-            // journal after mutating - the fpi is a photograph of the page, so taking
-            // it earlier would make recovery restore the pre-drain bitmap. the lsn
-            // stamp keeps the ordering safe since the wal record is forced to disk
-            // before the mutated page can be
 
-            //sets the pages free
+            // `set_free` rejects ids beyond the bitmap's capacity; dropping
+            // them here leaks those pages (the bounded-leak path).
             graduated.retain(|&pid| crate::page::free_space::set_free(&mut fs_guard[..], pid));
 
-            //writes a wal record if the graduation vector was not empty
+            // Journal AFTER mutating: the FPI is a photograph of the page, so
+            // taking it earlier would make recovery restore the pre-drain
+            // bitmap. Write-ahead ordering still holds via the LSN stamp —
+            // eviction forces the WAL through the page LSN before the page
+            // can reach disk.
             if !graduated.is_empty() {
                 let image: &[u8; PAGE_SIZE] = (&fs_guard[..]).try_into().unwrap();
                 let lsn = self
@@ -229,6 +289,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             wal,
             root: Mutex::new(root),
             pending_recycle: Mutex::new(Vec::new()),
+            vacuum_lock: Mutex::new(()),
             _val: PhantomData,
             _key: PhantomData,
         }

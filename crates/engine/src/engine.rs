@@ -280,4 +280,11 @@ where
     pub fn vacuum(&self) -> Result<usize, EngineError> {
         Ok(self.index.vacuum(&self.transaction_manager)?)
     }
+
+    /// Like [`Engine::vacuum`], but yields to `pacer` between leaf batches,
+    /// passing it the number of pages the batch dirtied (for cost throttling).
+    /// A `false` from the pacer abandons the pass: no drain, no horizon publish.
+    pub fn vacuum_paced(&self, pacer: impl FnMut(usize) -> bool) -> Result<usize, EngineError> {
+        Ok(self.index.vacuum_paced(&self.transaction_manager, pacer)?)
+    }
 }
