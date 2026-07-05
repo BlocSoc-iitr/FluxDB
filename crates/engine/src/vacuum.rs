@@ -44,8 +44,8 @@ where
     // pure maintenance, and the next open can always run one.
     while let Wake::Tick = next_wake(&rx, interval) {
         if engine.transaction_manager.dead_versions() >= AUTOVACUUM_DEAD_THRESHOLD {
-            engine.transaction_manager.take_dead_versions();
-            if !do_vacuum(&engine, &rx) {
+            let taken = engine.transaction_manager.take_dead_versions();
+            if !do_vacuum(&engine, &rx, taken) {
                 break;
             }
         }
@@ -59,7 +59,9 @@ where
 /// Returns `false` if `Shutdown` arrived mid-sweep — the pacer consumed the
 /// message, so the caller must exit instead of waiting for a second one.
 /// Errors are logged, not propagated: a failed sweep must not kill the thread.
-fn do_vacuum<K, V>(engine: &Engine<K, V>, rx: &Receiver<Msg>) -> bool
+/// On error the `taken` counter is restored so the next tick retries the sweep
+/// instead of waiting for a fresh threshold's worth of dead versions.
+fn do_vacuum<K, V>(engine: &Engine<K, V>, rx: &Receiver<Msg>, taken: u64) -> bool
 where
     K: Key,
     V: Value,
@@ -78,7 +80,10 @@ where
     });
     match result {
         Ok(dead) => tracing::debug!(dead_versions = dead, "vacuum sweep complete"),
-        Err(e) => tracing::error!(error = %e, "vacuum sweep failed"),
+        Err(e) => {
+            engine.transaction_manager.restore_dead_versions(taken);
+            tracing::error!(error = %e, "vacuum sweep failed");
+        }
     }
     !shutting_down
 }

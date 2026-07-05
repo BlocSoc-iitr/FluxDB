@@ -142,6 +142,12 @@ impl TransactionManager {
         self.dead_versions.swap(0, AcqRel)
     }
 
+    /// Returns a taken count after a failed sweep, so the next tick retries
+    /// instead of waiting for a fresh threshold's worth of dead versions.
+    pub fn restore_dead_versions(&self, n: u64) {
+        self.dead_versions.fetch_add(n, AcqRel);
+    }
+
     /// Truncates the CLOG, removing entries older than `horizon`.
     /// Now the removal of entries has been made two-tier, such that the entries that are
     /// committed and their txn_id lying below committed_horizon are deleted directly because
