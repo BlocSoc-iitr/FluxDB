@@ -120,11 +120,15 @@ fn test_checkpoint_recovery() {
 
     // 2. Start an active transaction and insert, but do NOT commit
     let mut active_txn = engine.begin();
-    active_txn.insert(&b"k2".as_slice(), &b"v2".as_slice()).unwrap();
+    active_txn
+        .insert(&b"k2".as_slice(), &b"v2".as_slice())
+        .unwrap();
 
     // 3. Start a transaction, insert, and abort (to test pinned_aborted seeding)
     let mut aborted_txn = engine.begin();
-    aborted_txn.insert(&b"k3".as_slice(), &b"v3".as_slice()).unwrap();
+    aborted_txn
+        .insert(&b"k3".as_slice(), &b"v3".as_slice())
+        .unwrap();
     drop(aborted_txn);
 
     // 4. Force checkpoint
@@ -133,7 +137,9 @@ fn test_checkpoint_recovery() {
     // 5. Simulate a ghost transaction: does work, but page flushes happen,
     //    so its WAL records are below the redo point. Then it crashes.
     let mut ghost_txn = engine.begin();
-    ghost_txn.insert(&b"k4".as_slice(), &b"v4".as_slice()).unwrap();
+    ghost_txn
+        .insert(&b"k4".as_slice(), &b"v4".as_slice())
+        .unwrap();
     engine.flush_all_pages().unwrap();
     engine.checkpoint().expect("Checkpoint 2 failed");
 
@@ -161,5 +167,8 @@ fn test_checkpoint_recovery() {
 
     // k4 should NOT be visible (ghost_txn caught by active_txns union)
     let v4 = engine.get(&b"k4".as_slice()).unwrap();
-    assert_eq!(v4, None, "k4 should be aborted as a ghost transaction crash victim");
+    assert_eq!(
+        v4, None,
+        "k4 should be aborted as a ghost transaction crash victim"
+    );
 }

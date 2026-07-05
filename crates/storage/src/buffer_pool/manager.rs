@@ -341,7 +341,9 @@ impl BufferPoolManager {
     /// Updates the last_checkpoint_redo_point for all shards.
     pub fn update_checkpoint_redo_point(&self, redo_point: u64) {
         for shard in &self.shards {
-            shard.last_checkpoint_redo_point.store(redo_point, std::sync::atomic::Ordering::Relaxed);
+            shard
+                .last_checkpoint_redo_point
+                .store(redo_point, std::sync::atomic::Ordering::Relaxed);
         }
     }
 

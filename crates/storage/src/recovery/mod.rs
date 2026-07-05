@@ -68,10 +68,7 @@ impl RecoveryManager {
                             checkpoint_opt = Some(data);
                         }
                         Err(e) => {
-                            eprintln!(
-                                "Warning: corrupt checkpoint at LSN {}: {:?}",
-                                record.lsn, e
-                            );
+                            eprintln!("Warning: corrupt checkpoint at LSN {}: {:?}", record.lsn, e);
                         }
                     }
                 }
@@ -84,10 +81,7 @@ impl RecoveryManager {
         }
 
         // Determine redo starting point and initial watermarks
-        let redo_point = checkpoint_opt
-            .as_ref()
-            .map(|c| c.redo_point)
-            .unwrap_or(0);
+        let redo_point = checkpoint_opt.as_ref().map(|c| c.redo_point).unwrap_or(0);
 
         let mut max_txn = checkpoint_opt
             .as_ref()
@@ -157,7 +151,9 @@ impl RecoveryManager {
         };
 
         if final_next_txn_id > 0 {
-            self.tm.next_txn_id.fetch_max(final_next_txn_id, Ordering::AcqRel);
+            self.tm
+                .next_txn_id
+                .fetch_max(final_next_txn_id, Ordering::AcqRel);
         }
 
         let final_next_page_id = if let Some(ref ckpt) = checkpoint_opt {

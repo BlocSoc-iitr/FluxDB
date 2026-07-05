@@ -360,10 +360,10 @@ mod tests {
     #[test]
     fn test_seed_clog_from_checkpoint() {
         let tm = TransactionManager::new();
-        
+
         let pinned = vec![10, 15, 20];
         tm.seed_clog_from_checkpoint(&pinned);
-        
+
         assert!(tm.is_aborted(10));
         assert!(tm.is_aborted(15));
         assert!(tm.is_aborted(20));

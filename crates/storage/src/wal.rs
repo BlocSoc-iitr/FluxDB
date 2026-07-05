@@ -173,7 +173,7 @@ impl CheckpointData {
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         if data.len() < 48 {
             return Err(WalError::CorruptedLog(
-                "Checkpoint data too short (need >= 48 bytes)".to_string()
+                "Checkpoint data too short (need >= 48 bytes)".to_string(),
             ));
         }
 
@@ -192,7 +192,9 @@ impl CheckpointData {
 
         // Parse active_txns array
         if pos + 4 > data.len() {
-            return Err(WalError::CorruptedLog("Missing active_txns count".to_string()));
+            return Err(WalError::CorruptedLog(
+                "Missing active_txns count".to_string(),
+            ));
         }
         let active_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
@@ -200,7 +202,9 @@ impl CheckpointData {
         let mut active_txns = Vec::with_capacity(active_count);
         for _ in 0..active_count {
             if pos + 8 > data.len() {
-                return Err(WalError::CorruptedLog("Truncated active_txns array".to_string()));
+                return Err(WalError::CorruptedLog(
+                    "Truncated active_txns array".to_string(),
+                ));
             }
             active_txns.push(u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()));
             pos += 8;
@@ -208,7 +212,9 @@ impl CheckpointData {
 
         // Parse pinned_aborted array
         if pos + 4 > data.len() {
-            return Err(WalError::CorruptedLog("Missing pinned_aborted count".to_string()));
+            return Err(WalError::CorruptedLog(
+                "Missing pinned_aborted count".to_string(),
+            ));
         }
         let aborted_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
@@ -216,7 +222,9 @@ impl CheckpointData {
         let mut pinned_aborted = Vec::with_capacity(aborted_count);
         for _ in 0..aborted_count {
             if pos + 8 > data.len() {
-                return Err(WalError::CorruptedLog("Truncated pinned_aborted array".to_string()));
+                return Err(WalError::CorruptedLog(
+                    "Truncated pinned_aborted array".to_string(),
+                ));
             }
             pinned_aborted.push(u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()));
             pos += 8;
@@ -1508,7 +1516,7 @@ mod tests {
             active_txns: vec![35, 38, 41],
             pinned_aborted: vec![20, 25],
         };
-        
+
         // Serialize
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&original.redo_point.to_le_bytes());
@@ -1524,10 +1532,10 @@ mod tests {
         for &id in &original.pinned_aborted {
             bytes.extend_from_slice(&id.to_le_bytes());
         }
-        
+
         // Deserialize
         let parsed = CheckpointData::from_bytes(&bytes).unwrap();
-        
+
         assert_eq!(parsed.redo_point, original.redo_point);
         assert_eq!(parsed.next_txn_id, original.next_txn_id);
         assert_eq!(parsed.active_txns, original.active_txns);
