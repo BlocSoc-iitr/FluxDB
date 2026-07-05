@@ -184,4 +184,6 @@ pub enum EngineError {
     Index(#[from] IndexError),
     #[error("write conflict: the transaction was aborted and may be retried")]
     TransactionConflict,
+    #[error("a background thread panicked")]
+    BackgroundThreadPanicked,
 }
