@@ -14,7 +14,7 @@
 
 use common::{EngineError, Key, Value};
 use db_core::transaction_manager::{TransactionManager, TransactionStatus};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
 use storage::buffer_pool::BufferPoolManager;
@@ -51,6 +51,8 @@ where
     /// Commit and abort hold this in shared mode across their WAL append and CLOG update.
     /// Checkpoints hold it in exclusive mode while picking a redo point and snapshotting.
     pub(crate) status_guard: RwLock<()>,
+
+    pub(crate) db_dir: PathBuf,
 }
 
 impl<K, V> Engine<K, V>
@@ -89,6 +91,7 @@ where
             disk_manager,
             transaction_manager,
             status_guard: RwLock::new(()),
+            db_dir: path.to_path_buf(),
         })
     }
     /// Opens an existing database.
@@ -129,6 +132,7 @@ where
             disk_manager,
             transaction_manager,
             status_guard: RwLock::new(()),
+            db_dir: path.to_path_buf(),
         })
     }
 
@@ -196,11 +200,14 @@ where
         )?;
 
         self.wal.flush_up_to(lsn)?;
-        
+
         //flush all dirty pages to buffer_pool
         self.buffer_pool.flush_all_pages()?;
 
-        // Notify buffer pool of the new checkpoint redo point for recovery optimization
+        // atomically write the superblock so recovery can find this checkpoint.
+        self.disk_manager
+            .atomic_write_file(&self.superblock_path, &lsn.to_le_bytes())?;
+
         self.buffer_pool.update_checkpoint_redo_point(redo_point);
 
         Ok(redo_point)
