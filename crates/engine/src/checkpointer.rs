@@ -18,7 +18,6 @@ pub(crate) enum Msg {
     Shutdown,
 }
 
-
 enum Wake {
     /// Interval elapsed with no message → periodic checkpoint. The only trigger.
     Tick,
@@ -70,7 +69,7 @@ where
         Ok(redo) => {
             if *last_redo == Some(redo) {
                 // A frozen redo point across checkpoints means a dirty frame is
-                // pinned. 
+                // pinned.
                 tracing::warn!(
                     redo_point = redo,
                     "redo point stalled; WAL will keep growing"
