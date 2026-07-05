@@ -20,7 +20,7 @@ use std::sync::RwLock;
 use storage::buffer_pool::BufferPoolManager;
 use storage::disk::DiskManager;
 use storage::index::BTreeIndex;
-use storage::page::PAGE_SIZE;
+use storage::page::{Lsn, PAGE_SIZE};
 use storage::recovery::RecoveryManager;
 use storage::wal::Wal;
 
@@ -82,8 +82,6 @@ where
         let (index, _root) = BTreeIndex::create(Arc::clone(&buffer_pool), Arc::clone(&wal))?;
         // index needs Arc because vacuum will later clone it.
         let index = Arc::new(index);
-        // TODO! spawn checkpoint thread once checkpoint is there
-        // TODO! spawn vacuum thread once vacuum is implemented
         Ok(Engine {
             index,
             wal,
@@ -124,7 +122,6 @@ where
             Arc::clone(&buffer_pool),
             Arc::clone(&wal),
         )?);
-        // TODO! spawn checkpoint + vacuum threads
         Ok(Engine {
             index,
             wal,
@@ -142,7 +139,11 @@ where
     /// Snapshots the redo point, active-transaction set, pinned-aborted set,
     /// and page/txn counters under the status guard (exclusive), then appends
     /// and flushes the record so recovery can start from the redo point.
-    pub fn checkpoint(&self) -> Result<(), EngineError> {
+    ///
+    /// Returns the chosen `redo_point` (the same LSN written to the record).
+    /// The background checkpointer compares it across ticks to detect a stalled
+    /// redo point (WAL that can't be reclaimed).
+    pub fn checkpoint(&self) -> Result<Lsn, EngineError> {
         use std::sync::atomic::Ordering::Acquire;
 
         // Take the status guard in exclusive mode so that no commit/abort
@@ -196,7 +197,7 @@ where
 
         self.wal.flush_up_to(lsn)?;
 
-        Ok(())
+        Ok(redo_point)
     }
 
     // ── PUBLIC API ─────────────────────────────────────────────
