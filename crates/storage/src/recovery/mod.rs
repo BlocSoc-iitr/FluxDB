@@ -101,10 +101,14 @@ impl RecoveryManager {
             while let Some(r) = iter.next_record() {
                 let record = r?;
 
-                // Skip records below the redo point
-                if record.lsn < redo_point {
-                    continue;
-                }
+                // TODO: Skip records below the redo point once checkpoint flushes pages
+                // Currently, checkpoints don't flush dirty pages (DESIGN.md step 3), so
+                // skipping WAL records below the redo point would lose data. We must replay
+                // all records until page flushing is implemented.
+                // if record.lsn < redo_point {
+                //     continue;
+                // }
+                let _ = redo_point; // silence unused warning
 
                 // Track all txn IDs seen in record headers
                 if record.txn_id != 0 {

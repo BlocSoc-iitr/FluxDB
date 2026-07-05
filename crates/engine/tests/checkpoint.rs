@@ -30,7 +30,9 @@ fn test_checkpoint_record_written() {
     let expected_active_txn_id: u64 = 3;
     let expected_aborted_txn_id: u64 = 2;
 
-    engine.checkpoint().expect("Checkpoint failed");
+    let redo_point = engine.checkpoint().expect("Checkpoint failed");
+    // Redo point should be a valid LSN (non-zero after some operations)
+    assert!(redo_point > 0, "Redo point should be > 0 after checkpoint");
 
     // Read back the WAL and find the Checkpoint record
     let wal_dir = dir.path().join("wal");
@@ -132,7 +134,8 @@ fn test_checkpoint_recovery() {
     drop(aborted_txn);
 
     // 4. Force checkpoint
-    engine.checkpoint().expect("Checkpoint failed");
+    let redo_point_1 = engine.checkpoint().expect("Checkpoint failed");
+    assert!(redo_point_1 > 0, "First redo point should be > 0");
 
     // 5. Simulate a ghost transaction: does work, but page flushes happen,
     //    so its WAL records are below the redo point. Then it crashes.
@@ -141,7 +144,12 @@ fn test_checkpoint_recovery() {
         .insert(&b"k4".as_slice(), &b"v4".as_slice())
         .unwrap();
     engine.flush_all_pages().unwrap();
-    engine.checkpoint().expect("Checkpoint 2 failed");
+    let redo_point_2 = engine.checkpoint().expect("Checkpoint 2 failed");
+    // Second checkpoint should have a redo point >= first (monotonic)
+    assert!(
+        redo_point_2 >= redo_point_1,
+        "Redo points should be monotonically increasing"
+    );
 
     // "Crash": Drop the engine completely without a clean shutdown
     drop(active_txn);
