@@ -51,8 +51,8 @@ where
     /// Commit and abort hold this in shared mode across their WAL append and CLOG update.
     /// Checkpoints hold it in exclusive mode while picking a redo point and snapshotting.
     pub(crate) status_guard: RwLock<()>,
-
-    pub(crate) db_dir: PathBuf,
+    /// Path to the database directory (needed to write the superblock).
+    pub(crate) superblock_path: PathBuf,
 }
 
 impl<K, V> Engine<K, V>
@@ -91,7 +91,7 @@ where
             disk_manager,
             transaction_manager,
             status_guard: RwLock::new(()),
-            db_dir: path.to_path_buf(),
+            superblock_path: path.join("checkpoint.superblock"),
         })
     }
     /// Opens an existing database.
@@ -132,7 +132,7 @@ where
             disk_manager,
             transaction_manager,
             status_guard: RwLock::new(()),
-            db_dir: path.to_path_buf(),
+            superblock_path: path.join("checkpoint.superblock"),
         })
     }
 
