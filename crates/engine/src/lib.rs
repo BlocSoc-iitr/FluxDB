@@ -2,6 +2,7 @@ mod checkpointer;
 mod engine;
 mod ops;
 mod txn;
+mod vacuum;
 
 #[cfg(test)]
 mod proptests;
@@ -13,6 +14,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::checkpointer::Msg;
+use crate::vacuum::Msg as VacMsg;
 
 pub use common::{BufferPoolError, DiskError, EngineError, IndexError, WalError};
 pub use common::{Key, Value};
@@ -21,12 +23,14 @@ pub use txn::TxnHandle;
 
 /// How often the background checkpointer runs. TODO: make configurable.
 pub(crate) const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30);
+/// How often the autovacuum worker wakes to check its trigger. TODO: make configurable.
+pub(crate) const VAC_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Owning handle for an open database.
 ///
 /// `Db` wraps the shared [`Engine`] and owns the background threads (the
-/// checkpointer today; vacuum later). Callers clone `db.engine` into worker
-/// threads.
+/// checkpointer and the autovacuum worker). Callers clone `db.engine` into
+/// worker threads.
 /// # Shutdown
 ///
 /// `Db` is an embedded library and installs **no** signal handler. The caller
@@ -41,6 +45,8 @@ where
     /// The database. Clone this into worker threads (`db.engine.clone()`).
     pub engine: Arc<Engine<K, V>>,
 
+    vac_handle: Option<JoinHandle<()>>,
+    vac_tx: Sender<VacMsg>,
     /// `Option` so `shutdown` can `take()` it and run exactly once.
     ckpt_handle: Option<JoinHandle<()>>,
     /// Owner-only; used solely to signal `Shutdown`. Never exposed.
@@ -80,19 +86,25 @@ where
             .spawn(move || checkpointer::run(engine_for_ckpt, rx, CHECKPOINT_INTERVAL))
             .expect("spawn checkpointer thread");
 
-        // TODO (later PR): spawn the vacuum thread here the same way, storing
-        // its own handle + sender; `shutdown` will then join both.
+        let (vac_tx, rx) = mpsc::channel();
+        let engine_for_vac = Arc::clone(&engine);
+        let vac_handle = thread::Builder::new()
+            .name("fluxdb-vacuum".into())
+            .spawn(move || vacuum::run(engine_for_vac, rx, VAC_INTERVAL))
+            .expect("spawn vacuum thread");
 
         Db {
             engine,
             ckpt_handle: Some(ckpt_handle),
             ckpt_tx,
+            vac_handle: Some(vac_handle),
+            vac_tx,
         }
     }
 
-    /// Explicit graceful shutdown: signals the checkpointer to run one final
-    /// checkpoint and joins it. Surfaces a thread panic as
-    /// [`EngineError::BackgroundThreadPanicked`]. Consumes the `Db`.
+    /// Explicit graceful shutdown: signals both background threads (the
+    /// checkpointer runs one final checkpoint) and joins them. Surfaces a
+    /// thread panic as [`EngineError::BackgroundThreadPanicked`]. Consumes the `Db`.
     pub fn close(mut self) -> Result<(), EngineError> {
         self.shutdown()
         // `self` drops here; `Drop` calls `shutdown` again → no-op (handle taken).
@@ -101,10 +113,19 @@ where
     /// Idempotent: `take()` ensures the signal + join happen at most once, so
     /// `close` followed by `Drop` (or a double `Drop`) is safe.
     fn shutdown(&mut self) -> Result<(), EngineError> {
-        if let Some(handle) = self.ckpt_handle.take() {
-            // Ignore the send error: if the thread already exited, the channel
-            // is closed — we still want to join.
+        let ckpt = self.ckpt_handle.take();
+        let vac = self.vac_handle.take();
+
+        // Signal both before joining either, so the threads wind down in parallel.
+        // Ignore send errors: if a thread already exited, its channel is closed —
+        // we still want to join.
+        if ckpt.is_some() {
             let _ = self.ckpt_tx.send(Msg::Shutdown);
+        }
+        if vac.is_some() {
+            let _ = self.vac_tx.send(VacMsg::Shutdown);
+        }
+        for handle in [ckpt, vac].into_iter().flatten() {
             handle
                 .join()
                 .map_err(|_| EngineError::BackgroundThreadPanicked)?;

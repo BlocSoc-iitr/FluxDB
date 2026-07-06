@@ -31,6 +31,7 @@ use std::sync::atomic::{
 use std::{
     collections::HashMap,
     sync::{Arc, Condvar, Mutex, RwLock},
+    time::{Duration, Instant},
 };
 
 use crate::transaction::{Snapshot, Transaction};
@@ -65,8 +66,10 @@ pub struct TransactionManager {
     pub next_txn_id: AtomicU64,
     pub clog: RwLock<HashMap<u64, TransactionStatus>>,
     pub vacuum_horizon: AtomicU64,
-    /// In-flight `txn_id` → its snapshot's `xmin` (feeds `global_xmin`).
-    pub active_txns: RwLock<HashMap<u64, u64>>,
+    pub dead_versions: AtomicU64,
+    /// In-flight `txn_id` → (its snapshot's `xmin`, when it began). The xmin
+    /// feeds `global_xmin`; the timestamp feeds `oldest_active_txn_age`.
+    pub active_txns: RwLock<HashMap<u64, (u64, Instant)>>,
     waiters: Mutex<HashMap<u64, WaiterEntry>>,
 }
 
@@ -83,6 +86,7 @@ impl TransactionManager {
             next_txn_id: AtomicU64::new(1),
             clog: RwLock::new(HashMap::new()),
             vacuum_horizon: AtomicU64::new(0),
+            dead_versions: AtomicU64::new(0),
             active_txns: RwLock::new(HashMap::new()),
             waiters: Mutex::new(HashMap::new()),
         }
@@ -95,9 +99,17 @@ impl TransactionManager {
         let active = self.active_txns.read().unwrap();
         active
             .values()
+            .map(|(xmin, _)| *xmin)
             .min()
-            .copied()
             .unwrap_or_else(|| self.next_txn_id.load(Acquire))
+    }
+
+    /// Age of the oldest still-open transaction, `None` if nothing is in
+    /// flight. A large value here means `global_xmin` is pinned and vacuum
+    /// cannot reclaim anything — the classic forgotten-transaction stall.
+    pub fn oldest_active_txn_age(&self) -> Option<Duration> {
+        let active = self.active_txns.read().unwrap();
+        active.values().map(|(_, began)| began.elapsed()).max()
     }
 
     /// Publishes the horizon of a COMPLETED full vacuum sweep. `fetch_max` so a
@@ -110,6 +122,30 @@ impl TransactionManager {
     /// completed full sweep (0 until the first post-restart sweep completes).
     pub fn vacuum_horizon(&self) -> u64 {
         self.vacuum_horizon.load(Acquire)
+    }
+
+    /// Counts dead row versions created since the last autovacuum sweep.
+    /// One per tombstoned version (update/delete success paths).
+    pub fn note_dead_version(&self) {
+        self.dead_versions.fetch_add(1, AcqRel);
+    }
+
+    /// Current dead-version count (for stats/tests).
+    pub fn dead_versions(&self) -> u64 {
+        self.dead_versions.load(Acquire)
+    }
+
+    /// Atomically resets the counter and returns what it was. The autovacuum
+    /// worker calls this once it has decided to sweep; the swap ensures
+    /// concurrent increments are never lost or double-counted.
+    pub fn take_dead_versions(&self) -> u64 {
+        self.dead_versions.swap(0, AcqRel)
+    }
+
+    /// Returns a taken count after a failed sweep, so the next tick retries
+    /// instead of waiting for a fresh threshold's worth of dead versions.
+    pub fn restore_dead_versions(&self, n: u64) {
+        self.dead_versions.fetch_add(n, AcqRel);
     }
 
     /// Truncates the CLOG, removing entries older than `horizon`.
@@ -144,7 +180,7 @@ impl TransactionManager {
         let txn_id = self.next_txn_id.fetch_add(1, AcqRel);
         // Snapshot xmin = oldest in-flight txn; stored for global_xmin().
         let xmin = active.keys().min().copied().unwrap_or(txn_id);
-        active.insert(txn_id, xmin);
+        active.insert(txn_id, (xmin, Instant::now()));
 
         let xmax = self.next_txn_id.load(Acquire);
         let active_vec: Vec<u64> = active.keys().cloned().collect();
@@ -291,7 +327,6 @@ impl TransactionManager {
         }
     }
 }
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

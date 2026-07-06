@@ -884,19 +884,23 @@ impl Wal {
         txn_id: u64,
         deleted_page_id: PageId,
         left_sibling: Option<PageId>,
-        right_sibling: PageId,
+        right_sibling: Option<PageId>,
         parent_page: PageId,
         remove_index: u16,
         keep_right_child: bool,
     ) -> Result<Lsn> {
-        let mut blocks = Vec::with_capacity(if left_sibling.is_some() { 3 } else { 2 });
+        let mut blocks = Vec::with_capacity(if left_sibling.is_some() && right_sibling.is_some() {
+            3
+        } else {
+            2
+        });
 
         let left_payload;
         if let Some(left_page) = left_sibling {
             left_payload = {
                 let mut p = Vec::with_capacity(1 + 8);
                 p.push(UNLINK_ROLE_LEFT);
-                p.extend_from_slice(&right_sibling.to_le_bytes());
+                p.extend_from_slice(&right_sibling.unwrap_or(0).to_le_bytes());
                 p
             };
             blocks.push(Block {
@@ -907,15 +911,21 @@ impl Wal {
             });
         }
 
-        let mut right_payload = Vec::with_capacity(1 + 8);
-        right_payload.push(UNLINK_ROLE_RIGHT);
-        right_payload.extend_from_slice(&left_sibling.unwrap_or(0).to_le_bytes());
-        blocks.push(Block {
-            page_id: right_sibling,
-            blk_flags: BLK_HAS_DATA,
-            fpi: None,
-            data: Some(&right_payload),
-        });
+        let right_payload;
+        if let Some(right_page) = right_sibling {
+            right_payload = {
+                let mut p = Vec::with_capacity(1 + 8);
+                p.push(UNLINK_ROLE_RIGHT);
+                p.extend_from_slice(&left_sibling.unwrap_or(0).to_le_bytes());
+                p
+            };
+            blocks.push(Block {
+                page_id: right_page,
+                blk_flags: BLK_HAS_DATA,
+                fpi: None,
+                data: Some(&right_payload),
+            });
+        }
 
         let mut parent_payload = Vec::with_capacity(1 + 2 + 1);
         parent_payload.push(UNLINK_ROLE_PARENT);
@@ -1458,7 +1468,7 @@ mod tests {
         let wal_dir = dir.path().join("unlink-page-wal");
 
         let wal = Wal::new(&wal_dir)?;
-        let lsn = wal.log_unlink_page(0, 22, Some(11), 33, 44, 2, true)?;
+        let lsn = wal.log_unlink_page(0, 22, Some(11), Some(33), 44, 2, true)?;
         wal.flush_up_to(lsn)?;
 
         let mut iter = WalIterator::new(&wal_dir).map_err(WalError::Io)?;

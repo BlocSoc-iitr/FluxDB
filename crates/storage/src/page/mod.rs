@@ -6,6 +6,7 @@
 //!
 //! Shared constants, helpers, and error types live here.
 
+pub mod free_space;
 pub mod internal;
 pub mod leaf;
 pub mod meta;
@@ -35,6 +36,8 @@ pub const LEAF: u8 = 1;
 pub const INTERNAL: u8 = 2;
 /// Marker byte stored at offset 0 of metadata page
 pub const META: u8 = 3;
+/// Marker byte stored at offset 0 of the free-space bitmap page.
+pub const FREE_SPACE: u8 = 5;
 /// Marker byte stored at offset 0 of every overflow page.
 pub const OVERFLOW: u8 = 4;
 // ── Page size ─────────────────────────────────────────────────────────────────
@@ -102,6 +105,8 @@ const OFF_INT_CHECKSUM: usize = 32;
 const OFF_META_CHECKSUM: usize = 56;
 /// checksum offset for overflow page
 const OFF_OVERFLOW_CHECKSUM: usize = 44;
+/// checksum offset for the free-space bitmap page
+const OFF_FREE_SPACE_CHECKSUM: usize = 24;
 /// Byte offset of the CRC32 field for the given page-type marker, or `None` for
 /// an unrecognised type (e.g. a never-initialised, all-zero page) which carries
 /// no checksum to verify.
@@ -112,7 +117,7 @@ fn checksum_offset(page_type: u8) -> Option<usize> {
         INTERNAL => Some(OFF_INT_CHECKSUM),
         META => Some(OFF_META_CHECKSUM),
         OVERFLOW => Some(OFF_OVERFLOW_CHECKSUM),
-
+        FREE_SPACE => Some(OFF_FREE_SPACE_CHECKSUM),
         _ => None,
     }
 }

@@ -1380,3 +1380,629 @@ fn crash_victim_overflow_insert_invisible_after_reopen() {
     let all: Vec<(Vec<u8>, Vec<u8>)> = index.range(.., &reader).map(|r| r.unwrap()).collect();
     assert!(all.is_empty());
 }
+
+// ── Unlink crash recovery ─────────────────────────────────────────────
+//
+// The index does not drive page deletion yet, so the pre-unlink tree is staged
+// by hand at page level: parent = [left] "m" [dead], leaf chain left = dead.
+
+#[test]
+fn recover_unlink_rightmost_leaf_ends_chain_at_left_sibling() {
+    // Extreme case: the unlinked leaf is the rightmost one (right_sibling =
+    // None), so the LEFT block's payload carries the 0 sentinel. Replay must
+    // decode it as rightlink = None; decoding it as Some(0) would splice the
+    // meta page into the leaf chain.
+    let dir = tempdir().unwrap();
+    let (left_pid, dead_pid, parent_pid);
+    {
+        let disk = Arc::new(DiskManager::new(dir.path().join("test.db"), MAX_PAGE_SIZE).unwrap());
+        let wal = make_wal(dir.path());
+        let pool = make_pool(disk, wal.clone());
+
+        // Burn page 0 as a meta stand-in so no real page id collides with the
+        // no_sibling sentinel.
+        drop(pool.new_page().unwrap());
+        left_pid = pool.new_page().unwrap().page_id;
+        dead_pid = pool.new_page().unwrap().page_id;
+        parent_pid = pool.new_page().unwrap().page_id;
+
+        {
+            let mut g = pool.fetch_page_mut(left_pid).unwrap();
+            let mut b = LeafPageBuilder::<&[u8], &[u8]>::new(left_pid, &mut g[..]);
+            b.set_prev_page(None);
+            b.set_rightlink(Some(dead_pid));
+            b.finish();
+        }
+        {
+            let mut g = pool.fetch_page_mut(dead_pid).unwrap();
+            let mut b = LeafPageBuilder::<&[u8], &[u8]>::new(dead_pid, &mut g[..]);
+            b.set_prev_page(Some(left_pid));
+            b.set_rightlink(None);
+            b.finish();
+            crate::page::set_half_dead(&mut g[..]);
+        }
+        {
+            let mut g = pool.fetch_page_mut(parent_pid).unwrap();
+            let mut b = InternalPageBuilder::<&[u8]>::new(parent_pid, &mut g[..]);
+            b.push_first_child(left_pid);
+            b.push_key_and_right_child(&(&b"m"[..]), dead_pid);
+            b.finish();
+        }
+        // The pre-unlink tree is durable, page lsn 0, the splice itself is
+        // WAL-only, so recovery must redo it.
+        pool.flush_all_pages().unwrap();
+
+        let txn = 1;
+        wal.log_unlink_page(txn, dead_pid, Some(left_pid), None, parent_pid, 0, false)
+            .unwrap();
+        wal.log_commit(txn).unwrap();
+        wal.flush_up_to(wal.next_lsn()).unwrap();
+        // crash
+    }
+
+    let disk = Arc::new(DiskManager::new(dir.path().join("test.db"), MAX_PAGE_SIZE).unwrap());
+    let wal = make_wal(dir.path());
+    let pool = make_pool(disk, wal.clone());
+    let tm = Arc::new(TM::new());
+    RecoveryManager::new(pool.clone(), dir.path().join("wal"), tm)
+        .recover::<&[u8], &[u8]>()
+        .unwrap();
+
+    {
+        let g = pool.fetch_page(left_pid).unwrap();
+        let left = LeafPageAccessor::<&[u8], &[u8]>::new(&g[..]);
+        assert_eq!(
+            left.rightlink(),
+            None,
+            "left sibling must become the end of the chain, not point at page 0"
+        );
+    }
+    {
+        let g = pool.fetch_page(parent_pid).unwrap();
+        let parent = InternalPageAccessor::<&[u8]>::new(&g[..]);
+        assert_eq!(parent.num_keys(), 0, "separator key must be removed");
+        assert_eq!(
+            parent.child_page_at(0),
+            left_pid,
+            "surviving child must be the left sibling"
+        );
+    }
+}
+
+// ── VAC-4: vacuum-driven unlink + recycle ─────────────────────────────
+//
+// Unlike the hand-staged test above, everything below goes through the real
+// driver: `vacuum` empties the leaf, `delete_empty_leaf` writes the records,
+// the drain graduates the id, `new_page` reuses it.
+
+/// Insert keys `range` (4-byte big-endian, 40-byte values) as individually
+/// committed transactions with durable Commit records, so the rows survive
+/// the crash-recovery tests below.
+fn fill_committed(idx: &Idx, wal: &Wal, tm: &Arc<TM>, range: std::ops::Range<u32>) {
+    for i in range {
+        let k = i.to_be_bytes();
+        let v = [0xAB_u8; 40];
+        let txn = tm.begin();
+        idx.insert(&(k.as_ref()), &(v.as_ref()), &txn).unwrap();
+        wal.log_commit(txn.txn_id).unwrap();
+        tm.mark_committed(txn.txn_id);
+    }
+}
+
+fn delete_committed(idx: &Idx, wal: &Wal, tm: &Arc<TM>, keys: &[u32]) {
+    for &i in keys {
+        let k = i.to_be_bytes();
+        let txn = tm.begin();
+        idx.delete(&(k.as_ref()), &txn).unwrap();
+        wal.log_commit(txn.txn_id).unwrap();
+        tm.mark_committed(txn.txn_id);
+    }
+}
+
+/// Leaf page ids left-to-right along the sibling chain.
+fn leaf_chain(idx: &Idx, pool: &BufferPoolManager) -> Vec<PageId> {
+    let mut out = Vec::new();
+    let mut pid = idx.find_leftmost_leaf(idx.root_page_id()).unwrap();
+    loop {
+        let g = pool.fetch_page(pid).unwrap();
+        let next = LeafPageAccessor::<&[u8], &[u8]>::new(&g[..]).rightlink();
+        drop(g);
+        out.push(pid);
+        match next {
+            Some(p) => pid = p,
+            None => return out,
+        }
+    }
+}
+
+/// Rows visible to `reader` via a full forward scan; unwraps scan errors so
+/// a broken leaf chain fails loudly instead of undercounting.
+fn count_rows(idx: &Idx, reader: &Transaction) -> usize {
+    idx.range(.., reader).fold(0, |n, r| {
+        r.unwrap();
+        n + 1
+    })
+}
+
+/// All keys physically on one leaf (live and dead), decoded back to u32.
+fn leaf_keys(pool: &BufferPoolManager, pid: PageId) -> Vec<u32> {
+    let g = pool.fetch_page(pid).unwrap();
+    let acc = LeafPageAccessor::<&[u8], &[u8]>::new(&g[..]);
+    (0..acc.num_pairs() as usize)
+        .map(|i| u32::from_be_bytes(acc.get_key(i).try_into().unwrap()))
+        .collect()
+}
+
+/// No internal page anywhere in the file may still hold a downlink to `dead`.
+fn assert_no_downlink_to(pool: &BufferPoolManager, dead: PageId) {
+    for pid in 0..pool.next_page_id() {
+        let Ok(g) = pool.fetch_page(pid) else {
+            continue;
+        };
+        if g[0] == crate::page::INTERNAL {
+            let acc = InternalPageAccessor::<&[u8]>::new(&g[..]);
+            for i in 0..=acc.num_keys() as usize {
+                assert_ne!(
+                    acc.child_page_at(i),
+                    dead,
+                    "internal page {pid} still points at the unlinked leaf"
+                );
+            }
+        }
+    }
+}
+
+/// Builds a 3+-leaf tree, durably empties its middle leaf, then "crashes"
+/// with ONLY the MarkHalfDead record in the WAL — the exact state of a crash
+/// between the two unlink records. Returns (left, dead, right, victim keys).
+fn stage_crash_between_mark_and_unlink(dir: &Path) -> (PageId, PageId, PageId, Vec<u32>) {
+    let (pool, wal, tm, idx) = build_db(dir);
+    fill_committed(&idx, &wal, &tm, 0..240);
+    let chain = leaf_chain(&idx, &pool);
+    assert!(
+        chain.len() >= 3,
+        "staging needs >= 3 leaves, got {}",
+        chain.len()
+    );
+    let mid = chain.len() / 2;
+    let (left, dead, right) = (chain[mid - 1], chain[mid], chain[mid + 1]);
+    let victims = leaf_keys(&pool, dead);
+    delete_committed(&idx, &wal, &tm, &victims);
+
+    // Everything above is durable in both files; the mark is WAL-only (its
+    // page change never reached the data file), the unlink never happened.
+    pool.flush_all_pages().unwrap();
+    wal.log_mark_half_dead(SYSTEM_TXN_ID, dead).unwrap();
+    wal.flush_up_to(wal.next_lsn()).unwrap();
+    (left, dead, right, victims)
+    // drop = crash
+}
+
+/// Test 1: emptying a middle leaf and sweeping must splice it out of the
+/// chain and the parent, with reads over the survivors intact.
+#[test]
+fn vacuum_unlinks_emptied_middle_leaf() {
+    let dir = tempdir().unwrap();
+    let (pool, wal, tm, idx) = build_db(dir.path());
+    fill_committed(&idx, &wal, &tm, 0..240);
+
+    let chain = leaf_chain(&idx, &pool);
+    assert!(
+        chain.len() >= 3,
+        "staging needs >= 3 leaves, got {}",
+        chain.len()
+    );
+    let mid = chain.len() / 2;
+    let (left, dead, right) = (chain[mid - 1], chain[mid], chain[mid + 1]);
+    let victims = leaf_keys(&pool, dead);
+    delete_committed(&idx, &wal, &tm, &victims);
+
+    let removed = idx.vacuum(&tm).unwrap();
+    assert_eq!(removed, victims.len());
+
+    // Fully unhooked: both chain directions skip it, parent downlink gone.
+    {
+        let g = pool.fetch_page(left).unwrap();
+        assert_eq!(
+            LeafPageAccessor::<&[u8], &[u8]>::new(&g[..]).rightlink(),
+            Some(right)
+        );
+    }
+    {
+        let g = pool.fetch_page(right).unwrap();
+        assert_eq!(
+            LeafPageAccessor::<&[u8], &[u8]>::new(&g[..]).prev_page(),
+            Some(left)
+        );
+    }
+    assert_no_downlink_to(&pool, dead);
+    assert!(!leaf_chain(&idx, &pool).contains(&dead));
+
+    // Reads over the survivors stay correct in every access path.
+    let survivors = 240 - victims.len();
+    let reader = tm.begin();
+    assert!(
+        idx.get(&(victims[0].to_be_bytes().as_ref()), &reader)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        idx.get(&(0u32.to_be_bytes().as_ref()), &reader)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(count_rows(&idx, &reader), survivors);
+    let bwd = idx
+        .range_backward::<std::ops::RangeFull>(.., &reader)
+        .fold(0, |n, r| {
+            r.unwrap();
+            n + 1
+        });
+    assert_eq!(bwd, survivors);
+}
+
+/// Test 2: same, but for the rightmost leaf (`right_sibling = None` arm) —
+/// its left neighbor must become the new end of the chain.
+#[test]
+fn vacuum_unlinks_emptied_rightmost_leaf() {
+    let dir = tempdir().unwrap();
+    let (pool, wal, tm, idx) = build_db(dir.path());
+    fill_committed(&idx, &wal, &tm, 0..240);
+
+    let chain = leaf_chain(&idx, &pool);
+    assert!(
+        chain.len() >= 3,
+        "staging needs >= 3 leaves, got {}",
+        chain.len()
+    );
+    let (left, dead) = (chain[chain.len() - 2], chain[chain.len() - 1]);
+    let victims = leaf_keys(&pool, dead);
+    delete_committed(&idx, &wal, &tm, &victims);
+
+    let removed = idx.vacuum(&tm).unwrap();
+    assert_eq!(removed, victims.len());
+
+    {
+        let g = pool.fetch_page(left).unwrap();
+        assert_eq!(
+            LeafPageAccessor::<&[u8], &[u8]>::new(&g[..]).rightlink(),
+            None,
+            "left neighbor must become the end of the chain"
+        );
+    }
+    assert_no_downlink_to(&pool, dead);
+    assert_eq!(leaf_chain(&idx, &pool).last(), Some(&left));
+
+    // A backward scan starts from the rightmost leaf — the arm under test.
+    let survivors = 240 - victims.len();
+    let reader = tm.begin();
+    let bwd: Vec<_> = idx
+        .range_backward::<std::ops::RangeFull>(.., &reader)
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(bwd.len(), survivors);
+    assert_eq!(
+        bwd[0].0,
+        victims[0].wrapping_sub(1).to_be_bytes(),
+        "new max key must be the last survivor before the deleted range"
+    );
+}
+
+/// Test 3: a crash between MarkHalfDead and UnlinkPage leaves a flagged but
+/// wired leaf; recovery must produce a walkable tree and the next sweep must
+/// FINISH the demolition rather than restart it.
+#[test]
+fn crash_between_mark_half_dead_and_unlink_is_resumable() {
+    let dir = tempdir().unwrap();
+    let (left, dead, right, victims) = stage_crash_between_mark_and_unlink(dir.path());
+
+    let (pool, _wal, tm, idx) = reopen_db(dir.path());
+
+    // Recovery replayed the mark…
+    {
+        let g = pool.fetch_page(dead).unwrap();
+        assert!(
+            crate::page::is_half_dead(&g[..]),
+            "MarkHalfDead must replay"
+        );
+    }
+    // …and the flagged-but-wired page doesn't break a forward walk.
+    let survivors = 240 - victims.len();
+    let reader = tm.begin();
+    assert_eq!(count_rows(&idx, &reader), survivors);
+
+    // The next sweep completes the interrupted unlink.
+    let removed = idx.vacuum(&tm).unwrap();
+    assert_eq!(removed, victims.len());
+    {
+        let g = pool.fetch_page(left).unwrap();
+        assert_eq!(
+            LeafPageAccessor::<&[u8], &[u8]>::new(&g[..]).rightlink(),
+            Some(right)
+        );
+    }
+    assert_no_downlink_to(&pool, dead);
+    let reader = tm.begin();
+    assert_eq!(count_rows(&idx, &reader), survivors);
+}
+
+/// Test 4: running recovery twice over the same WAL must be a byte-identical
+/// no-op on the data file — the LSN gate skips already-applied changes.
+#[test]
+fn double_recovery_after_mid_delete_crash_is_byte_identical() {
+    let dir = tempdir().unwrap();
+    stage_crash_between_mark_and_unlink(dir.path());
+
+    drop(reopen_db(dir.path()));
+    let first = std::fs::read(dir.path().join("test.db")).unwrap();
+    drop(reopen_db(dir.path()));
+    let second = std::fs::read(dir.path().join("test.db")).unwrap();
+    assert!(
+        first == second,
+        "double recovery must be a byte-identical no-op"
+    );
+}
+
+/// Test 5: an insert that routes to a half-dead leaf must back off and retry
+/// (writer-race guard #2), landing safely once the unlink completes.
+#[test]
+fn insert_onto_half_dead_leaf_backs_off_and_survives() {
+    let dir = tempdir().unwrap();
+    let (pool, wal, tm, idx) = build_db(dir.path());
+    fill_committed(&idx, &wal, &tm, 0..240);
+
+    let chain = leaf_chain(&idx, &pool);
+    assert!(
+        chain.len() >= 3,
+        "staging needs >= 3 leaves, got {}",
+        chain.len()
+    );
+    let dead = chain[chain.len() / 2];
+    let victims = leaf_keys(&pool, dead);
+    delete_committed(&idx, &wal, &tm, &victims);
+
+    // Stage the transient window by hand: flag set, unlink not yet applied —
+    // the gap between MarkHalfDead and UnlinkPage in a live deletion.
+    {
+        let mut g = pool.fetch_page_mut(dead).unwrap();
+        crate::page::set_half_dead(&mut g[..]);
+    }
+
+    // A key that routes squarely into the half-dead leaf's range.
+    let key = victims[victims.len() / 2];
+    let idx = Arc::new(idx);
+    let writer_idx = Arc::clone(&idx);
+    let writer_tm = Arc::clone(&tm);
+    let writer = std::thread::spawn(move || {
+        let k = key.to_be_bytes();
+        let txn = writer_tm.begin();
+        writer_idx
+            .insert(&(k.as_ref()), &(&b"survivor"[..]), &txn)
+            .unwrap();
+        writer_tm.mark_committed(txn.txn_id);
+    });
+
+    // While the flag is set and the downlink exists, the insert must spin in
+    // its back-off loop rather than write onto the doomed page.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(
+        !writer.is_finished(),
+        "insert must not land on a half-dead leaf"
+    );
+
+    // Finish the demolition; the retrying insert can now route past the leaf.
+    idx.vacuum(&tm).unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !writer.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "insert never completed after the unlink"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    writer.join().unwrap();
+
+    let reader = tm.begin();
+    let got = idx.get(&(key.to_be_bytes().as_ref()), &reader).unwrap();
+    assert_eq!(got.as_deref(), Some(b"survivor".as_ref()));
+    assert!(!leaf_chain(&idx, &pool).contains(&dead));
+}
+
+/// Test 6 (issue done-when): a deleted page id must stay parked while any
+/// snapshot that could walk to it is alive, and graduate to the bitmap +
+/// allocator only after the horizon passes its stamp.
+#[test]
+fn recycle_is_horizon_gated() {
+    let dir = tempdir().unwrap();
+    let (pool, wal, tm, idx) = build_db(dir.path());
+    fill_committed(&idx, &wal, &tm, 0..240);
+
+    let chain = leaf_chain(&idx, &pool);
+    assert!(
+        chain.len() >= 3,
+        "staging needs >= 3 leaves, got {}",
+        chain.len()
+    );
+    let dead = chain[chain.len() / 2];
+    let victims = leaf_keys(&pool, dead);
+    delete_committed(&idx, &wal, &tm, &victims);
+
+    // The long-lived snapshot: begins after the deletes settle, before the
+    // unlink — it can't see the dead rows but could still walk to the page.
+    let pin = tm.begin();
+
+    // Sweep #1 unlinks the leaf and parks its id, stamped with pin's xmin.
+    assert_eq!(idx.vacuum(&tm).unwrap(), victims.len());
+    let fs_pid = *pool.free_page.lock().unwrap();
+    {
+        let g = pool.fetch_page(fs_pid).unwrap();
+        assert!(
+            crate::page::free_space::scan_free(&g[..]).is_empty(),
+            "id must stay parked while the pin lives"
+        );
+    }
+    // Allocation must still grow the file, not hand out the parked id.
+    assert_ne!(pool.new_page().unwrap().page_id, dead);
+
+    // A second sweep with the pin still open changes nothing.
+    idx.vacuum(&tm).unwrap();
+    {
+        let g = pool.fetch_page(fs_pid).unwrap();
+        assert!(crate::page::free_space::scan_free(&g[..]).is_empty());
+    }
+
+    // Finish the pin: the next sweep's horizon passes the stamp.
+    tm.mark_committed(pin.txn_id);
+    idx.vacuum(&tm).unwrap();
+    {
+        let g = pool.fetch_page(fs_pid).unwrap();
+        assert_eq!(crate::page::free_space::scan_free(&g[..]), vec![dead]);
+    }
+    assert_eq!(
+        pool.new_page().unwrap().page_id,
+        dead,
+        "the very next allocation must reuse the freed id"
+    );
+}
+
+/// Test 7: a crash after UnlinkPage but before the bitmap FPI must leak the
+/// id (never free it, never hand it out twice), leave the tree walkable, and
+/// recover idempotently.
+#[test]
+fn crash_before_bitmap_fpi_leaks_id_safely() {
+    let dir = tempdir().unwrap();
+    let (left, dead, right, victims) = {
+        let (pool, wal, tm, idx) = build_db(dir.path());
+        fill_committed(&idx, &wal, &tm, 0..240);
+        let chain = leaf_chain(&idx, &pool);
+        assert!(
+            chain.len() >= 3,
+            "staging needs >= 3 leaves, got {}",
+            chain.len()
+        );
+        let mid = chain.len() / 2;
+        let (left, dead, right) = (chain[mid - 1], chain[mid], chain[mid + 1]);
+        let victims = leaf_keys(&pool, dead);
+        delete_committed(&idx, &wal, &tm, &victims);
+
+        // One sweep: the unlink lands in the WAL, but the freed id is still
+        // parked (its stamp equals this pass's own xmin), so no bitmap FPI
+        // exists yet — exactly the crash point under test.
+        idx.vacuum(&tm).unwrap();
+        let fs_pid = *pool.free_page.lock().unwrap();
+        {
+            let g = pool.fetch_page(fs_pid).unwrap();
+            assert!(crate::page::free_space::scan_free(&g[..]).is_empty());
+        }
+        wal.flush_up_to(wal.next_lsn()).unwrap();
+        (left, dead, right, victims)
+        // crash: WAL ends after UnlinkPage, no bitmap change journaled
+    };
+
+    drop(reopen_db(dir.path()));
+    let first = std::fs::read(dir.path().join("test.db")).unwrap();
+    let (pool, _wal, tm, idx) = reopen_db(dir.path());
+    let second = std::fs::read(dir.path().join("test.db")).unwrap();
+    assert!(
+        first == second,
+        "double recovery must be a byte-identical no-op"
+    );
+
+    // The replayed unlink left a walkable, spliced tree.
+    let reader = tm.begin();
+    assert_eq!(count_rows(&idx, &reader), 240 - victims.len());
+    {
+        let g = pool.fetch_page(left).unwrap();
+        assert_eq!(
+            LeafPageAccessor::<&[u8], &[u8]>::new(&g[..]).rightlink(),
+            Some(right)
+        );
+    }
+    assert_no_downlink_to(&pool, dead);
+
+    // The id is leaked: not in the bitmap, not in the pool, never handed out.
+    let fs_pid = *pool.free_page.lock().unwrap();
+    {
+        let g = pool.fetch_page(fs_pid).unwrap();
+        assert!(
+            crate::page::free_space::scan_free(&g[..]).is_empty(),
+            "crash-lost id must leak, not resurrect as free"
+        );
+    }
+    assert!(pool.free_pool.lock().unwrap().is_empty());
+    assert_ne!(
+        pool.new_page().unwrap().page_id,
+        dead,
+        "a leaked id must never be handed out"
+    );
+}
+
+/// Test 8: once a recycled id is reused, a crash must replay the page to its
+/// NEW life — the LSN gate keeps the old life's records from resurrecting.
+#[test]
+fn recycled_page_replays_to_new_contents() {
+    let dir = tempdir().unwrap();
+    let (dead, victims, inserted) = {
+        let (pool, wal, tm, idx) = build_db(dir.path());
+        fill_committed(&idx, &wal, &tm, 0..240);
+        let chain = leaf_chain(&idx, &pool);
+        assert!(
+            chain.len() >= 3,
+            "staging needs >= 3 leaves, got {}",
+            chain.len()
+        );
+        let dead = chain[chain.len() / 2];
+        let victims = leaf_keys(&pool, dead);
+        delete_committed(&idx, &wal, &tm, &victims);
+
+        idx.vacuum(&tm).unwrap(); // unlink + park
+        let bump = tm.begin(); // move the horizon past the stamp
+        tm.mark_committed(bump.txn_id);
+        idx.vacuum(&tm).unwrap(); // graduate: bitmap + free_pool hold the id
+
+        // Grow the tree until a split's new_page pops the recycled id and the
+        // page begins its new life as a leaf full of fresh keys.
+        let mut inserted = 0u32;
+        for i in 1000u32.. {
+            fill_committed(&idx, &wal, &tm, i..i + 1);
+            inserted += 1;
+            if leaf_chain(&idx, &pool).contains(&dead) {
+                break;
+            }
+            assert!(inserted < 500, "recycled id was never handed back out");
+        }
+
+        wal.flush_up_to(wal.next_lsn()).unwrap();
+        (dead, victims, inserted)
+        // crash: the new life exists only in the WAL
+    };
+
+    let (pool, _wal, tm, idx) = reopen_db(dir.path());
+
+    // The recycled page replayed to its new life…
+    {
+        let g = pool.fetch_page(dead).unwrap();
+        assert!(!crate::page::is_half_dead(&g[..]));
+    }
+    // Its contents are whatever the split moved there (which may legitimately
+    // include pre-existing keys) — but never its old life's victim rows.
+    let new_life = leaf_keys(&pool, dead);
+    assert!(!new_life.is_empty());
+    assert!(
+        !new_life.iter().any(|k| victims.contains(k)),
+        "old-life contents resurrected on the recycled page: {new_life:?}"
+    );
+
+    // …and every surviving row is exactly where it should be.
+    let reader = tm.begin();
+    assert!(
+        idx.get(&(victims[0].to_be_bytes().as_ref()), &reader)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        count_rows(&idx, &reader),
+        240 - victims.len() + inserted as usize
+    );
+}

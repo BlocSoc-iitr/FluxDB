@@ -1,6 +1,6 @@
 use crate::buffer_pool::shard::{BufferPoolShard, PageReadGuard, PageWriteGuard};
 use crate::disk::DiskManager;
-use crate::page::Lsn;
+use crate::page::{Lsn, PAGE_SIZE, PageId};
 use crate::wal::Wal;
 use common::{BufferPoolError, MAX_FRAMES, NUM_SHARDS, SHARD_MASK};
 use std::cmp::max;
@@ -12,6 +12,8 @@ pub type Result<T> = std::result::Result<T, BufferPoolError>;
 pub struct BufferPoolManager {
     pub(crate) shards: Vec<BufferPoolShard>,
     next_page_id: Mutex<u64>,
+    pub(crate) free_pool: Mutex<Vec<PageId>>,
+    pub(crate) free_page: Mutex<u64>,
 }
 
 impl BufferPoolManager {
@@ -26,10 +28,19 @@ impl BufferPoolManager {
             .map(|_| BufferPoolShard::new(disk_manager.clone(), shard_size, Arc::clone(&wal)))
             .collect();
 
-        Self {
+        let pool = Self {
             shards,
             next_page_id: Mutex::new(existing_pages),
+            free_pool: Mutex::new(Vec::new()),
+            free_page: Mutex::new(0),
+        };
+        if existing_pages > 0
+            && let Ok(meta) = pool.fetch_page(0)
+        {
+            *pool.free_page.lock().unwrap() = crate::page::meta::read_free_space(&meta[..]);
         }
+
+        pool
     }
 
     #[inline]
@@ -51,6 +62,18 @@ impl BufferPoolManager {
         *self.next_page_id.lock().unwrap()
     }
 
+    fn claim_recycled(&self, pid: PageId) -> Result<()> {
+        let free_space_id = *self.free_page.lock().unwrap();
+        let mut fs_guard = self.fetch_page_mut(free_space_id)?;
+        crate::page::free_space::clear_free(&mut fs_guard[..], pid);
+        let image: &[u8; PAGE_SIZE] = (&fs_guard[..]).try_into().unwrap();
+        let lsn = self.shards[0]
+            .wal
+            .log_page_compact(0, free_space_id, image)?;
+        crate::page::set_lsn(&mut fs_guard[..], lsn);
+        Ok(())
+    }
+
     /// Creates a new page in the buffer pool.
     ///
     /// This will allocate a new `PageId`, find a free frame (potentially evicting
@@ -61,7 +84,19 @@ impl BufferPoolManager {
     /// * Returns [`BufferPoolError::NoEvictableFrames`] if all frames are pinned.
     /// * Returns [`BufferPoolError::InternalError`] if a disk I/O error occurs during eviction.
     pub fn new_page(&self) -> Result<PageWriteGuard<'_>> {
-        let page_id = {
+        let recycled = self.free_pool.lock().unwrap().pop();
+        let page_id = if let Some(pid) = recycled {
+            // Recycle: claim the id in the bitmap page and journal the
+            // allocation, so a replayed bitmap never re-offers it. On any
+            // error the id would otherwise be lost — re-park it.
+            match self.claim_recycled(pid) {
+                Ok(()) => pid,
+                Err(e) => {
+                    self.free_pool.lock().unwrap().push(pid);
+                    return Err(e);
+                }
+            }
+        } else {
             let mut id = self.next_page_id.lock().unwrap();
             let pid = *id;
             *id += 1;
@@ -69,8 +104,9 @@ impl BufferPoolManager {
         };
 
         let shard = self.get_shard(page_id);
-        // A freshly allocated page id is unique, so this is always a miss
-        // (needs_load = true): the frame is published in the loading state.
+        // A fresh id is always a miss; a recycled id may hit a frame still
+        // caching the page's previous life. Either way the fill(0) below
+        // starts the page from a clean slate.
         let (frame_id, _needs_load) = shard.acquire_frame(page_id)?;
 
         let mut data = shard.pages[frame_id].write().unwrap();
