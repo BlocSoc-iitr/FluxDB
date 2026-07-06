@@ -62,6 +62,17 @@ impl BufferPoolManager {
         *self.next_page_id.lock().unwrap()
     }
 
+
+    fn claim_recycled(&self, pid: PageId) -> Result<()> {
+        let free_space_id = *self.free_page.lock().unwrap();
+        let mut fs_guard = self.fetch_page_mut(free_space_id)?;
+        crate::page::free_space::clear_free(&mut fs_guard[..], pid);
+        let image: &[u8; PAGE_SIZE] = (&fs_guard[..]).try_into().unwrap();
+        let lsn = self.shards[0].wal.log_page_compact(0, free_space_id, image)?;
+        crate::page::set_lsn(&mut fs_guard[..], lsn);
+        Ok(())
+    }
+
     /// Creates a new page in the buffer pool.
     ///
     /// This will allocate a new `PageId`, find a free frame (potentially evicting
@@ -72,26 +83,23 @@ impl BufferPoolManager {
     /// * Returns [`BufferPoolError::NoEvictableFrames`] if all frames are pinned.
     /// * Returns [`BufferPoolError::InternalError`] if a disk I/O error occurs during eviction.
     pub fn new_page(&self) -> Result<PageWriteGuard<'_>> {
-        let page_id = {
-            if let Some(pid) = self.free_pool.lock().unwrap().pop() {
-                // Recycle: claim the id in the bitmap page and journal the
-                // allocation, so a replayed bitmap never re-offers it.
-                let free_space_id = *self.free_page.lock().unwrap();
-                let mut fs_guard = self.fetch_page_mut(free_space_id)?;
-                crate::page::free_space::clear_free(&mut fs_guard[..], pid);
-                let image: &[u8; PAGE_SIZE] = (&fs_guard[..]).try_into().unwrap();
-                let lsn = self.shards[0]
-                    .wal
-                    .log_page_compact(0, free_space_id, image)?;
-                crate::page::set_lsn(&mut fs_guard[..], lsn);
-
-                pid
-            } else {
-                let mut id = self.next_page_id.lock().unwrap();
-                let pid = *id;
-                *id += 1;
-                pid
+        let recycled = self.free_pool.lock().unwrap().pop();
+        let page_id = if let Some(pid) = recycled {
+            // Recycle: claim the id in the bitmap page and journal the
+            // allocation, so a replayed bitmap never re-offers it. On any
+            // error the id would otherwise be lost — re-park it.
+            match self.claim_recycled(pid) {
+                Ok(()) => pid,
+                Err(e) => {
+                    self.free_pool.lock().unwrap().push(pid);
+                    return Err(e);
+                }
             }
+        } else {
+            let mut id = self.next_page_id.lock().unwrap();
+            let pid = *id;
+            *id += 1;
+            pid
         };
 
         let shard = self.get_shard(page_id);

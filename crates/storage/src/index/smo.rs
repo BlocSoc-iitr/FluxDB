@@ -165,6 +165,18 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         )
     }
 
+    /// Abandon a leaf we marked half-dead but cannot finish unlinking this
+    fn abandon_unlink(&self, leaf_pid: PageId) -> Result<()> {
+        let mut guard = self.pool.fetch_page_mut(leaf_pid)?;
+        if page::is_half_dead(&guard[..]) {
+            page::clear_half_dead(&mut guard[..]);
+            let image: &[u8; PAGE_SIZE] = (&guard[..]).try_into().unwrap();
+            let lsn = self.wal.log_page_compact(SYSTEM_TXN_ID, leaf_pid, image)?;
+            page::set_lsn(&mut guard[..], lsn);
+        }
+        Ok(())
+    }
+
     pub(super) fn delete_empty_leaf(
         &self,
         leaf_pid: PageId,
@@ -250,9 +262,11 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         let mut parent_pid = entry.page_id;
 
         // Pre-check under a shared latch, moving right if the parent split
-        // after the stack was collected. This runs BEFORE the half-dead mark
-        // so bailing is still harmless: a half-dead leaf that can never be
-        // unlinked would make inserts routed to it back off forever.
+        // after the stack was collected. On a fresh sweep the leaf is not yet
+        // marked, so bailing is harmless. On crash-resume the leaf enters here
+        // ALREADY half-dead, so every bail must clear the flag (via
+        // abandon_unlink) — otherwise a leaf that can never be unlinked makes
+        // inserts routed to it back off forever.
         loop {
             let guard = self.pool.fetch_page(parent_pid)?;
             let acc = InternalPageAccessor::<K>::new(&guard[..]);
@@ -262,7 +276,8 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 // leave a degenerate empty internal. Concurrent splits only
                 // ADD parent keys, so this pre-check cannot be invalidated.
                 if n == 0 {
-                    return Ok(());
+                    drop(guard);
+                    return self.abandon_unlink(leaf_pid);
                 }
                 break;
             }
@@ -273,7 +288,10 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                 }
                 // downlink gone, now a concurrent completer already unlinked the
                 // leaf (or it was never linked), nothing to do this sweep
-                None => return Ok(()),
+                None => {
+                    drop(guard);
+                    return self.abandon_unlink(leaf_pid);
+                }
             }
         }
 
@@ -312,8 +330,11 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                         pid = next;
                     }
                     // Chain ended before reaching the leaf — it is no longer
-                    // linked; leave it for a later sweep.
-                    None => return Ok(()),
+                    // linked. Clear the mark and leave it for a later sweep.
+                    None => {
+                        drop(guard);
+                        return self.abandon_unlink(leaf_pid);
+                    }
                 }
             },
         };
@@ -330,7 +351,9 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             let n = acc.num_keys() as usize;
             if let Some(j) = (0..=n).find(|&i| acc.child_page_at(i) == leaf_pid) {
                 if n == 0 {
-                    return Ok(());
+                    drop(guard);
+                    drop(left_guard);
+                    return self.abandon_unlink(leaf_pid);
                 }
                 // Mapping for remove_key_at(index, ChildSide): removing child
                 // 0 keeps the right child of key 0; any other child j is the
@@ -347,7 +370,11 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                     drop(guard);
                     parent_pid = right;
                 }
-                None => return Ok(()),
+                None => {
+                    drop(guard);
+                    drop(left_guard);
+                    return self.abandon_unlink(leaf_pid);
+                }
             }
         };
 
