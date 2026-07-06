@@ -197,6 +197,9 @@ where
 
         self.wal.flush_up_to(lsn)?;
 
+        // Notify buffer pool of the new checkpoint redo point for recovery optimization
+        self.buffer_pool.update_checkpoint_redo_point(redo_point);
+
         Ok(redo_point)
     }
 
@@ -286,5 +289,11 @@ where
     /// A `false` from the pacer abandons the pass: no drain, no horizon publish.
     pub fn vacuum_paced(&self, pacer: impl FnMut(usize) -> bool) -> Result<usize, EngineError> {
         Ok(self.index.vacuum_paced(&self.transaction_manager, pacer)?)
+    }
+
+    /// Flushes all dirty pages to disk (used for tests and clean shutdown).
+    pub fn flush_all_pages(&self) -> Result<(), EngineError> {
+        self.buffer_pool.flush_all_pages()?;
+        Ok(())
     }
 }

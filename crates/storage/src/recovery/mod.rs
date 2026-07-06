@@ -55,43 +55,121 @@ impl RecoveryManager {
     /// Replay the WAL in LSN order: rebuild the CLOG, mark crash victims, restore
     /// the txn-id allocator, and redo page changes. Idempotent (LSN-gated).
     pub fn recover<K: Key, V: Value>(&self) -> Result<()> {
-        let mut iter = WalIterator::new(&self.wal_dir).map_err(WalError::Io)?;
+        // PASS 1: Find the latest valid Checkpoint record
+        let mut checkpoint_opt: Option<crate::wal::CheckpointData> = None;
 
-        // Every txn that did work, and the highest id seen.
-        let mut seen: HashSet<u64> = HashSet::new();
-        let mut max_txn = 0u64;
-
-        while let Some(r) = iter.next_record() {
-            let record = r?;
-
-            if record.txn_id != 0 {
-                seen.insert(record.txn_id);
-                max_txn = max_txn.max(record.txn_id);
-            }
-
-            match record.entry_type {
-                WalRecordType::Commit => self.tm.mark_committed(record.txn_id),
-                WalRecordType::Abort => self.tm.mark_aborted(record.txn_id),
-                // OverflowFree carries no page blocks — it lists freed overflow
-                // page IDs in main_data. Re-delete each (idempotent on absent
-                // pages)
-                WalRecordType::OverflowFree => self.redo_overflow_free(&record)?,
-                // OverflowWrite carries a full-page image and is replayed by the
-                // generic FPI path in redo_record — no physiological apply needed.
-                _ => self.redo_record::<K, V>(&record)?,
+        {
+            let mut iter = WalIterator::new(&self.wal_dir).map_err(WalError::Io)?;
+            while let Some(r) = iter.next_record() {
+                let record = r?;
+                if record.entry_type == WalRecordType::Checkpoint {
+                    match record.parse_checkpoint() {
+                        Ok(data) => {
+                            checkpoint_opt = Some(data);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Warning: corrupt checkpoint at LSN {}: {:?}",
+                                record.lsn,
+                                e
+                            );
+                        }
+                    }
+                }
             }
         }
 
-        // Crash victims: a txn that did work but never settled was in-flight at
-        // the crash
-        for &txn_id in &seen {
+        // Seed CLOG from checkpoint (if found)
+        if let Some(ref ckpt) = checkpoint_opt {
+            self.tm.seed_clog_from_checkpoint(&ckpt.pinned_aborted);
+        }
+
+        // Determine redo starting point and initial watermarks
+        let redo_point = checkpoint_opt.as_ref().map(|c| c.redo_point).unwrap_or(0);
+
+        let mut max_txn = checkpoint_opt
+            .as_ref()
+            .map(|c| c.next_txn_id.saturating_sub(1))
+            .unwrap_or(0);
+
+        let mut max_page_id = checkpoint_opt
+            .as_ref()
+            .map(|c| c.next_page_id.saturating_sub(1))
+            .unwrap_or(0);
+
+        // PASS 2: Redo scan from redo_point
+        let mut seen: HashSet<u64> = HashSet::new();
+
+        {
+            let mut iter = WalIterator::new(&self.wal_dir).map_err(WalError::Io)?;
+            while let Some(r) = iter.next_record() {
+                let record = r?;
+
+                // TODO: Skip records below the redo point once checkpoint flushes pages
+                // Currently, checkpoints don't flush dirty pages (DESIGN.md step 3), so
+                // skipping WAL records below the redo point would lose data. We must replay
+                // all records until page flushing is implemented.
+                // if record.lsn < redo_point {
+                //     continue;
+                // }
+                let _ = redo_point; // silence unused warning
+
+                // Track all txn IDs seen in record headers
+                if record.txn_id != 0 {
+                    seen.insert(record.txn_id);
+                    max_txn = max_txn.max(record.txn_id);
+                }
+
+                // Track max page ID touched
+                for block in &record.blocks {
+                    max_page_id = max_page_id.max(block.page_id);
+                }
+
+                // Apply the record
+                match record.entry_type {
+                    WalRecordType::Commit => self.tm.mark_committed(record.txn_id),
+                    WalRecordType::Abort => self.tm.mark_aborted(record.txn_id),
+                    WalRecordType::Checkpoint => {} // skip checkpoint records in redo
+                    WalRecordType::OverflowFree => self.redo_overflow_free(&record)?,
+                    _ => self.redo_record::<K, V>(&record)?,
+                }
+            }
+        }
+
+        // Crash Victims: (checkpoint.active_txns ∪ seen) ∩ unsettled
+        let crash_victim_candidates = if let Some(ref ckpt) = checkpoint_opt {
+            let mut candidates = HashSet::from_iter(ckpt.active_txns.iter().copied());
+            candidates.extend(&seen);
+            candidates
+        } else {
+            seen
+        };
+
+        for txn_id in crash_victim_candidates {
             if !self.tm.is_committed(txn_id) && !self.tm.is_aborted(txn_id) {
                 self.tm.mark_aborted(txn_id);
             }
         }
 
-        // Restore the id allocator so new txns can't reuse a recovered id.
-        self.tm.next_txn_id.fetch_max(max_txn + 1, Ordering::AcqRel);
+        // Restore Watermarks
+        let final_next_txn_id = if let Some(ref ckpt) = checkpoint_opt {
+            ckpt.next_txn_id.max(max_txn + 1)
+        } else {
+            max_txn + 1
+        };
+
+        if final_next_txn_id > 0 {
+            self.tm
+                .next_txn_id
+                .fetch_max(final_next_txn_id, Ordering::AcqRel);
+        }
+
+        let final_next_page_id = if let Some(ref ckpt) = checkpoint_opt {
+            ckpt.next_page_id.max(max_page_id + 1)
+        } else {
+            max_page_id + 1
+        };
+        self.pool.advance_next_page_id(final_next_page_id);
 
         self.pool.flush_all_pages()?;
         Ok(())

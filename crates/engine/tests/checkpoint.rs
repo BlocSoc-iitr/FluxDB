@@ -30,7 +30,9 @@ fn test_checkpoint_record_written() {
     let expected_active_txn_id: u64 = 3;
     let expected_aborted_txn_id: u64 = 2;
 
-    engine.checkpoint().expect("Checkpoint failed");
+    let redo_point = engine.checkpoint().expect("Checkpoint failed");
+    // Redo point should be a valid LSN (non-zero after some operations)
+    assert!(redo_point > 0, "Redo point should be > 0 after checkpoint");
 
     // Read back the WAL and find the Checkpoint record
     let wal_dir = dir.path().join("wal");
@@ -109,4 +111,72 @@ fn test_checkpoint_record_written() {
     }
 
     assert!(found_checkpoint, "Checkpoint record not found in WAL");
+}
+
+#[test]
+fn test_checkpoint_recovery() {
+    let (dir, engine) = fresh_engine();
+
+    // 1. Insert and commit a record
+    engine.insert(&b"k1".as_slice(), &b"v1".as_slice()).unwrap();
+
+    // 2. Start an active transaction and insert, but do NOT commit
+    let mut active_txn = engine.begin();
+    active_txn
+        .insert(&b"k2".as_slice(), &b"v2".as_slice())
+        .unwrap();
+
+    // 3. Start a transaction, insert, and abort (to test pinned_aborted seeding)
+    let mut aborted_txn = engine.begin();
+    aborted_txn
+        .insert(&b"k3".as_slice(), &b"v3".as_slice())
+        .unwrap();
+    drop(aborted_txn);
+
+    // 4. Force checkpoint
+    let redo_point_1 = engine.checkpoint().expect("Checkpoint failed");
+    assert!(redo_point_1 > 0, "First redo point should be > 0");
+
+    // 5. Simulate a ghost transaction: does work, but page flushes happen,
+    //    so its WAL records are below the redo point. Then it crashes.
+    let mut ghost_txn = engine.begin();
+    ghost_txn
+        .insert(&b"k4".as_slice(), &b"v4".as_slice())
+        .unwrap();
+    engine.flush_all_pages().unwrap();
+    let redo_point_2 = engine.checkpoint().expect("Checkpoint 2 failed");
+    // Second checkpoint should have a redo point >= first (monotonic)
+    assert!(
+        redo_point_2 >= redo_point_1,
+        "Redo points should be monotonically increasing"
+    );
+
+    // "Crash": Drop the engine completely without a clean shutdown
+    drop(active_txn);
+    drop(ghost_txn);
+    drop(engine);
+
+    // 6. Recover the engine
+    let engine = TestEngine::open(dir.path()).expect("Recovery failed");
+
+    // 7. Assertions
+
+    // k1 should be visible (committed)
+    let v1 = engine.get(&b"k1".as_slice()).unwrap();
+    assert_eq!(v1, Some(b"v1".to_vec()));
+
+    // k2 should NOT be visible (active_txn crash victim)
+    let v2 = engine.get(&b"k2".as_slice()).unwrap();
+    assert_eq!(v2, None, "k2 should be aborted as a crash victim");
+
+    // k3 should NOT be visible (aborted_txn seeded from checkpoint)
+    let v3 = engine.get(&b"k3".as_slice()).unwrap();
+    assert_eq!(v3, None, "k3 should be aborted from pinned_aborted seed");
+
+    // k4 should NOT be visible (ghost_txn caught by active_txns union)
+    let v4 = engine.get(&b"k4".as_slice()).unwrap();
+    assert_eq!(
+        v4, None,
+        "k4 should be aborted as a ghost transaction crash victim"
+    );
 }

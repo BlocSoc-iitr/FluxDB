@@ -332,6 +332,21 @@ impl BufferPoolManager {
         })
     }
 
+    /// Advances the next page id if the given target is higher.
+    pub fn advance_next_page_id(&self, target_id: u64) {
+        let mut id = self.next_page_id.lock().unwrap();
+        *id = max(*id, target_id);
+    }
+
+    /// Updates the last_checkpoint_redo_point for all shards.
+    pub fn update_checkpoint_redo_point(&self, redo_point: u64) {
+        for shard in &self.shards {
+            shard
+                .last_checkpoint_redo_point
+                .store(redo_point, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// Returns the min rec_lsn among all the frame by comparing minimun lsn of the shards
     ///This point is the redo point
     pub fn min_rec_lsn(&self) -> Option<Lsn> {
