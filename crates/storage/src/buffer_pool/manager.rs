@@ -62,13 +62,14 @@ impl BufferPoolManager {
         *self.next_page_id.lock().unwrap()
     }
 
-
     fn claim_recycled(&self, pid: PageId) -> Result<()> {
         let free_space_id = *self.free_page.lock().unwrap();
         let mut fs_guard = self.fetch_page_mut(free_space_id)?;
         crate::page::free_space::clear_free(&mut fs_guard[..], pid);
         let image: &[u8; PAGE_SIZE] = (&fs_guard[..]).try_into().unwrap();
-        let lsn = self.shards[0].wal.log_page_compact(0, free_space_id, image)?;
+        let lsn = self.shards[0]
+            .wal
+            .log_page_compact(0, free_space_id, image)?;
         crate::page::set_lsn(&mut fs_guard[..], lsn);
         Ok(())
     }

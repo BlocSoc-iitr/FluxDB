@@ -625,7 +625,7 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
             return (0, Vec::new());
         }
 
-        // 3. Preserve page metadata before clearing. 
+        // 3. Preserve page metadata before clearing.
         let high_key: Option<Vec<u8>> = acc.high_key_bytes().map(|b| b.to_vec());
         let rightlink = acc.rightlink();
         let prev_page = acc.prev_page();
