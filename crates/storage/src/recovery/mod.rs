@@ -11,6 +11,7 @@
 //! may still be redone, but MVCC visibility hides them through the rebuilt CLOG.
 
 use std::collections::HashSet;
+use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -37,51 +38,95 @@ pub struct RecoveryManager {
     pool: Arc<BufferPoolManager>,
     wal_dir: PathBuf,
     tm: Arc<TransactionManager>,
+    superblock_path: PathBuf,
+}
+
+/// Result of reading `<db_dir>/checkpoint.superblock`.
+enum SuperblockState {
+    /// No superblock file — fresh DB or pre-superblock DB. Stay silent.
+    Missing,
+    /// Present but wrong size / unreadable — warn and fall back.
+    Invalid,
+    Valid(crate::page::Lsn),
 }
 
 impl RecoveryManager {
     /// Creates a recovery manager over a WAL segment directory.
     ///
     /// `wal_dir` must be the same directory used by the live [`crate::wal::Wal`]
-    /// manager, usually `<db>/wal`.
+    /// manager, usually `<db>/wal`. `superblock_path` is `<db_dir>/checkpoint.superblock`.
     pub fn new(
         pool: Arc<BufferPoolManager>,
         wal_dir: PathBuf,
         tm: Arc<TransactionManager>,
+        superblock_path: PathBuf,
     ) -> Self {
-        Self { pool, wal_dir, tm }
+        Self {
+            pool,
+            wal_dir,
+            tm,
+            superblock_path,
+        }
+    }
+
+    /// Reads and validates the superblock file (8-byte LE checkpoint LSN).
+    fn read_superblock(&self) -> SuperblockState {
+        match std::fs::read(&self.superblock_path) {
+            Ok(bytes) if bytes.len() == 8 => {
+                SuperblockState::Valid(u64::from_le_bytes(bytes.try_into().unwrap()))
+            }
+            Ok(_) => SuperblockState::Invalid,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => SuperblockState::Missing,
+            Err(_) => SuperblockState::Invalid,
+        }
     }
 
     /// Replay the WAL in LSN order: rebuild the CLOG, mark crash victims, restore
     /// the txn-id allocator, and redo page changes. Idempotent (LSN-gated).
     pub fn recover<K: Key, V: Value>(&self) -> Result<()> {
-        // PASS 1: Find the latest valid Checkpoint record
+        // PASS 1: Find the checkpoint record named by the superblock.
         let mut checkpoint_opt: Option<crate::wal::CheckpointData> = None;
 
-        {
-            let mut iter = WalIterator::new(&self.wal_dir).map_err(WalError::Io)?;
-            while let Some(r) = iter.next_record() {
-                let record = r?;
-                if record.entry_type == WalRecordType::Checkpoint {
-                    match record.parse_checkpoint() {
-                        Ok(data) => {
-                            checkpoint_opt = Some(data);
+        match self.read_superblock() {
+            SuperblockState::Valid(target_lsn) => {
+                let mut iter = WalIterator::new(&self.wal_dir).map_err(WalError::Io)?;
+                let mut found = false;
+                while let Some(r) = iter.next_record() {
+                    let record = r?;
+                    if record.entry_type == WalRecordType::Checkpoint && record.lsn == target_lsn {
+                        found = true;
+                        match record.parse_checkpoint() {
+                            Ok(data) => checkpoint_opt = Some(data),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "corrupt checkpoint record at superblock LSN {}: {:?}; falling back to full replay",
+                                    target_lsn,
+                                    e
+                                );
+                            }
                         }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Warning: corrupt checkpoint at LSN {}: {:?}",
-                                record.lsn,
-                                e
-                            );
-                        }
+                        break;
                     }
                 }
+                if !found {
+                    tracing::warn!(
+                        "superblock names checkpoint LSN {} but no matching record was found in the WAL; falling back to full replay",
+                        target_lsn
+                    );
+                }
             }
+            SuperblockState::Invalid => {
+                tracing::warn!(
+                    "checkpoint superblock is missing or malformed; falling back to full replay"
+                );
+            }
+            SuperblockState::Missing => {} // fresh DB / pre-superblock DB: stay silent.
         }
 
-        // Seed CLOG from checkpoint (if found)
+        // Seed CLOG and vacuum horizon from checkpoint (if found).
         if let Some(ref ckpt) = checkpoint_opt {
             self.tm.seed_clog_from_checkpoint(&ckpt.pinned_aborted);
+            self.tm.publish_vacuum_horizon(ckpt.vacuum_horizon);
         }
 
         // Determine redo starting point and initial watermarks
@@ -105,15 +150,6 @@ impl RecoveryManager {
             while let Some(r) = iter.next_record() {
                 let record = r?;
 
-                // TODO: Skip records below the redo point once checkpoint flushes pages
-                // Currently, checkpoints don't flush dirty pages (DESIGN.md step 3), so
-                // skipping WAL records below the redo point would lose data. We must replay
-                // all records until page flushing is implemented.
-                // if record.lsn < redo_point {
-                //     continue;
-                // }
-                let _ = redo_point; // silence unused warning
-
                 // Track all txn IDs seen in record headers
                 if record.txn_id != 0 {
                     seen.insert(record.txn_id);
@@ -125,13 +161,25 @@ impl RecoveryManager {
                     max_page_id = max_page_id.max(block.page_id);
                 }
 
-                // Apply the record
+                // Records below redo_point were already flushed + fsynced by the
+                // checkpoint (Phase 1); still scan them (above) but skip page redo.
+                // Commit/Abort are cheap CLOG updates, not page I/O — always applied.
+                let below_redo_point = record.lsn < redo_point;
+
                 match record.entry_type {
                     WalRecordType::Commit => self.tm.mark_committed(record.txn_id),
                     WalRecordType::Abort => self.tm.mark_aborted(record.txn_id),
                     WalRecordType::Checkpoint => {} // skip checkpoint records in redo
-                    WalRecordType::OverflowFree => self.redo_overflow_free(&record)?,
-                    _ => self.redo_record::<K, V>(&record)?,
+                    WalRecordType::OverflowFree => {
+                        if !below_redo_point {
+                            self.redo_overflow_free(&record)?;
+                        }
+                    }
+                    _ => {
+                        if !below_redo_point {
+                            self.redo_record::<K, V>(&record)?;
+                        }
+                    }
                 }
             }
         }

@@ -73,9 +73,14 @@ fn reopen_db(dir: &Path) -> (Arc<BufferPoolManager>, Arc<Wal>, Arc<TM>, Idx) {
     let wal = make_wal(dir);
     let pool = make_pool(disk, wal.clone());
     let tm = Arc::new(TM::new());
-    RecoveryManager::new(pool.clone(), dir.join("wal"), tm.clone())
-        .recover::<&[u8], &[u8]>()
-        .unwrap();
+    RecoveryManager::new(
+        pool.clone(),
+        dir.join("wal"),
+        tm.clone(),
+        dir.join("checkpoint.superblock"),
+    )
+    .recover::<&[u8], &[u8]>()
+    .unwrap();
     let index = BTreeIndex::open(pool.clone(), wal.clone()).unwrap();
     (pool, wal, tm, index)
 }
@@ -1444,9 +1449,14 @@ fn recover_unlink_rightmost_leaf_ends_chain_at_left_sibling() {
     let wal = make_wal(dir.path());
     let pool = make_pool(disk, wal.clone());
     let tm = Arc::new(TM::new());
-    RecoveryManager::new(pool.clone(), dir.path().join("wal"), tm)
-        .recover::<&[u8], &[u8]>()
-        .unwrap();
+    RecoveryManager::new(
+        pool.clone(),
+        dir.path().join("wal"),
+        tm,
+        dir.path().join("checkpoint.superblock"),
+    )
+    .recover::<&[u8], &[u8]>()
+    .unwrap();
 
     {
         let g = pool.fetch_page(left_pid).unwrap();

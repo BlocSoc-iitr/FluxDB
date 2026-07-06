@@ -1232,9 +1232,14 @@ fn raw_reopen_db(dir: &Path) -> (Arc<BufferPoolManager>, Arc<Wal>, Arc<RawTM>, R
     let wal = Arc::new(Wal::new(dir.join("wal")).unwrap());
     let pool = Arc::new(BufferPoolManager::new(disk, wal.clone()));
     let tm = Arc::new(RawTM::new());
-    RecoveryManager::new(pool.clone(), dir.join("wal"), tm.clone())
-        .recover::<&[u8], &[u8]>()
-        .unwrap();
+    RecoveryManager::new(
+        pool.clone(),
+        dir.join("wal"),
+        tm.clone(),
+        dir.join("checkpoint.superblock"),
+    )
+    .recover::<&[u8], &[u8]>()
+    .unwrap();
     let index = BTreeIndex::open(pool.clone(), wal.clone()).unwrap();
     (pool, wal, tm, index)
 }

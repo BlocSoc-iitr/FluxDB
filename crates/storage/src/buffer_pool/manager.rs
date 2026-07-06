@@ -247,17 +247,14 @@ impl BufferPoolManager {
 
     /// Flushes all dirty pages in the buffer pool to disk.
     ///
-    /// Each shard writes its dirty pages first, then performs one data-file
-    /// sync for that shard. This preserves WAL-before-page while avoiding an
-    /// `fdatasync` per dirty page.
-    ///
     /// # Errors
     ///
     /// * Returns [`BufferPoolError::InternalError`] if a disk I/O error occurs.
     pub fn flush_all_pages(&self) -> Result<()> {
         for shard in &self.shards {
-            shard.flush_all_pages()?;
+            shard.flush_all_pages_no_sync()?;
         }
+        self.shards[0].disk_manager.sync_data()?;
         Ok(())
     }
 
@@ -337,15 +334,6 @@ impl BufferPoolManager {
     pub fn advance_next_page_id(&self, target_id: u64) {
         let mut id = self.next_page_id.lock().unwrap();
         *id = max(*id, target_id);
-    }
-
-    /// Updates the last_checkpoint_redo_point for all shards.
-    pub fn update_checkpoint_redo_point(&self, redo_point: u64) {
-        for shard in &self.shards {
-            shard
-                .last_checkpoint_redo_point
-                .store(redo_point, std::sync::atomic::Ordering::Relaxed);
-        }
     }
 
     /// Returns the min rec_lsn among all the frame by comparing minimun lsn of the shards

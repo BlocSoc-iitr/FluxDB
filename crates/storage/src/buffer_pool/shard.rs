@@ -252,9 +252,11 @@ impl BufferPoolShard {
 
             if is_dirty && old_page_id != INVALID_FRAME_ID {
                 drop(inner);
-                self.flush_page(old_page_id)?;
+                // Data-file durability is no longer this path's job: the checkpoint's
+                // single batched fsync covers it, so eviction skips sync_data here.
+                self.flush_page_without_sync(old_page_id)?;
                 inner = self.inner.lock().unwrap();
-                continue; // need to re-check the table now as someone might have loaded this frame while we were flushing 
+                continue; // need to re-check the table now as someone might have loaded this frame while we were flushing
             }
 
             if old_page_id != INVALID_FRAME_ID {
@@ -365,8 +367,8 @@ impl BufferPoolShard {
         Ok(true)
     }
 
-    pub fn flush_all_pages(&self) -> Result<()> {
-        let mut written_pages = Vec::new();
+    /// Writes every dirty frame in this shard to disk without syncing.
+    pub fn flush_all_pages_no_sync(&self) -> Result<()> {
         let n_frames = self.pages.len();
         for frame_id in 0..n_frames {
             let (pid, is_dirty) = {
@@ -374,22 +376,10 @@ impl BufferPoolShard {
                 let meta = &inner.metadata[frame_id];
                 (meta.page_id, meta.is_dirty)
             };
-            if is_dirty && pid != INVALID_FRAME_ID && self.flush_page_without_sync(pid)? {
-                written_pages.push(pid);
+            if is_dirty && pid != INVALID_FRAME_ID {
+                self.flush_page_without_sync(pid)?;
             }
         }
-        if !written_pages.is_empty()
-            && let Err(e) = self.disk_manager.sync_data()
-        {
-            let mut inner = self.inner.lock().unwrap();
-            for pid in written_pages {
-                if let Some(&frame_id) = inner.page_table.get(&pid) {
-                    inner.metadata[frame_id].is_dirty = true;
-                }
-            }
-            return Err(e.into());
-        }
-
         Ok(())
     }
 
