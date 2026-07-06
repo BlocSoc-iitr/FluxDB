@@ -199,6 +199,14 @@ impl CheckpointData {
         let active_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
 
+        // Bound the allocation using the remaining payload bytes (leave room for aborted_len).
+        let max_active = data.len().saturating_sub(pos + 4) / 8;
+        if active_count > max_active {
+            return Err(WalError::CorruptedLog(
+                "active_txns count exceeds remaining checkpoint payload".to_string(),
+            ));
+        }
+
         let mut active_txns = Vec::with_capacity(active_count);
         for _ in 0..active_count {
             if pos + 8 > data.len() {
@@ -219,6 +227,14 @@ impl CheckpointData {
         let aborted_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
 
+        // Bound the allocation using the remaining payload bytes.
+        let max_aborted = data.len().saturating_sub(pos) / 8;
+        if aborted_count > max_aborted {
+            return Err(WalError::CorruptedLog(
+                "pinned_aborted count exceeds remaining checkpoint payload".to_string(),
+            ));
+        }
+
         let mut pinned_aborted = Vec::with_capacity(aborted_count);
         for _ in 0..aborted_count {
             if pos + 8 > data.len() {
@@ -233,8 +249,8 @@ impl CheckpointData {
         if pos != data.len() {
             return Err(WalError::CorruptedLog(format!(
                 "Unparsed trailing bytes in checkpoint: expected {}, got {}",
-                pos,
-                data.len()
+                data.len(),
+                pos
             )));
         }
 

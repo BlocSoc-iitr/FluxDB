@@ -68,7 +68,7 @@ impl RecoveryManager {
                             checkpoint_opt = Some(data);
                         }
                         Err(e) => {
-                            eprintln!("Warning: corrupt checkpoint at LSN {}: {:?}", record.lsn, e);
+                            tracing::warn!("Warning: corrupt checkpoint at LSN {}: {:?}", record.lsn, e);
                         }
                     }
                 }
