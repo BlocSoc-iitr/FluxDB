@@ -56,10 +56,9 @@ use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions, create_dir_all, metadata, read_dir};
 use std::io::{self, BufRead, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use crate::disk::DiskManager;
 use crate::page::{Lsn, PAGE_SIZE, PageId};
 use common::WalError;
 
@@ -338,7 +337,6 @@ struct WalBuffer {
 
 struct WalState {
     buffer: WalBuffer, //
-    flushed_lsn: Option<Lsn>,
     is_flushing: bool,
     flush_error: Option<String>,
 }
@@ -346,7 +344,14 @@ struct WalState {
 struct WalShared {
     state: Mutex<WalState>,
     writer: Mutex<SegmentWriter>,
+    /// Followers park on `durable` paired with `gate`, never `state`, so a
+    /// post-flush wakeup does not contend the hot buffer mutex.
+    gate: Mutex<()>,
     durable: Condvar,
+    flushed_lsn: AtomicU64,
+    /// Set when a flush fails (error text lives in `WalState::flush_error`).
+    /// Checked under the gate so an errored flush can't strand a waiter.
+    flush_failed: AtomicBool,
     segment_size: u64,
     buffer_capacity: usize,
     /// Allocated at buffer entry, under the state lock: LSN order, buffer
@@ -552,6 +557,8 @@ impl SegmentWriter {
             .append(true)
             .open(&path)
             .map_err(WalError::Io)?;
+        // sync here so that on flush only fsync(file) is needed. 
+        Self::sync_dir(&layout.dir)?;
 
         Ok(Self {
             layout,
@@ -561,13 +568,21 @@ impl SegmentWriter {
         })
     }
 
+    /// Persist the WAL directory's entries.
+    fn sync_dir(dir: &Path) -> Result<()> {
+        File::open(dir)
+            .and_then(|d| d.sync_all())
+            .map_err(WalError::Io)
+    }
+
     fn current_path(&self) -> PathBuf {
         segment_path(&self.layout.dir, self.segment_index)
     }
 
     fn rotate(&mut self) -> Result<()> {
+        // Old segment: contents only
         self.file.flush().map_err(WalError::Io)?;
-        DiskManager::sync_file_and_dir(&self.file, &self.current_path())?;
+        self.file.sync_all().map_err(WalError::Io)?;
 
         self.segment_index += 1;
         self.offset = 0;
@@ -577,6 +592,7 @@ impl SegmentWriter {
             .append(true)
             .open(&path)
             .map_err(WalError::Io)?;
+        Self::sync_dir(&self.layout.dir)?;
         Ok(())
     }
 
@@ -598,9 +614,11 @@ impl SegmentWriter {
         Ok(())
     }
 
+    /// One fsync per flush: the segment's directory entry was made durable at
+    /// creation time (open/rotate), so only the file contents need syncing.
     fn sync(&mut self) -> Result<()> {
         self.file.flush().map_err(WalError::Io)?;
-        DiskManager::sync_file_and_dir(&self.file, &self.current_path())?;
+        self.file.sync_all().map_err(WalError::Io)?;
         Ok(())
     }
 }
@@ -941,12 +959,14 @@ impl Wal {
         let shared = Arc::new(WalShared {
             state: Mutex::new(WalState {
                 buffer: WalBuffer::with_capacity(buffer_capacity),
-                flushed_lsn,
                 is_flushing: false,
                 flush_error: None,
             }),
             writer: Mutex::new(writer),
+            gate: Mutex::new(()),
             durable: Condvar::new(),
+            flushed_lsn: AtomicU64::new(flushed_lsn.unwrap_or(0)),
+            flush_failed: AtomicBool::new(false),
             segment_size,
             buffer_capacity,
             next_lsn: AtomicU64::new(next_lsn),
@@ -960,7 +980,10 @@ impl Wal {
     }
 
     pub fn flushed_lsn(&self) -> Option<Lsn> {
-        self.shared.state.lock().unwrap().flushed_lsn
+        match self.shared.flushed_lsn.load(Ordering::Acquire) {
+            0 => None,
+            lsn => Some(lsn),
+        }
     }
 
     pub fn log_commit(&self, txn_id: u64) -> Result<Lsn> {
@@ -1464,20 +1487,29 @@ impl Wal {
             return Ok(());
         }
 
-        let mut state = self.shared.state.lock().unwrap();
         loop {
-            if state
-                .flushed_lsn
-                .is_some_and(|flushed| flushed >= target_lsn)
-            {
+            // Lock-free fast path: another leader's group flush usually
+            // already covered this LSN by the time a follower re-checks.
+            if self.shared.flushed_lsn.load(Ordering::Acquire) >= target_lsn {
                 return Ok(());
             }
+
+            let mut state = self.shared.state.lock().unwrap();
             if let Some(err) = state.flush_error.as_ref() {
                 return Err(WalError::FlushFailed(err.clone()));
             }
 
             if state.is_flushing {
-                state = self.shared.durable.wait(state).unwrap();
+                // Park on the gate, not `state`
+                drop(state);
+                let gate = self.shared.gate.lock().unwrap();
+                // Re-check under the gate; the leader publishes flushed_lsn
+                // before notifying under this same gate, so no wakeup is lost.
+                if self.shared.flushed_lsn.load(Ordering::Acquire) < target_lsn
+                    && !self.shared.flush_failed.load(Ordering::Acquire)
+                {   // drop the guard immediately as we just need to wakeup and loop again. 
+                    drop(self.shared.durable.wait(gate).unwrap());
+                }
             } else {
                 state.is_flushing = true;
 
@@ -1488,6 +1520,8 @@ impl Wal {
                     // buffer means flushed_lsn covers the target (caught above).
                     debug_assert!(false, "flushed_lsn behind target with empty buffer");
                     state.is_flushing = false;
+                    drop(state);
+                    drop(self.shared.gate.lock().unwrap());
                     self.shared.durable.notify_all();
                     return Ok(());
                 };
@@ -1504,19 +1538,27 @@ impl Wal {
                     Ok(())
                 })();
 
-                state = self.shared.state.lock().unwrap();
+                let mut state = self.shared.state.lock().unwrap();
                 state.is_flushing = false;
 
                 match flush_result {
                     Ok(()) => {
                         state.buffer.consume_prefix(bytes_to_consume);
-                        state.flushed_lsn = Some(durable_lsn);
+                        self.shared
+                            .flushed_lsn
+                            .store(durable_lsn, Ordering::Release);
                     }
                     Err(err) => {
                         state.flush_error = Some(err.to_string());
+                        self.shared.flush_failed.store(true, Ordering::Release);
                     }
                 }
+                drop(state);
 
+                // Acquire the gate before notifying: a follower that checked
+                // flushed_lsn under the gate is either already in wait() (gets
+                // this notify) or saw the new value. Publish-then-notify.
+                drop(self.shared.gate.lock().unwrap());
                 self.shared.durable.notify_all();
             }
         }
@@ -2126,13 +2168,19 @@ mod tests {
         let dir = tempdir().map_err(WalError::Io)?;
         let wal_dir = dir.path().join("io-error-wal");
 
-        let wal = Wal::new(&wal_dir)?;
+        // Small segment so the second record forces a rotation. sync() alone
+        // can't see a deleted directory (the fd stays valid); rotation must,
+        // because it creates the next segment file in that directory.
+        let wal = Wal::with_segment_size(&wal_dir, 64)?;
         wal.append(WalRecordType::Commit, 1, &[], None)?;
+        wal.flush_up_to(1)?;
 
-        // Remove the WAL directory to force an I/O error on the next flush.
+        // Remove the WAL directory to force an I/O error on the next rotation.
         std::fs::remove_dir_all(&wal_dir).map_err(WalError::Io)?;
 
-        let result = wal.flush_up_to(1);
+        // 48-byte record: 28 + 48 > 64 → rotate → create-in-missing-dir fails.
+        wal.append(WalRecordType::Commit, 1, &[], Some(&[0u8; 20]))?;
+        let result = wal.flush_up_to(2);
         assert!(
             matches!(result, Err(WalError::FlushFailed(_))),
             "Expected FlushFailed, got {:?}",
