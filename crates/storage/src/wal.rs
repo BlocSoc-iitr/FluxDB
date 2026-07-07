@@ -557,7 +557,7 @@ impl SegmentWriter {
             .append(true)
             .open(&path)
             .map_err(WalError::Io)?;
-        // sync here so that on flush only fsync(file) is needed. 
+        // sync here so that on flush only fsync(file) is needed.
         Self::sync_dir(&layout.dir)?;
 
         Ok(Self {
@@ -1507,7 +1507,8 @@ impl Wal {
                 // before notifying under this same gate, so no wakeup is lost.
                 if self.shared.flushed_lsn.load(Ordering::Acquire) < target_lsn
                     && !self.shared.flush_failed.load(Ordering::Acquire)
-                {   // drop the guard immediately as we just need to wakeup and loop again. 
+                {
+                    // drop the guard immediately as we just need to wakeup and loop again.
                     drop(self.shared.durable.wait(gate).unwrap());
                 }
             } else {
