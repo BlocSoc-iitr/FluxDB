@@ -460,7 +460,7 @@ impl BufferPoolShard {
     /// returns 'true' if the FPI is to be attached with WAL record
     /// page_lsn_before <= redo_point ensures that this is the first change in page after the last checkpoint
     pub fn mark_dirty(&self, page_id: u64, lsn: Lsn, page_lsn_before: Lsn) -> bool {
-        let redo_point = self.last_checkpoint_redo_point.load(Ordering::Relaxed);
+        let redo_point = self.last_checkpoint_redo_point.load(Ordering::Acquire);
         let mut inner = self.inner.lock().unwrap();
 
         if let Some(&frame_id) = inner.page_table.get(&page_id) {
