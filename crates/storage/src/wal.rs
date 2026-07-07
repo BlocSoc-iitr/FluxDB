@@ -53,7 +53,7 @@
 
 use crc32fast::Hasher;
 use std::collections::VecDeque;
-use std::fs::{File, OpenOptions, create_dir_all, metadata, read_dir};
+use std::fs::{self, File, OpenOptions, create_dir_all, metadata, read_dir};
 use std::io::{self, BufRead, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -860,6 +860,12 @@ impl Wal {
         Self::new_with_buffer_capacity(path, WAL_BUFFER_CAPACITY)
     }
 
+    /// Opens (or creates) a WAL directory with a custom segment size,
+    /// test helper only
+    pub fn with_segment_size(path: impl AsRef<Path>, segment_size: u64) -> Result<Self> {
+        Self::new_with_options(path, WAL_BUFFER_CAPACITY, segment_size)
+    }
+
     fn new_with_buffer_capacity(path: impl AsRef<Path>, buffer_capacity: usize) -> Result<Self> {
         Self::new_with_options(path, buffer_capacity, WAL_SEGMENT_SIZE)
     }
@@ -1515,6 +1521,59 @@ impl Wal {
             }
         }
     }
+
+    /// Deletes WAL segments that are entirely below `redo_point`, returning
+    /// how many were deleted.
+    ///
+    /// A segment is entirely below `redo_point` iff the first record LSN of
+    /// the *next* segment is `<= redo_point` (LSNs are monotonic across
+    /// segments). The active (highest-index) segment is never deleted, and an
+    /// unreadable/empty next-segment head stops reclaim at that point
+    /// (conservative — never deletes speculatively).
+    pub fn reclaim_segments_below(&self, redo_point: Lsn) -> Result<usize> {
+        // Lock the writer only to snapshot a consistent segment list + the
+        // active segment index; deletion itself doesn't touch the append path.
+        let (dir, active_index) = {
+            let writer = self.shared.writer.lock().unwrap();
+            (writer.layout.dir.clone(), writer.segment_index)
+        };
+
+        let segments = list_segments(&dir).map_err(WalError::Io)?;
+        let mut deleted = 0;
+
+        for i in 0..segments.len() {
+            let (index, path) = &segments[i];
+            if *index >= active_index {
+                break; // never delete the active segment
+            }
+            let Some((_, next_path)) = segments.get(i + 1) else {
+                break; // no next-segment head to check — stop conservatively
+            };
+            match first_record_lsn(next_path) {
+                Some(next_first_lsn) if next_first_lsn <= redo_point => {
+                    fs::remove_file(path).map_err(WalError::Io)?;
+                    deleted += 1;
+                }
+                _ => break, // segments are LSN-monotonic: nothing further is eligible either
+            }
+        }
+
+        if deleted > 0 {
+            let dir_file = File::open(&dir).map_err(WalError::Io)?;
+            dir_file.sync_all().map_err(WalError::Io)?;
+        }
+
+        Ok(deleted)
+    }
+}
+
+/// Reads the LSN (first 8 bytes) of the first record in a segment file.
+/// Returns `None` if the file is empty, too short, or unreadable.
+fn first_record_lsn(path: &Path) -> Option<Lsn> {
+    let mut file = File::open(path).ok()?;
+    let mut buf = [0u8; 8];
+    file.read_exact(&mut buf).ok()?;
+    Some(Lsn::from_le_bytes(buf))
 }
 
 #[cfg(test)]
@@ -1848,6 +1907,75 @@ mod tests {
         let reopened = Wal::new_with_options(&wal_dir, 1024, 64)?;
         assert_eq!(reopened.next_lsn(), 6);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_reclaim_segments_below_boundary() -> Result<()> {
+        let dir = tempdir().map_err(WalError::Io)?;
+        let wal_dir = dir.path().join("reclaim-wal");
+        // 28-byte commit records, segment_size=64 -> 2 records/segment.
+        let wal = Wal::new_with_options(&wal_dir, 1024, 64)?;
+        for txn_id in 0..5 {
+            wal.log_commit(txn_id)?;
+        }
+        wal.flush_up_to(5)?;
+
+        // Segments: [1: lsn 1,2] [2: lsn 3,4] [3: lsn 5] (active).
+        assert_eq!(list_segments(&wal_dir).map_err(WalError::Io)?.len(), 3);
+
+        // redo_point == segment 2's first lsn (3) -> segment 1 is entirely below, deleted.
+        let deleted = wal.reclaim_segments_below(3)?;
+        assert_eq!(deleted, 1);
+        let remaining = list_segments(&wal_dir).map_err(WalError::Io)?;
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].0, 2);
+        assert_eq!(remaining[1].0, 3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_reclaim_segments_below_keeps_segment_above_boundary() -> Result<()> {
+        let dir = tempdir().map_err(WalError::Io)?;
+        let wal_dir = dir.path().join("reclaim-wal-2");
+        let wal = Wal::new_with_options(&wal_dir, 1024, 64)?;
+        for txn_id in 0..5 {
+            wal.log_commit(txn_id)?;
+        }
+        wal.flush_up_to(5)?;
+
+        // redo_point == 2, segment 2's first lsn is 3 > 2 -> segment 1 kept.
+        let deleted = wal.reclaim_segments_below(2)?;
+        assert_eq!(deleted, 0);
+        assert_eq!(list_segments(&wal_dir).map_err(WalError::Io)?.len(), 3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_reclaim_never_deletes_active_segment() -> Result<()> {
+        let dir = tempdir().map_err(WalError::Io)?;
+        let wal_dir = dir.path().join("reclaim-wal-3");
+        let wal = Wal::new_with_options(&wal_dir, 1024, 64)?;
+        wal.log_commit(1)?;
+        wal.flush_up_to(1)?;
+
+        // Only one (active) segment exists; a huge redo_point must not delete it.
+        let deleted = wal.reclaim_segments_below(u64::MAX)?;
+        assert_eq!(deleted, 0);
+        assert_eq!(list_segments(&wal_dir).map_err(WalError::Io)?.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_reclaim_on_empty_dir_is_noop() -> Result<()> {
+        let dir = tempdir().map_err(WalError::Io)?;
+        let wal_dir = dir.path().join("reclaim-wal-4");
+        let wal = Wal::new(&wal_dir)?;
+        let deleted = wal.reclaim_segments_below(1000)?;
+        assert_eq!(deleted, 0);
         Ok(())
     }
 

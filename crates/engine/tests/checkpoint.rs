@@ -2,6 +2,14 @@ use engine::Engine;
 use storage::wal::{WalIterator, WalRecordType};
 use tempfile::TempDir;
 
+fn superblock_path(dir: &TempDir) -> std::path::PathBuf {
+    dir.path().join("checkpoint.superblock")
+}
+
+fn segment_count(dir: &TempDir) -> usize {
+    std::fs::read_dir(dir.path().join("wal")).unwrap().count()
+}
+
 type TestEngine = Engine<&'static [u8], &'static [u8]>;
 
 fn fresh_engine() -> (TempDir, TestEngine) {
@@ -179,4 +187,183 @@ fn test_checkpoint_recovery() {
         v4, None,
         "k4 should be aborted as a ghost transaction crash victim"
     );
+}
+
+/// Leaks a formatted key/value pair to get `'static` byte slices for `TestEngine`.
+fn static_kv(i: u64) -> (&'static [u8], &'static [u8]) {
+    let key = format!("key-{i:06}").into_bytes().leak() as &'static [u8];
+    let value = format!("val-{i:06}").into_bytes().leak() as &'static [u8];
+    (key, value)
+}
+
+#[test]
+fn test_checkpoint_durability_survives_eviction() {
+    let (dir, engine) = fresh_engine();
+
+    // Enough distinct keys to overflow the 80-frame pool and force evictions
+    // (and their now-unsynced page writes) well before the checkpoint runs.
+    const N: u64 = 2000;
+    let mut kvs = Vec::with_capacity(N as usize);
+    for i in 0..N {
+        let (k, v) = static_kv(i);
+        engine.insert(&k, &v).unwrap();
+        kvs.push((k, v));
+    }
+
+    engine.checkpoint().expect("Checkpoint failed");
+    drop(engine);
+
+    let engine = TestEngine::open(dir.path()).expect("Reopen failed");
+    for (k, v) in kvs {
+        assert_eq!(
+            engine.get(&k).unwrap(),
+            Some(v.to_vec()),
+            "key {k:?} missing after reopen"
+        );
+    }
+}
+
+#[test]
+fn test_checkpoint_reclaims_wal_segments_and_recovers() {
+    let dir = TempDir::new().unwrap();
+    // Small segments so a modest workload spans many of them (must still fit
+    // multi-FPI split records, which run past 8 KB).
+    let engine = TestEngine::create_with_wal_segment_size(dir.path(), 64 * 1024).unwrap();
+
+    // Aborted ghost: its only WAL records will live in reclaimed segments.
+    let mut aborted = engine.begin();
+    aborted
+        .insert(&b"ghost-key".as_slice(), &b"ghost-val".as_slice())
+        .unwrap();
+    drop(aborted); // drop aborts
+
+    const N: u64 = 2000;
+    let mut kvs = Vec::with_capacity(N as usize);
+    for i in 0..N {
+        let (k, v) = static_kv(i);
+        engine.insert(&k, &v).unwrap();
+        kvs.push((k, v));
+    }
+
+    let segments_before = segment_count(&dir);
+    assert!(
+        segments_before > 2,
+        "workload should span multiple segments, got {segments_before}"
+    );
+
+    // Clean pool -> redo_point advances past the old segments; checkpoint reclaims them.
+    engine.flush_all_pages().unwrap();
+    engine.checkpoint().expect("Checkpoint failed");
+
+    let segments_after = segment_count(&dir);
+    assert!(
+        segments_after < segments_before,
+        "checkpoint should reclaim old segments ({segments_before} -> {segments_after})"
+    );
+
+    // "Crash" and recover.
+    drop(engine);
+    let engine = TestEngine::open(dir.path()).expect("Recovery failed");
+
+    for (k, v) in &kvs {
+        assert_eq!(engine.get(k).unwrap(), Some(v.to_vec()));
+    }
+    // Ghost's WAL records were reclaimed; pinned_aborted seeding must hide it.
+    assert_eq!(
+        engine.get(&b"ghost-key".as_slice()).unwrap(),
+        None,
+        "aborted ghost must stay invisible after its WAL records were reclaimed"
+    );
+}
+
+#[test]
+fn test_recovery_ignores_checkpoint_without_superblock() {
+    let dir = TempDir::new().unwrap();
+    let engine = TestEngine::create(dir.path()).unwrap();
+
+    engine.insert(&b"k1".as_slice(), &b"v1".as_slice()).unwrap();
+    engine.checkpoint().expect("Checkpoint failed");
+    engine.insert(&b"k2".as_slice(), &b"v2".as_slice()).unwrap();
+    drop(engine);
+
+    // Simulate a crash between the checkpoint record (step 2) and the
+    // superblock write (step 4): the record exists but is not committed.
+    std::fs::remove_file(superblock_path(&dir)).unwrap();
+
+    let engine = TestEngine::open(dir.path()).expect("Recovery failed");
+    assert_eq!(engine.get(&b"k1".as_slice()).unwrap(), Some(b"v1".to_vec()));
+    assert_eq!(engine.get(&b"k2".as_slice()).unwrap(), Some(b"v2".to_vec()));
+}
+
+#[test]
+fn test_recovery_falls_back_on_corrupt_superblock() {
+    let dir = TempDir::new().unwrap();
+    let engine = TestEngine::create(dir.path()).unwrap();
+
+    engine.insert(&b"k1".as_slice(), &b"v1".as_slice()).unwrap();
+    engine.checkpoint().expect("Checkpoint failed");
+    drop(engine);
+
+    // Wrong size.
+    std::fs::write(superblock_path(&dir), b"junk").unwrap();
+    let engine = TestEngine::open(dir.path()).expect("Recovery failed");
+    assert_eq!(engine.get(&b"k1".as_slice()).unwrap(), Some(b"v1".to_vec()));
+    drop(engine);
+
+    // Right size, garbage LSN (no matching checkpoint record).
+    std::fs::write(superblock_path(&dir), u64::MAX.to_le_bytes()).unwrap();
+    let engine = TestEngine::open(dir.path()).expect("Recovery failed");
+    assert_eq!(engine.get(&b"k1".as_slice()).unwrap(), Some(b"v1".to_vec()));
+}
+
+#[test]
+fn test_recovery_seeds_vacuum_horizon_from_checkpoint() {
+    let dir = TempDir::new().unwrap();
+    let engine = TestEngine::create(dir.path()).unwrap();
+
+    engine.insert(&b"k1".as_slice(), &b"v1".as_slice()).unwrap();
+    engine.delete(&b"k1".as_slice()).unwrap();
+    engine.vacuum().expect("Vacuum failed"); // full sweep publishes a horizon
+
+    let horizon = engine.vacuum_horizon();
+    assert!(horizon > 0, "vacuum should have published a horizon");
+
+    engine.checkpoint().expect("Checkpoint failed");
+    drop(engine);
+
+    let engine = TestEngine::open(dir.path()).expect("Recovery failed");
+    assert_eq!(
+        engine.vacuum_horizon(),
+        horizon,
+        "recovery should seed the vacuum horizon from the checkpoint"
+    );
+}
+
+#[test]
+fn test_checkpoint_durability_with_clean_pool() {
+    let (dir, engine) = fresh_engine();
+
+    const N: u64 = 2000;
+    let mut kvs = Vec::with_capacity(N as usize);
+    for i in 0..N {
+        let (k, v) = static_kv(i);
+        engine.insert(&k, &v).unwrap();
+        kvs.push((k, v));
+    }
+
+    // Flush every dirty page ahead of the checkpoint, so the pool holds zero
+    // dirty frames when checkpoint() runs. Only an unconditional fsync makes
+    // the evicted/flushed pages durable in this case.
+    engine.flush_all_pages().unwrap();
+    engine.checkpoint().expect("Checkpoint failed");
+    drop(engine);
+
+    let engine = TestEngine::open(dir.path()).expect("Reopen failed");
+    for (k, v) in kvs {
+        assert_eq!(
+            engine.get(&k).unwrap(),
+            Some(v.to_vec()),
+            "key {k:?} missing after reopen"
+        );
+    }
 }

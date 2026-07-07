@@ -14,7 +14,7 @@
 
 use common::{EngineError, Key, Value};
 use db_core::transaction_manager::{TransactionManager, TransactionStatus};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
 use storage::buffer_pool::BufferPoolManager;
@@ -51,6 +51,8 @@ where
     /// Commit and abort hold this in shared mode across their WAL append and CLOG update.
     /// Checkpoints hold it in exclusive mode while picking a redo point and snapshotting.
     pub(crate) status_guard: RwLock<()>,
+    /// Path to the database directory (needed to write the superblock).
+    pub(crate) superblock_path: PathBuf,
 }
 
 impl<K, V> Engine<K, V>
@@ -64,6 +66,25 @@ where
     /// writes the initial metadata/root pages. Creating over an existing
     /// database returns [`EngineError::AlreadyExists`].
     pub fn create(dir_path: impl AsRef<Path>) -> Result<Engine<K, V>, EngineError> {
+        Self::create_with_wal(dir_path, |wal_dir| Ok(Arc::new(Wal::new(wal_dir)?)))
+    }
+
+    /// Like [`Engine::create`], but with a custom WAL segment size. Test-only
+    /// hook so segment-boundary/reclaim behavior can be exercised without
+    /// writing `WAL_SEGMENT_SIZE` bytes per segment.
+    pub fn create_with_wal_segment_size(
+        dir_path: impl AsRef<Path>,
+        wal_segment_size: u64,
+    ) -> Result<Engine<K, V>, EngineError> {
+        Self::create_with_wal(dir_path, move |wal_dir| {
+            Ok(Arc::new(Wal::with_segment_size(wal_dir, wal_segment_size)?))
+        })
+    }
+
+    fn create_with_wal(
+        dir_path: impl AsRef<Path>,
+        make_wal: impl FnOnce(&Path) -> Result<Arc<Wal>, EngineError>,
+    ) -> Result<Engine<K, V>, EngineError> {
         let path = dir_path.as_ref();
         std::fs::create_dir_all(path)?;
         let exist = path.join("data.db").exists();
@@ -73,7 +94,7 @@ where
         // initialize disk manager
         let disk_manager = Arc::new(DiskManager::new(path.join("data.db"), PAGE_SIZE)?);
         // initialize WAL shared by the index and buffer pool.
-        let wal = Arc::new(Wal::new(path.join("wal"))?);
+        let wal = make_wal(&path.join("wal"))?;
         let buffer_pool = Arc::new(BufferPoolManager::new(
             Arc::clone(&disk_manager),
             Arc::clone(&wal),
@@ -89,6 +110,7 @@ where
             disk_manager,
             transaction_manager,
             status_guard: RwLock::new(()),
+            superblock_path: path.join("checkpoint.superblock"),
         })
     }
     /// Opens an existing database.
@@ -115,6 +137,7 @@ where
             Arc::clone(&buffer_pool),
             path.join("wal"),
             Arc::clone(&transaction_manager),
+            path.join("checkpoint.superblock"),
         );
         recovery.recover::<K, V>()?;
 
@@ -129,6 +152,7 @@ where
             disk_manager,
             transaction_manager,
             status_guard: RwLock::new(()),
+            superblock_path: path.join("checkpoint.superblock"),
         })
     }
 
@@ -197,8 +221,20 @@ where
 
         self.wal.flush_up_to(lsn)?;
 
-        // Notify buffer pool of the new checkpoint redo point for recovery optimization
+        //flush all dirty pages to buffer_pool
+        self.buffer_pool.flush_all_pages()?;
+
+        // atomically write the superblock so recovery can find this checkpoint.
+        self.disk_manager
+            .atomic_write_file(&self.superblock_path, &lsn.to_le_bytes())?;
+
         self.buffer_pool.update_checkpoint_redo_point(redo_point);
+
+        // Step 5: reclaim WAL segments now fully covered by this committed
+        // checkpoint. Non-fatal: the checkpoint itself is already durable.
+        if let Err(e) = self.wal.reclaim_segments_below(redo_point) {
+            tracing::warn!("WAL segment reclaim failed after checkpoint: {:?}", e);
+        }
 
         Ok(redo_point)
     }
@@ -289,6 +325,11 @@ where
     /// A `false` from the pacer abandons the pass: no drain, no horizon publish.
     pub fn vacuum_paced(&self, pacer: impl FnMut(usize) -> bool) -> Result<usize, EngineError> {
         Ok(self.index.vacuum_paced(&self.transaction_manager, pacer)?)
+    }
+
+    /// Current vacuum horizon (exposed for tests and observability).
+    pub fn vacuum_horizon(&self) -> u64 {
+        self.transaction_manager.vacuum_horizon()
     }
 
     /// Flushes all dirty pages to disk (used for tests and clean shutdown).

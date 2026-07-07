@@ -33,8 +33,7 @@ where
             self.transaction_manager.mark_committed(txn.txn_id);
             return Ok(());
         }
-        //Starting the RwLock which will be active until the its dropped
-        // Ignore poison: lock holds no data, and doing this ensures checkpoint panics never crash user commits.
+        // Held until dropped at end of scope, so commit and checkpoint never run concurrently.
         let _guard = self.status_guard.read().unwrap_or_else(|e| e.into_inner());
 
         let lsn_res = self.wal.log_commit(txn.txn_id);
@@ -170,7 +169,6 @@ impl<K: Key, V: Value> Drop for TxnHandle<'_, K, V> {
 }
 
 #[cfg(test)]
-
 mod tests {
     use super::*;
     use std::sync::Arc;

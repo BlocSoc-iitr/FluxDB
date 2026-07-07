@@ -4,6 +4,7 @@ use crate::page::{Lsn, PAGE_SIZE, PageId};
 use crate::wal::Wal;
 use common::{BufferPoolError, MAX_FRAMES, NUM_SHARDS, SHARD_MASK};
 use std::cmp::max;
+use std::sync::atomic::Ordering::Release;
 use std::sync::{Arc, Mutex};
 
 pub type Result<T> = std::result::Result<T, BufferPoolError>;
@@ -246,17 +247,14 @@ impl BufferPoolManager {
 
     /// Flushes all dirty pages in the buffer pool to disk.
     ///
-    /// Each shard writes its dirty pages first, then performs one data-file
-    /// sync for that shard. This preserves WAL-before-page while avoiding an
-    /// `fdatasync` per dirty page.
-    ///
     /// # Errors
     ///
     /// * Returns [`BufferPoolError::InternalError`] if a disk I/O error occurs.
     pub fn flush_all_pages(&self) -> Result<()> {
         for shard in &self.shards {
-            shard.flush_all_pages()?;
+            shard.flush_all_pages_no_sync()?;
         }
+        self.shards[0].disk_manager.sync_data()?;
         Ok(())
     }
 
@@ -338,15 +336,6 @@ impl BufferPoolManager {
         *id = max(*id, target_id);
     }
 
-    /// Updates the last_checkpoint_redo_point for all shards.
-    pub fn update_checkpoint_redo_point(&self, redo_point: u64) {
-        for shard in &self.shards {
-            shard
-                .last_checkpoint_redo_point
-                .store(redo_point, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-
     /// Returns the min rec_lsn among all the frame by comparing minimun lsn of the shards
     ///This point is the redo point
     pub fn min_rec_lsn(&self) -> Option<Lsn> {
@@ -354,5 +343,12 @@ impl BufferPoolManager {
             .iter()
             .filter_map(|shard| shard.inner.lock().unwrap().min_rec_lsn)
             .min()
+    }
+
+    /// Notifies every shard of new checkpoint redo
+    pub fn update_checkpoint_redo_point(&self, redo_point: Lsn) {
+        for shard in &self.shards {
+            shard.last_checkpoint_redo_point.store(redo_point, Release);
+        }
     }
 }
