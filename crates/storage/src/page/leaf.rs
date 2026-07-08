@@ -630,6 +630,7 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
         let rightlink = acc.rightlink();
         let prev_page = acc.prev_page();
         let lsn = acc.lsn();
+        let flags = read_u8(page_data, super::OFF_FLAGS);
 
         // 4. Rebuild the page using the Builder.
         let mut builder = LeafPageBuilder::<K, V>::new(page_id, page_data);
@@ -644,6 +645,7 @@ impl<'a, K: Key, V: Value> LeafPageMutator<'a, K, V> {
 
         let mut m = builder.finish();
         m.set_lsn(lsn);
+        write_u8(page_data, super::OFF_FLAGS, flags);
 
         (dead_count, orphaned_chains)
     }

@@ -22,7 +22,11 @@ where
         key: &K::SelfType<'_>,
     ) -> Result<(), EngineError> {
         txn.note_write();
-        self.index.delete(key, txn).map_err(map_conflict)
+        self.index.delete(key, txn).map_err(map_conflict)?;
+        // Counted at op time, not commit: an aborted delete also leaves a
+        // dead version for vacuum to clean.
+        self.transaction_manager.note_dead_version();
+        Ok(())
     }
 
     /// Reads take `&Transaction` — they never set the wrote-flag.
@@ -41,7 +45,10 @@ where
         value: &V::SelfType<'_>,
     ) -> Result<(), EngineError> {
         txn.note_write();
-        self.index.update(key, value, txn).map_err(map_conflict)
+        self.index.update(key, value, txn).map_err(map_conflict)?;
+        // An update tombstones the previous version — same accounting as delete.
+        self.transaction_manager.note_dead_version();
+        Ok(())
     }
 }
 

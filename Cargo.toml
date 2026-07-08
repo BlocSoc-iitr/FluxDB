@@ -8,6 +8,7 @@ common = { path = "crates/common" }
 storage = {path = "crates/storage"}
 thiserror = "1"
 db-core = { path = "crates/db-core"}
+tracing = "0.1"
 
 # Bench what you ship: cross-crate inlining on, debug symbols kept for flamegraphs.
 [profile.release]

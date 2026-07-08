@@ -53,13 +53,12 @@
 
 use crc32fast::Hasher;
 use std::collections::VecDeque;
-use std::fs::{File, OpenOptions, create_dir_all, metadata, read_dir};
+use std::fs::{self, File, OpenOptions, create_dir_all, metadata, read_dir};
 use std::io::{self, BufRead, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use crate::disk::DiskManager;
 use crate::page::{Lsn, PAGE_SIZE, PageId};
 use common::WalError;
 
@@ -149,6 +148,154 @@ pub struct WalRecord<'a> {
     pub main_data: Option<&'a [u8]>,
 }
 
+/// Parsed checkpoint record payload.
+///
+/// A checkpoint snapshots the consistent state needed by recovery to start
+/// replay from the redo point instead of the beginning of the log.
+#[derive(Debug, Clone)]
+pub struct CheckpointData {
+    pub redo_point: Lsn,
+    pub next_txn_id: u64,
+    pub vacuum_horizon: u64,
+    pub root_pid: u64,
+    pub next_page_id: u64,
+    pub active_txns: Vec<u64>,
+    pub pinned_aborted: Vec<u64>,
+}
+
+impl CheckpointData {
+    /// Parse a checkpoint record's main_data payload.
+    ///
+    /// Format: redo_point(8) | next_txn_id(8) | vacuum_horizon(8) | root_pid(8)
+    ///         | next_page_id(8) | active_len(4) | active_txns(8×N)
+    ///         | aborted_len(4) | pinned_aborted(8×M)
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        if data.len() < 48 {
+            return Err(WalError::CorruptedLog(
+                "Checkpoint data too short (need >= 48 bytes)".to_string(),
+            ));
+        }
+
+        let mut pos = 0;
+
+        let redo_point = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        let next_txn_id = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        let vacuum_horizon = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        let root_pid = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        let next_page_id = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+
+        // Parse active_txns array
+        if pos + 4 > data.len() {
+            return Err(WalError::CorruptedLog(
+                "Missing active_txns count".to_string(),
+            ));
+        }
+        let active_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+
+        // Bound the allocation using the remaining payload bytes (leave room for aborted_len).
+        let max_active = data.len().saturating_sub(pos + 4) / 8;
+        if active_count > max_active {
+            return Err(WalError::CorruptedLog(
+                "active_txns count exceeds remaining checkpoint payload".to_string(),
+            ));
+        }
+
+        let mut active_txns = Vec::with_capacity(active_count);
+        for _ in 0..active_count {
+            if pos + 8 > data.len() {
+                return Err(WalError::CorruptedLog(
+                    "Truncated active_txns array".to_string(),
+                ));
+            }
+            active_txns.push(u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()));
+            pos += 8;
+        }
+
+        // Parse pinned_aborted array
+        if pos + 4 > data.len() {
+            return Err(WalError::CorruptedLog(
+                "Missing pinned_aborted count".to_string(),
+            ));
+        }
+        let aborted_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+
+        // Bound the allocation using the remaining payload bytes.
+        let max_aborted = data.len().saturating_sub(pos) / 8;
+        if aborted_count > max_aborted {
+            return Err(WalError::CorruptedLog(
+                "pinned_aborted count exceeds remaining checkpoint payload".to_string(),
+            ));
+        }
+
+        let mut pinned_aborted = Vec::with_capacity(aborted_count);
+        for _ in 0..aborted_count {
+            if pos + 8 > data.len() {
+                return Err(WalError::CorruptedLog(
+                    "Truncated pinned_aborted array".to_string(),
+                ));
+            }
+            pinned_aborted.push(u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()));
+            pos += 8;
+        }
+
+        if pos != data.len() {
+            return Err(WalError::CorruptedLog(format!(
+                "Unparsed trailing bytes in checkpoint: expected {}, got {}",
+                data.len(),
+                pos
+            )));
+        }
+
+        Ok(CheckpointData {
+            redo_point,
+            next_txn_id,
+            vacuum_horizon,
+            root_pid,
+            next_page_id,
+            active_txns,
+            pinned_aborted,
+        })
+    }
+
+    /// Helper for recovery fallback: create empty checkpoint data.
+    pub fn empty() -> Self {
+        Self {
+            redo_point: 0,
+            next_txn_id: 1,
+            vacuum_horizon: 0,
+            root_pid: 0,
+            next_page_id: 0,
+            active_txns: Vec::new(),
+            pinned_aborted: Vec::new(),
+        }
+    }
+}
+
+impl<'a> WalRecord<'a> {
+    /// Parse this record as a Checkpoint, returning the structured data.
+    ///
+    /// Returns `Err` if this is not a Checkpoint record or the payload is corrupt.
+    pub fn parse_checkpoint(&self) -> Result<CheckpointData> {
+        if self.entry_type != WalRecordType::Checkpoint {
+            return Err(WalError::CorruptedLog(format!(
+                "Expected Checkpoint record, got {:?}",
+                self.entry_type
+            )));
+        }
+        let data = self.main_data.ok_or_else(|| {
+            WalError::CorruptedLog("Checkpoint record missing main_data".to_string())
+        })?;
+        CheckpointData::from_bytes(data)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct WalLayout {
     dir: PathBuf,
@@ -190,7 +337,6 @@ struct WalBuffer {
 
 struct WalState {
     buffer: WalBuffer, //
-    flushed_lsn: Option<Lsn>,
     is_flushing: bool,
     flush_error: Option<String>,
 }
@@ -198,7 +344,15 @@ struct WalState {
 struct WalShared {
     state: Mutex<WalState>,
     writer: Mutex<SegmentWriter>,
+    /// Followers park on `durable` paired with `gate`, never `state`, so a
+    /// post-flush wakeup does not contend the hot buffer mutex.
+    gate: Mutex<()>,
     durable: Condvar,
+    flushed_lsn: AtomicU64,
+    /// Set when a flush fails (error text lives in `WalState::flush_error`).
+    /// Checked under the gate so an errored flush can't strand a waiter.
+    flush_failed: AtomicBool,
+    flush_active: AtomicBool,
     segment_size: u64,
     buffer_capacity: usize,
     /// Allocated at buffer entry, under the state lock: LSN order, buffer
@@ -404,6 +558,8 @@ impl SegmentWriter {
             .append(true)
             .open(&path)
             .map_err(WalError::Io)?;
+        // sync here so that on flush only fsync(file) is needed.
+        Self::sync_dir(&layout.dir)?;
 
         Ok(Self {
             layout,
@@ -413,13 +569,21 @@ impl SegmentWriter {
         })
     }
 
+    /// Persist the WAL directory's entries.
+    fn sync_dir(dir: &Path) -> Result<()> {
+        File::open(dir)
+            .and_then(|d| d.sync_all())
+            .map_err(WalError::Io)
+    }
+
     fn current_path(&self) -> PathBuf {
         segment_path(&self.layout.dir, self.segment_index)
     }
 
     fn rotate(&mut self) -> Result<()> {
+        // Old segment: contents only
         self.file.flush().map_err(WalError::Io)?;
-        DiskManager::sync_file_and_dir(&self.file, &self.current_path())?;
+        self.file.sync_all().map_err(WalError::Io)?;
 
         self.segment_index += 1;
         self.offset = 0;
@@ -429,6 +593,7 @@ impl SegmentWriter {
             .append(true)
             .open(&path)
             .map_err(WalError::Io)?;
+        Self::sync_dir(&self.layout.dir)?;
         Ok(())
     }
 
@@ -450,9 +615,11 @@ impl SegmentWriter {
         Ok(())
     }
 
+    /// One fsync per flush: the segment's directory entry was made durable at
+    /// creation time (open/rotate), so only the file contents need syncing.
     fn sync(&mut self) -> Result<()> {
         self.file.flush().map_err(WalError::Io)?;
-        DiskManager::sync_file_and_dir(&self.file, &self.current_path())?;
+        self.file.sync_all().map_err(WalError::Io)?;
         Ok(())
     }
 }
@@ -712,6 +879,12 @@ impl Wal {
         Self::new_with_buffer_capacity(path, WAL_BUFFER_CAPACITY)
     }
 
+    /// Opens (or creates) a WAL directory with a custom segment size,
+    /// test helper only
+    pub fn with_segment_size(path: impl AsRef<Path>, segment_size: u64) -> Result<Self> {
+        Self::new_with_options(path, WAL_BUFFER_CAPACITY, segment_size)
+    }
+
     fn new_with_buffer_capacity(path: impl AsRef<Path>, buffer_capacity: usize) -> Result<Self> {
         Self::new_with_options(path, buffer_capacity, WAL_SEGMENT_SIZE)
     }
@@ -787,12 +960,15 @@ impl Wal {
         let shared = Arc::new(WalShared {
             state: Mutex::new(WalState {
                 buffer: WalBuffer::with_capacity(buffer_capacity),
-                flushed_lsn,
                 is_flushing: false,
                 flush_error: None,
             }),
             writer: Mutex::new(writer),
+            gate: Mutex::new(()),
             durable: Condvar::new(),
+            flushed_lsn: AtomicU64::new(flushed_lsn.unwrap_or(0)),
+            flush_failed: AtomicBool::new(false),
+            flush_active: AtomicBool::new(false),
             segment_size,
             buffer_capacity,
             next_lsn: AtomicU64::new(next_lsn),
@@ -806,7 +982,10 @@ impl Wal {
     }
 
     pub fn flushed_lsn(&self) -> Option<Lsn> {
-        self.shared.state.lock().unwrap().flushed_lsn
+        match self.shared.flushed_lsn.load(Ordering::Acquire) {
+            0 => None,
+            lsn => Some(lsn),
+        }
     }
 
     pub fn log_commit(&self, txn_id: u64) -> Result<Lsn> {
@@ -884,19 +1063,23 @@ impl Wal {
         txn_id: u64,
         deleted_page_id: PageId,
         left_sibling: Option<PageId>,
-        right_sibling: PageId,
+        right_sibling: Option<PageId>,
         parent_page: PageId,
         remove_index: u16,
         keep_right_child: bool,
     ) -> Result<Lsn> {
-        let mut blocks = Vec::with_capacity(if left_sibling.is_some() { 3 } else { 2 });
+        let mut blocks = Vec::with_capacity(if left_sibling.is_some() && right_sibling.is_some() {
+            3
+        } else {
+            2
+        });
 
         let left_payload;
         if let Some(left_page) = left_sibling {
             left_payload = {
                 let mut p = Vec::with_capacity(1 + 8);
                 p.push(UNLINK_ROLE_LEFT);
-                p.extend_from_slice(&right_sibling.to_le_bytes());
+                p.extend_from_slice(&right_sibling.unwrap_or(0).to_le_bytes());
                 p
             };
             blocks.push(Block {
@@ -907,15 +1090,21 @@ impl Wal {
             });
         }
 
-        let mut right_payload = Vec::with_capacity(1 + 8);
-        right_payload.push(UNLINK_ROLE_RIGHT);
-        right_payload.extend_from_slice(&left_sibling.unwrap_or(0).to_le_bytes());
-        blocks.push(Block {
-            page_id: right_sibling,
-            blk_flags: BLK_HAS_DATA,
-            fpi: None,
-            data: Some(&right_payload),
-        });
+        let right_payload;
+        if let Some(right_page) = right_sibling {
+            right_payload = {
+                let mut p = Vec::with_capacity(1 + 8);
+                p.push(UNLINK_ROLE_RIGHT);
+                p.extend_from_slice(&left_sibling.unwrap_or(0).to_le_bytes());
+                p
+            };
+            blocks.push(Block {
+                page_id: right_page,
+                blk_flags: BLK_HAS_DATA,
+                fpi: None,
+                data: Some(&right_payload),
+            });
+        }
 
         let mut parent_payload = Vec::with_capacity(1 + 2 + 1);
         parent_payload.push(UNLINK_ROLE_PARENT);
@@ -1300,30 +1489,52 @@ impl Wal {
             return Ok(());
         }
 
-        let mut state = self.shared.state.lock().unwrap();
         loop {
-            if state
-                .flushed_lsn
-                .is_some_and(|flushed| flushed >= target_lsn)
-            {
+            // Lock-free fast path: another leader's group flush usually
+            // already covered this LSN by the time a follower re-checks.
+            if self.shared.flushed_lsn.load(Ordering::Acquire) >= target_lsn {
                 return Ok(());
             }
+
+            let mut state = self.shared.state.lock().unwrap();
             if let Some(err) = state.flush_error.as_ref() {
                 return Err(WalError::FlushFailed(err.clone()));
             }
 
             if state.is_flushing {
-                state = self.shared.durable.wait(state).unwrap();
+                // Park on the gate, not `state`
+                drop(state);
+                let gate = self.shared.gate.lock().unwrap();
+                // Re-check under the gate; the leader publishes flushed_lsn
+                // before notifying under this same gate, so no wakeup is lost.
+                // Park only while a leader is active: the leader's buffer
+                // snapshot may predate this record, so its flush can complete
+                // without covering target_lsn — with no flush in flight the
+                // only thread that will ever flush this record is us.
+                if self.shared.flushed_lsn.load(Ordering::Acquire) < target_lsn
+                    && !self.shared.flush_failed.load(Ordering::Acquire)
+                    && self.shared.flush_active.load(Ordering::Acquire)
+                {
+                    // drop the guard immediately as we just need to wakeup and loop again.
+                    drop(self.shared.durable.wait(gate).unwrap());
+                }
             } else {
                 state.is_flushing = true;
+                self.shared.flush_active.store(true, Ordering::Release);
 
                 let Some((bytes_to_consume, durable_lsn)) = state.buffer.buffered_prefix_len()
                 else {
-                    // Unreachable: LSNs are allocated at buffer entry, so any
-                    // allocated LSN is buffered or already flushed — an empty
-                    // buffer means flushed_lsn covers the target (caught above).
-                    debug_assert!(false, "flushed_lsn behind target with empty buffer");
+                    // Reachable: the fast-path durable check is lock-free, so a
+                    // concurrent flush can complete between it and taking
+                    // `state`.
+                    debug_assert!(
+                        self.shared.flushed_lsn.load(Ordering::Acquire) >= target_lsn,
+                        "empty WAL buffer but target LSN not durable"
+                    );
                     state.is_flushing = false;
+                    self.shared.flush_active.store(false, Ordering::Release);
+                    drop(state);
+                    drop(self.shared.gate.lock().unwrap());
                     self.shared.durable.notify_all();
                     return Ok(());
                 };
@@ -1340,28 +1551,127 @@ impl Wal {
                     Ok(())
                 })();
 
-                state = self.shared.state.lock().unwrap();
+                let mut state = self.shared.state.lock().unwrap();
                 state.is_flushing = false;
+                self.shared.flush_active.store(false, Ordering::Release);
 
                 match flush_result {
                     Ok(()) => {
                         state.buffer.consume_prefix(bytes_to_consume);
-                        state.flushed_lsn = Some(durable_lsn);
+                        self.shared
+                            .flushed_lsn
+                            .store(durable_lsn, Ordering::Release);
                     }
                     Err(err) => {
                         state.flush_error = Some(err.to_string());
+                        self.shared.flush_failed.store(true, Ordering::Release);
                     }
                 }
+                drop(state);
 
+                // Acquire the gate before notifying: a follower that checked
+                // flushed_lsn under the gate is either already in wait() (gets
+                // this notify) or saw the new value. Publish-then-notify.
+                drop(self.shared.gate.lock().unwrap());
                 self.shared.durable.notify_all();
             }
         }
     }
+
+    /// Deletes WAL segments that are entirely below `redo_point`, returning
+    /// how many were deleted.
+    ///
+    /// A segment is entirely below `redo_point` iff the first record LSN of
+    /// the *next* segment is `<= redo_point` (LSNs are monotonic across
+    /// segments). The active (highest-index) segment is never deleted, and an
+    /// unreadable/empty next-segment head stops reclaim at that point
+    /// (conservative — never deletes speculatively).
+    pub fn reclaim_segments_below(&self, redo_point: Lsn) -> Result<usize> {
+        // Lock the writer only to snapshot a consistent segment list + the
+        // active segment index; deletion itself doesn't touch the append path.
+        let (dir, active_index) = {
+            let writer = self.shared.writer.lock().unwrap();
+            (writer.layout.dir.clone(), writer.segment_index)
+        };
+
+        let segments = list_segments(&dir).map_err(WalError::Io)?;
+        let mut deleted = 0;
+
+        for i in 0..segments.len() {
+            let (index, path) = &segments[i];
+            if *index >= active_index {
+                break; // never delete the active segment
+            }
+            let Some((_, next_path)) = segments.get(i + 1) else {
+                break; // no next-segment head to check — stop conservatively
+            };
+            match first_record_lsn(next_path) {
+                Some(next_first_lsn) if next_first_lsn <= redo_point => {
+                    fs::remove_file(path).map_err(WalError::Io)?;
+                    deleted += 1;
+                }
+                _ => break, // segments are LSN-monotonic: nothing further is eligible either
+            }
+        }
+
+        if deleted > 0 {
+            let dir_file = File::open(&dir).map_err(WalError::Io)?;
+            dir_file.sync_all().map_err(WalError::Io)?;
+        }
+
+        Ok(deleted)
+    }
+}
+
+/// Reads the LSN (first 8 bytes) of the first record in a segment file.
+/// Returns `None` if the file is empty, too short, or unreadable.
+fn first_record_lsn(path: &Path) -> Option<Lsn> {
+    let mut file = File::open(path).ok()?;
+    let mut buf = [0u8; 8];
+    file.read_exact(&mut buf).ok()?;
+    Some(Lsn::from_le_bytes(buf))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_checkpoint_data_roundtrip() {
+        let original = CheckpointData {
+            redo_point: 100,
+            next_txn_id: 42,
+            vacuum_horizon: 30,
+            root_pid: 1,
+            next_page_id: 50,
+            active_txns: vec![35, 38, 41],
+            pinned_aborted: vec![20, 25],
+        };
+
+        // Serialize
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&original.redo_point.to_le_bytes());
+        bytes.extend_from_slice(&original.next_txn_id.to_le_bytes());
+        bytes.extend_from_slice(&original.vacuum_horizon.to_le_bytes());
+        bytes.extend_from_slice(&original.root_pid.to_le_bytes());
+        bytes.extend_from_slice(&original.next_page_id.to_le_bytes());
+        bytes.extend_from_slice(&(original.active_txns.len() as u32).to_le_bytes());
+        for &id in &original.active_txns {
+            bytes.extend_from_slice(&id.to_le_bytes());
+        }
+        bytes.extend_from_slice(&(original.pinned_aborted.len() as u32).to_le_bytes());
+        for &id in &original.pinned_aborted {
+            bytes.extend_from_slice(&id.to_le_bytes());
+        }
+
+        // Deserialize
+        let parsed = CheckpointData::from_bytes(&bytes).unwrap();
+
+        assert_eq!(parsed.redo_point, original.redo_point);
+        assert_eq!(parsed.next_txn_id, original.next_txn_id);
+        assert_eq!(parsed.active_txns, original.active_txns);
+        assert_eq!(parsed.pinned_aborted, original.pinned_aborted);
+    }
     use std::io::{Seek, SeekFrom};
     use std::sync::Arc;
     use std::thread;
@@ -1458,7 +1768,7 @@ mod tests {
         let wal_dir = dir.path().join("unlink-page-wal");
 
         let wal = Wal::new(&wal_dir)?;
-        let lsn = wal.log_unlink_page(0, 22, Some(11), 33, 44, 2, true)?;
+        let lsn = wal.log_unlink_page(0, 22, Some(11), Some(33), 44, 2, true)?;
         wal.flush_up_to(lsn)?;
 
         let mut iter = WalIterator::new(&wal_dir).map_err(WalError::Io)?;
@@ -1657,6 +1967,75 @@ mod tests {
     }
 
     #[test]
+    fn test_reclaim_segments_below_boundary() -> Result<()> {
+        let dir = tempdir().map_err(WalError::Io)?;
+        let wal_dir = dir.path().join("reclaim-wal");
+        // 28-byte commit records, segment_size=64 -> 2 records/segment.
+        let wal = Wal::new_with_options(&wal_dir, 1024, 64)?;
+        for txn_id in 0..5 {
+            wal.log_commit(txn_id)?;
+        }
+        wal.flush_up_to(5)?;
+
+        // Segments: [1: lsn 1,2] [2: lsn 3,4] [3: lsn 5] (active).
+        assert_eq!(list_segments(&wal_dir).map_err(WalError::Io)?.len(), 3);
+
+        // redo_point == segment 2's first lsn (3) -> segment 1 is entirely below, deleted.
+        let deleted = wal.reclaim_segments_below(3)?;
+        assert_eq!(deleted, 1);
+        let remaining = list_segments(&wal_dir).map_err(WalError::Io)?;
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].0, 2);
+        assert_eq!(remaining[1].0, 3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_reclaim_segments_below_keeps_segment_above_boundary() -> Result<()> {
+        let dir = tempdir().map_err(WalError::Io)?;
+        let wal_dir = dir.path().join("reclaim-wal-2");
+        let wal = Wal::new_with_options(&wal_dir, 1024, 64)?;
+        for txn_id in 0..5 {
+            wal.log_commit(txn_id)?;
+        }
+        wal.flush_up_to(5)?;
+
+        // redo_point == 2, segment 2's first lsn is 3 > 2 -> segment 1 kept.
+        let deleted = wal.reclaim_segments_below(2)?;
+        assert_eq!(deleted, 0);
+        assert_eq!(list_segments(&wal_dir).map_err(WalError::Io)?.len(), 3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_reclaim_never_deletes_active_segment() -> Result<()> {
+        let dir = tempdir().map_err(WalError::Io)?;
+        let wal_dir = dir.path().join("reclaim-wal-3");
+        let wal = Wal::new_with_options(&wal_dir, 1024, 64)?;
+        wal.log_commit(1)?;
+        wal.flush_up_to(1)?;
+
+        // Only one (active) segment exists; a huge redo_point must not delete it.
+        let deleted = wal.reclaim_segments_below(u64::MAX)?;
+        assert_eq!(deleted, 0);
+        assert_eq!(list_segments(&wal_dir).map_err(WalError::Io)?.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_reclaim_on_empty_dir_is_noop() -> Result<()> {
+        let dir = tempdir().map_err(WalError::Io)?;
+        let wal_dir = dir.path().join("reclaim-wal-4");
+        let wal = Wal::new(&wal_dir)?;
+        let deleted = wal.reclaim_segments_below(1000)?;
+        assert_eq!(deleted, 0);
+        Ok(())
+    }
+
+    #[test]
     fn test_wal_recovery_torn_tail() -> Result<()> {
         let dir = tempdir().map_err(|e| WalError::Io(e))?;
         let wal_dir = dir.path().join("torntail-wal");
@@ -1803,13 +2182,19 @@ mod tests {
         let dir = tempdir().map_err(WalError::Io)?;
         let wal_dir = dir.path().join("io-error-wal");
 
-        let wal = Wal::new(&wal_dir)?;
+        // Small segment so the second record forces a rotation. sync() alone
+        // can't see a deleted directory (the fd stays valid); rotation must,
+        // because it creates the next segment file in that directory.
+        let wal = Wal::with_segment_size(&wal_dir, 64)?;
         wal.append(WalRecordType::Commit, 1, &[], None)?;
+        wal.flush_up_to(1)?;
 
-        // Remove the WAL directory to force an I/O error on the next flush.
+        // Remove the WAL directory to force an I/O error on the next rotation.
         std::fs::remove_dir_all(&wal_dir).map_err(WalError::Io)?;
 
-        let result = wal.flush_up_to(1);
+        // 48-byte record: 28 + 48 > 64 → rotate → create-in-missing-dir fails.
+        wal.append(WalRecordType::Commit, 1, &[], Some(&[0u8; 20]))?;
+        let result = wal.flush_up_to(2);
         assert!(
             matches!(result, Err(WalError::FlushFailed(_))),
             "Expected FlushFailed, got {:?}",
@@ -1912,6 +2297,57 @@ mod tests {
 
         assert_eq!(wal.next_lsn(), (total + 1) as u64);
 
+        Ok(())
+    }
+
+    /// Regression: a follower must never park on the gate when no flush is in
+    /// flight. A leader's buffer snapshot can predate a follower's append, so
+    /// the leader's flush completes WITHOUT covering the follower's LSN; the
+    /// follower must then loop back and lead its own flush instead of waiting
+    /// for a notify that will never come. Pre-fix this deadlocked a commit
+    /// (seen live in cpu/mixed_autocommit/2). Watchdog fails loud, not hung.
+    #[test]
+    fn concurrent_commit_flush_never_strands_a_waiter() -> Result<()> {
+        use std::sync::mpsc;
+
+        // tmpfs: cheap flushes = more append/flush interleavings per second
+        // (the race needs a leader snapshot to predate a follower's append),
+        // and the watchdog stays far from honest-but-slow disk time.
+        let dir = tempfile::tempdir_in("/dev/shm")
+            .or_else(|_| tempdir())
+            .map_err(WalError::Io)?;
+        let wal = std::sync::Arc::new(Wal::new(dir.path().join("strand-wal"))?);
+
+        const THREADS: u64 = 4;
+        const PER_THREAD: u64 = 2_000;
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let wal2 = std::sync::Arc::clone(&wal);
+        let worker = std::thread::spawn(move || {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let wal = std::sync::Arc::clone(&wal2);
+                    std::thread::spawn(move || {
+                        // Autocommit shape: append one record, wait durable.
+                        for _ in 0..PER_THREAD {
+                            let lsn = wal.append(WalRecordType::Commit, 1, &[], None).unwrap();
+                            wal.flush_up_to(lsn).unwrap();
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            let _ = done_tx.send(());
+        });
+
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(120))
+            .expect("commit waiter stranded on the WAL gate (deadlock regression)");
+        worker.join().unwrap();
+
+        assert_eq!(wal.flushed_lsn(), Some(THREADS * PER_THREAD));
         Ok(())
     }
 
