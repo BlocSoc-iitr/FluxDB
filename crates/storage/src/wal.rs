@@ -352,6 +352,7 @@ struct WalShared {
     /// Set when a flush fails (error text lives in `WalState::flush_error`).
     /// Checked under the gate so an errored flush can't strand a waiter.
     flush_failed: AtomicBool,
+    flush_active: AtomicBool,
     segment_size: u64,
     buffer_capacity: usize,
     /// Allocated at buffer entry, under the state lock: LSN order, buffer
@@ -967,6 +968,7 @@ impl Wal {
             durable: Condvar::new(),
             flushed_lsn: AtomicU64::new(flushed_lsn.unwrap_or(0)),
             flush_failed: AtomicBool::new(false),
+            flush_active: AtomicBool::new(false),
             segment_size,
             buffer_capacity,
             next_lsn: AtomicU64::new(next_lsn),
@@ -1505,22 +1507,32 @@ impl Wal {
                 let gate = self.shared.gate.lock().unwrap();
                 // Re-check under the gate; the leader publishes flushed_lsn
                 // before notifying under this same gate, so no wakeup is lost.
+                // Park only while a leader is active: the leader's buffer
+                // snapshot may predate this record, so its flush can complete
+                // without covering target_lsn — with no flush in flight the
+                // only thread that will ever flush this record is us.
                 if self.shared.flushed_lsn.load(Ordering::Acquire) < target_lsn
                     && !self.shared.flush_failed.load(Ordering::Acquire)
+                    && self.shared.flush_active.load(Ordering::Acquire)
                 {
                     // drop the guard immediately as we just need to wakeup and loop again.
                     drop(self.shared.durable.wait(gate).unwrap());
                 }
             } else {
                 state.is_flushing = true;
+                self.shared.flush_active.store(true, Ordering::Release);
 
                 let Some((bytes_to_consume, durable_lsn)) = state.buffer.buffered_prefix_len()
                 else {
-                    // Unreachable: LSNs are allocated at buffer entry, so any
-                    // allocated LSN is buffered or already flushed — an empty
-                    // buffer means flushed_lsn covers the target (caught above).
-                    debug_assert!(false, "flushed_lsn behind target with empty buffer");
+                    // Reachable: the fast-path durable check is lock-free, so a
+                    // concurrent flush can complete between it and taking
+                    // `state`.
+                    debug_assert!(
+                        self.shared.flushed_lsn.load(Ordering::Acquire) >= target_lsn,
+                        "empty WAL buffer but target LSN not durable"
+                    );
                     state.is_flushing = false;
+                    self.shared.flush_active.store(false, Ordering::Release);
                     drop(state);
                     drop(self.shared.gate.lock().unwrap());
                     self.shared.durable.notify_all();
@@ -1541,6 +1553,7 @@ impl Wal {
 
                 let mut state = self.shared.state.lock().unwrap();
                 state.is_flushing = false;
+                self.shared.flush_active.store(false, Ordering::Release);
 
                 match flush_result {
                     Ok(()) => {
@@ -2284,6 +2297,57 @@ mod tests {
 
         assert_eq!(wal.next_lsn(), (total + 1) as u64);
 
+        Ok(())
+    }
+
+    /// Regression: a follower must never park on the gate when no flush is in
+    /// flight. A leader's buffer snapshot can predate a follower's append, so
+    /// the leader's flush completes WITHOUT covering the follower's LSN; the
+    /// follower must then loop back and lead its own flush instead of waiting
+    /// for a notify that will never come. Pre-fix this deadlocked a commit
+    /// (seen live in cpu/mixed_autocommit/2). Watchdog fails loud, not hung.
+    #[test]
+    fn concurrent_commit_flush_never_strands_a_waiter() -> Result<()> {
+        use std::sync::mpsc;
+
+        // tmpfs: cheap flushes = more append/flush interleavings per second
+        // (the race needs a leader snapshot to predate a follower's append),
+        // and the watchdog stays far from honest-but-slow disk time.
+        let dir = tempfile::tempdir_in("/dev/shm")
+            .or_else(|_| tempdir())
+            .map_err(WalError::Io)?;
+        let wal = std::sync::Arc::new(Wal::new(dir.path().join("strand-wal"))?);
+
+        const THREADS: u64 = 4;
+        const PER_THREAD: u64 = 2_000;
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let wal2 = std::sync::Arc::clone(&wal);
+        let worker = std::thread::spawn(move || {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let wal = std::sync::Arc::clone(&wal2);
+                    std::thread::spawn(move || {
+                        // Autocommit shape: append one record, wait durable.
+                        for _ in 0..PER_THREAD {
+                            let lsn = wal.append(WalRecordType::Commit, 1, &[], None).unwrap();
+                            wal.flush_up_to(lsn).unwrap();
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            let _ = done_tx.send(());
+        });
+
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(120))
+            .expect("commit waiter stranded on the WAL gate (deadlock regression)");
+        worker.join().unwrap();
+
+        assert_eq!(wal.flushed_lsn(), Some(THREADS * PER_THREAD));
         Ok(())
     }
 

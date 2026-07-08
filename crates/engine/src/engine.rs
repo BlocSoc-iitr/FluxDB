@@ -13,6 +13,7 @@
 //! transaction CLOG have been rebuilt.
 
 use common::{EngineError, Key, Value};
+use db_core::transaction::Transaction;
 use db_core::transaction_manager::{TransactionManager, TransactionStatus};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -259,19 +260,12 @@ where
     }
 
     pub fn get(&self, key: &K::SelfType<'_>) -> Result<Option<Vec<u8>>, EngineError> {
-        // reads still need a transaction: the snapshot from begin() is what
-        // makes the read correct; its commit hits the read-only fast path
-        let txn = self.transaction_manager.begin();
-        match self.get_in(&txn, key) {
-            Ok(v) => {
-                self.commit(txn)?;
-                Ok(v)
-            }
-            Err(e) => {
-                let _ = self.abort(txn);
-                Err(e)
-            }
-        }
+        //a read needs only a Snapshot
+        let (snapshot, token) = self.transaction_manager.read_snapshot();
+        let txn = Transaction::new(u64::MAX, snapshot, Arc::clone(&self.transaction_manager));
+        let result = self.get_in(&txn, key);
+        self.transaction_manager.end_read(token);
+        result
     }
 
     pub fn update(
