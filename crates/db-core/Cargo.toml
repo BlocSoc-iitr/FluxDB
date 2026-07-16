@@ -3,4 +3,11 @@ name = "db-core"
 version = "0.1.0"
 edition = "2024"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 [dependencies]
+arc-swap = "1"
+
+[dev-dependencies]
+loom = "0.7"
