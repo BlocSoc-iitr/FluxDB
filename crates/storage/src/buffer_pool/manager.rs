@@ -12,7 +12,7 @@ pub type Result<T> = std::result::Result<T, BufferPoolError>;
 /// The main manager for the buffer pool, providing a partitioned cache for disk pages.
 pub struct BufferPoolManager {
     pub(crate) shards: Vec<BufferPoolShard>,
-    next_page_id: Mutex<u64>,
+    next_page_id: std::sync::atomic::AtomicU64,
     pub(crate) free_pool: Mutex<Vec<PageId>>,
     pub(crate) free_page: Mutex<u64>,
 }
@@ -31,7 +31,7 @@ impl BufferPoolManager {
 
         let pool = Self {
             shards,
-            next_page_id: Mutex::new(existing_pages),
+            next_page_id: std::sync::atomic::AtomicU64::new(existing_pages),
             free_pool: Mutex::new(Vec::new()),
             free_page: Mutex::new(0),
         };
@@ -50,7 +50,7 @@ impl BufferPoolManager {
     }
 
     fn check_page_id(&self, page_id: u64) -> Result<()> {
-        let next_id = *self.next_page_id.lock().unwrap();
+        let next_id = self.next_page_id.load(std::sync::atomic::Ordering::Acquire);
         if page_id >= next_id {
             Err(BufferPoolError::PageNotFound(page_id))
         } else {
@@ -60,7 +60,7 @@ impl BufferPoolManager {
 
     /// Returns the next page id that will be allocated.
     pub fn next_page_id(&self) -> u64 {
-        *self.next_page_id.lock().unwrap()
+        self.next_page_id.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn claim_recycled(&self, pid: PageId) -> Result<()> {
@@ -98,10 +98,7 @@ impl BufferPoolManager {
                 }
             }
         } else {
-            let mut id = self.next_page_id.lock().unwrap();
-            let pid = *id;
-            *id += 1;
-            pid
+            self.next_page_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         };
 
         let shard = self.get_shard(page_id);
@@ -318,8 +315,13 @@ impl BufferPoolManager {
             }
         }
         {
-            let mut id = self.next_page_id.lock().unwrap();
-            *id = max(*id, page_id + 1);
+            let mut current = self.next_page_id.load(std::sync::atomic::Ordering::Acquire);
+            while current < page_id + 1 {
+                if self.next_page_id.compare_exchange_weak(current, page_id + 1, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::Acquire).is_ok() {
+                    break;
+                }
+                current = self.next_page_id.load(std::sync::atomic::Ordering::Acquire);
+            }
         }
         Ok(PageWriteGuard {
             shard,
@@ -332,8 +334,13 @@ impl BufferPoolManager {
 
     /// Advances the next page id if the given target is higher.
     pub fn advance_next_page_id(&self, target_id: u64) {
-        let mut id = self.next_page_id.lock().unwrap();
-        *id = max(*id, target_id);
+        let mut current = self.next_page_id.load(std::sync::atomic::Ordering::Acquire);
+        while current < target_id {
+            if self.next_page_id.compare_exchange_weak(current, target_id, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::Acquire).is_ok() {
+                break;
+            }
+            current = self.next_page_id.load(std::sync::atomic::Ordering::Acquire);
+        }
     }
 
     /// Returns the min rec_lsn among all the frame by comparing minimun lsn of the shards
@@ -341,7 +348,7 @@ impl BufferPoolManager {
     pub fn min_rec_lsn(&self) -> Option<Lsn> {
         self.shards
             .iter()
-            .filter_map(|shard| shard.inner.lock().unwrap().min_rec_lsn)
+            .filter_map(|shard| *shard.min_rec_lsn.lock().unwrap())
             .min()
     }
 

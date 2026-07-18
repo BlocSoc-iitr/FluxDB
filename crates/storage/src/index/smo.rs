@@ -196,14 +196,14 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         // target is "just below high_key" — high_key
         // == None means rightmost spine
         let mut stack = BTStack::new();
-        let mut pid = *self.root.lock().unwrap();
+        let mut pid = self.root_page_id();
         loop {
             let page = self.pool.fetch_page(pid)?;
             if crate::page::is_incomplete_split(&page[..]) {
                 drop(page);
                 self.finish_split(pid, &stack)?;
                 stack.clear();
-                pid = *self.root.lock().unwrap();
+                pid = self.root_page_id();
                 continue;
             }
             match page[0] {
@@ -581,7 +581,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         loop {
             if depth == 0 {
                 // The splitting page is the root unless one was created concurrently.
-                if *self.root.lock().unwrap() != left_child {
+                if self.root_page_id() != left_child {
                     crate::page::clear_incomplete_split(
                         &mut self.pool.fetch_page_mut(left_child)?[..],
                     );
@@ -619,7 +619,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                     crate::page::set_lsn(&mut old[..], lsn);
                 }
 
-                *self.root.lock().unwrap() = new_root_pid;
+                self.root.store(new_root_pid, std::sync::atomic::Ordering::Release);
                 return Ok(());
             }
 
