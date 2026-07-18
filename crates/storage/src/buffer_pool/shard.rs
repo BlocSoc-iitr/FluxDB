@@ -150,7 +150,7 @@ pub struct BufferPoolShard {
     pub free_list: Mutex<Vec<usize>>,
     pub replacer: Mutex<ClockReplacer>,
     pub min_rec_lsn: Mutex<Option<Lsn>>,
-    pub load_done: Condvar, 
+    pub load_done: Condvar,
     pub wait_mutex: Mutex<()>,
     pub wal: Arc<Wal>,
     pub last_checkpoint_redo_point: AtomicU64,
@@ -183,7 +183,7 @@ impl BufferPoolShard {
             load_done: Condvar::new(),
             wait_mutex: Mutex::new(()),
             wal,
-            last_checkpoint_redo_point: AtomicU64::new(0), 
+            last_checkpoint_redo_point: AtomicU64::new(0),
         }
     }
 
@@ -192,7 +192,7 @@ impl BufferPoolShard {
         let table = self.page_table.read().unwrap();
         if let Some(&frame_id) = table.get(&page_id) {
             let meta = &self.metadata[frame_id];
-            
+
             // Only unpin if it matches
             if meta.page_id.load(Ordering::Acquire) != page_id {
                 return;
@@ -201,7 +201,7 @@ impl BufferPoolShard {
             if is_dirty {
                 meta.is_dirty.store(true, Ordering::Release);
             }
-            
+
             let prev = meta.pin_count.fetch_sub(1, Ordering::SeqCst);
             if prev == 1 {
                 self.replacer.lock().unwrap().unpin(frame_id);
@@ -239,7 +239,7 @@ impl BufferPoolShard {
                     }
                 }
             }
-            
+
             // Slow path: write lock
             let mut table = self.page_table.write().unwrap();
             // Re-check
@@ -262,14 +262,14 @@ impl BufferPoolShard {
 
             let frame_id = self.find_victim_frame_id()?;
             let meta = &self.metadata[frame_id];
-            
+
             let old_page_id = meta.page_id.load(Ordering::Acquire);
             let is_dirty = meta.is_dirty.load(Ordering::Acquire);
 
             if is_dirty && old_page_id != INVALID_FRAME_ID {
                 drop(table);
                 self.flush_page_without_sync(old_page_id)?;
-                continue; 
+                continue;
             }
 
             if old_page_id != INVALID_FRAME_ID {
@@ -289,7 +289,9 @@ impl BufferPoolShard {
 
     pub fn finish_load(&self, page_id: u64, frame_id: usize, success: bool) {
         if success {
-            self.metadata[frame_id].loading.store(false, Ordering::Release);
+            self.metadata[frame_id]
+                .loading
+                .store(false, Ordering::Release);
         } else {
             let mut table = self.page_table.write().unwrap();
             table.remove(&page_id);
@@ -317,7 +319,9 @@ impl BufferPoolShard {
             let table = self.page_table.read().unwrap();
             if let Some(&id) = table.get(&page_id) {
                 let meta = &self.metadata[id];
-                if meta.is_dirty.load(Ordering::Acquire) && meta.page_id.load(Ordering::Acquire) != INVALID_FRAME_ID {
+                if meta.is_dirty.load(Ordering::Acquire)
+                    && meta.page_id.load(Ordering::Acquire) != INVALID_FRAME_ID
+                {
                     meta.is_dirty.store(false, Ordering::Release);
                     meta.pin_count.fetch_add(1, Ordering::SeqCst);
                     (meta.page_id.load(Ordering::Acquire), id)
@@ -341,7 +345,7 @@ impl BufferPoolShard {
         if prev == 1 {
             self.replacer.lock().unwrap().unpin(frame_id);
         }
-        
+
         if let Err(e) = res {
             meta.is_dirty.store(true, Ordering::Release);
             return Err(e);
@@ -353,7 +357,8 @@ impl BufferPoolShard {
 
             let mut min_lock = self.min_rec_lsn.lock().unwrap();
             if old_rec_lsn == *min_lock {
-                *min_lock = self.metadata
+                *min_lock = self
+                    .metadata
                     .iter()
                     .filter(|m| m.is_dirty.load(Ordering::Acquire))
                     .filter_map(|m| *m.rec_lsn.lock().unwrap())
@@ -417,7 +422,7 @@ impl BufferPoolShard {
                 if prev == 1 {
                     self.replacer.lock().unwrap().unpin(frame_id);
                 }
-                
+
                 if res.is_err() {
                     meta.is_dirty.store(true, Ordering::Release);
                     return Err(BufferPoolError::InternalError(
@@ -441,14 +446,14 @@ impl BufferPoolShard {
 
     pub fn mark_dirty(&self, page_id: u64, lsn: Lsn, page_lsn_before: Lsn) -> bool {
         let redo_point = self.last_checkpoint_redo_point.load(Ordering::Acquire);
-        
+
         let table = self.page_table.read().unwrap();
         if let Some(&frame_id) = table.get(&page_id) {
             let meta = &self.metadata[frame_id];
-            
+
             // Atomically check and set is_dirty
             let was_clean = !meta.is_dirty.swap(true, Ordering::SeqCst);
-            
+
             if was_clean {
                 let mut rec_lsn = meta.rec_lsn.lock().unwrap();
                 *rec_lsn = Some(lsn);

@@ -3,7 +3,7 @@ use crate::disk::DiskManager;
 use crate::page::{Lsn, PAGE_SIZE, PageId};
 use crate::wal::Wal;
 use common::{BufferPoolError, MAX_FRAMES, NUM_SHARDS, SHARD_MASK};
-use std::cmp::max;
+
 use std::sync::atomic::Ordering::Release;
 use std::sync::{Arc, Mutex};
 
@@ -98,7 +98,8 @@ impl BufferPoolManager {
                 }
             }
         } else {
-            self.next_page_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            self.next_page_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         };
 
         let shard = self.get_shard(page_id);
@@ -317,7 +318,16 @@ impl BufferPoolManager {
         {
             let mut current = self.next_page_id.load(std::sync::atomic::Ordering::Acquire);
             while current < page_id + 1 {
-                if self.next_page_id.compare_exchange_weak(current, page_id + 1, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::Acquire).is_ok() {
+                if self
+                    .next_page_id
+                    .compare_exchange_weak(
+                        current,
+                        page_id + 1,
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
                     break;
                 }
                 current = self.next_page_id.load(std::sync::atomic::Ordering::Acquire);
@@ -336,7 +346,16 @@ impl BufferPoolManager {
     pub fn advance_next_page_id(&self, target_id: u64) {
         let mut current = self.next_page_id.load(std::sync::atomic::Ordering::Acquire);
         while current < target_id {
-            if self.next_page_id.compare_exchange_weak(current, target_id, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::Acquire).is_ok() {
+            if self
+                .next_page_id
+                .compare_exchange_weak(
+                    current,
+                    target_id,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok()
+            {
                 break;
             }
             current = self.next_page_id.load(std::sync::atomic::Ordering::Acquire);

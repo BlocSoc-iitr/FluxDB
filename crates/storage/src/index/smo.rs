@@ -619,7 +619,8 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                     crate::page::set_lsn(&mut old[..], lsn);
                 }
 
-                self.root.store(new_root_pid, std::sync::atomic::Ordering::Release);
+                self.root
+                    .store(new_root_pid, std::sync::atomic::Ordering::Release);
                 return Ok(());
             }
 
