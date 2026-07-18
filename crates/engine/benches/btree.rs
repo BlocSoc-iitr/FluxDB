@@ -192,13 +192,14 @@ fn bench_range_full_scan(c: &mut Criterion) {
 
 /// Reader snapshot carrying `active_len` synthetic in-flight txn IDs (top half of
 /// the u64 range so they never collide with the small insert IDs → records stay
-/// visible but every `is_visible` scans the whole active Vec to a miss).
+/// visible but every `is_visible` searches the whole active set to a miss).
 fn scan_txn(tm: &Arc<TransactionManager>, active_len: u64) -> Transaction {
     let active: Vec<u64> = (0..active_len).map(|i| u64::MAX / 2 + 1 + i).collect();
     let snap = Snapshot {
         xmin: 1,
         xmax: u64::MAX,
-        active,
+        active: Arc::from(active),
+        aborted: Arc::from([]),
     };
     Transaction::new(u64::MAX - 1, snap, tm.clone())
 }

@@ -14,7 +14,7 @@
 
 use common::{EngineError, Key, Value};
 use db_core::transaction::Transaction;
-use db_core::transaction_manager::{TransactionManager, TransactionStatus};
+use db_core::transaction_manager::TransactionManager;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -181,28 +181,13 @@ where
             .unwrap_or_else(|| self.wal.next_lsn());
         let next_txn_id = self.transaction_manager.next_txn_id.load(Acquire);
 
-        let active_txns: Vec<u64> = self
-            .transaction_manager
-            .active_txns
-            .read()
-            .unwrap()
-            .keys()
-            .copied()
-            .collect();
+        let state = self.transaction_manager.active_state.read().unwrap();
+
+        let active_txns: Vec<u64> = state.active.keys().copied().collect();
 
         let vacuum_horizon = self.transaction_manager.vacuum_horizon();
 
-        let pinned_aborted: Vec<u64> = self
-            .transaction_manager
-            .clog
-            .read()
-            .unwrap()
-            .iter()
-            .filter(|(txn_id, status)| {
-                **status == TransactionStatus::Aborted && **txn_id >= vacuum_horizon
-            })
-            .map(|(txn_id, _)| *txn_id)
-            .collect();
+        let pinned_aborted: Vec<u64> = state.recent_aborts.iter().copied().collect();
 
         let root_pid = self.index.root_page_id();
         let next_page_id = self.buffer_pool.next_page_id();

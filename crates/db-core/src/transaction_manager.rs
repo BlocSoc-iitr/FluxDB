@@ -24,15 +24,20 @@
 //!    It is recorded as `Aborted` in the CLOG and removed from `active_txns`. Its writes
 //!    will remain invisible to all future transactions and can be garbage collected.
 
+use crossbeam_utils::CachePadded;
+use std::cell::Cell;
+use std::collections::BTreeSet;
 use std::sync::atomic::{
-    AtomicU64,
-    Ordering::{AcqRel, Acquire},
+    AtomicBool, AtomicU64,
+    Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst},
 };
 use std::{
     collections::HashMap,
     sync::{Arc, Condvar, Mutex, RwLock},
     time::{Duration, Instant},
 };
+
+use arc_swap::ArcSwap;
 
 use crate::transaction::{Snapshot, Transaction};
 
@@ -62,6 +67,38 @@ pub enum TransactionStatus {
 type WaiterEntry = Arc<(Mutex<bool>, Condvar)>;
 
 #[derive(Debug)]
+pub struct ActiveState {
+    pub active: HashMap<u64, (u64, Instant)>,
+    pub recent_aborts: BTreeSet<u64>,
+}
+
+/// Immutable transaction state published for lock-free snapshot reads.
+///
+/// Phase 1 publishes the active set and horizon metadata. `aborted` is present
+/// but empty until the recent-aborts phase migrates abort ownership out of CLOG.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxnState {
+    /// Sorted in-flight transaction IDs.
+    pub active: Arc<[u64]>,
+    /// Sorted live aborted transaction IDs. Empty in Phase 1.
+    pub aborted: Arc<[u64]>,
+    /// Oldest snapshot xmin among active transactions, or `xmax` if none.
+    pub xmin: u64,
+    /// `next_txn_id` at publish time.
+    pub xmax: u64,
+}
+
+/// Lock ordering invariant (acquire in this order, never reversed):
+///
+///   `active_state` → overflow reader map → `clog`
+///
+/// - Writers (`begin`/`mark_committed`/`mark_aborted`) hold `active_state.write()`
+///   while publishing `txn_state` via `ArcSwap::store`.
+/// - `global_xmin` loads published state, scans fixed reader slots, and only
+///   locks the overflow reader map when it is non-empty.
+/// - `read_snapshot` is lock-free on `active_txns` (loads from `txn_state`),
+///   then publishes into a fixed slot or the overflow reader map.
+#[derive(Debug)]
 pub struct TransactionManager {
     pub next_txn_id: AtomicU64,
     pub clog: RwLock<HashMap<u64, TransactionStatus>>,
@@ -69,11 +106,30 @@ pub struct TransactionManager {
     pub dead_versions: AtomicU64,
     /// In-flight `txn_id` → (its snapshot's `xmin`, when it began). The xmin
     /// feeds `global_xmin`; the timestamp feeds `oldest_active_txn_age`.
-    pub active_txns: RwLock<HashMap<u64, (u64, Instant)>>,
-    pub readers: RwLock<HashMap<u64, u64>>,
-    /// Monotonic token source for `readers` entries.
+    pub active_state: RwLock<ActiveState>,
+    /// Immutable transaction state. Every publisher must hold
+    /// `active_state.write()` while building and storing a new value.
+    pub txn_state: ArcSwap<TxnState>,
+
+    slots: Box<[CachePadded<AtomicU64>]>,
+    overflow_readers: Mutex<HashMap<u64, u64>>,
+    overflow_nonempty: AtomicBool,
+    /// Even when no reader is registering. Odd while a reader is between
+    /// claiming capacity and publishing its snapshot xmin.
+    reader_epoch: AtomicU64,
     next_reader_token: AtomicU64,
+    next_reader_slot_probe: AtomicU64,
+
     waiters: Mutex<HashMap<u64, WaiterEntry>>,
+}
+
+const EMPTY_SLOT: u64 = u64::MAX;
+const SETTING_UP_SLOT: u64 = 0;
+const MAX_READER_SLOTS: usize = 128;
+const OVERFLOW_READER_TOKEN_FLAG: u64 = 1 << 63;
+
+thread_local! {
+    static CACHED_READER_SLOT: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
 }
 
 impl Default for TransactionManager {
@@ -85,30 +141,162 @@ impl Default for TransactionManager {
 impl TransactionManager {
     /// Creates a new, empty `TransactionManager`.
     pub fn new() -> Self {
+        let initial_state = TxnState {
+            active: Arc::from([]),
+            aborted: Arc::from([]),
+            xmin: 1,
+            xmax: 1,
+        };
+        let mut slots = Vec::with_capacity(MAX_READER_SLOTS);
+        for _ in 0..MAX_READER_SLOTS {
+            slots.push(CachePadded::new(AtomicU64::new(EMPTY_SLOT)));
+        }
         Self {
             next_txn_id: AtomicU64::new(1),
             clog: RwLock::new(HashMap::new()),
             vacuum_horizon: AtomicU64::new(0),
             dead_versions: AtomicU64::new(0),
-            active_txns: RwLock::new(HashMap::new()),
-            readers: RwLock::new(HashMap::new()),
+            active_state: RwLock::new(ActiveState {
+                active: HashMap::new(),
+                recent_aborts: BTreeSet::new(),
+            }),
+            txn_state: ArcSwap::from_pointee(initial_state),
+            slots: slots.into_boxed_slice(),
+            overflow_readers: Mutex::new(HashMap::new()),
+            overflow_nonempty: AtomicBool::new(false),
+            reader_epoch: AtomicU64::new(0),
             next_reader_token: AtomicU64::new(0),
+            next_reader_slot_probe: AtomicU64::new(0),
             waiters: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn build_txn_state(&self, active_state: &ActiveState) -> TxnState {
+        let xmax = self.next_txn_id.load(Acquire);
+        let mut active_ids: Vec<u64> = active_state.active.keys().copied().collect();
+        active_ids.sort_unstable();
+
+        let aborted_ids: Vec<u64> = active_state.recent_aborts.iter().copied().collect();
+
+        let xmin = active_state
+            .active
+            .values()
+            .map(|(xmin, _)| *xmin)
+            .min()
+            .unwrap_or(xmax);
+
+        TxnState {
+            active: Arc::from(active_ids),
+            aborted: Arc::from(aborted_ids),
+            xmin,
+            xmax,
+        }
+    }
+
+    fn publish_txn_state(&self, active_state: &ActiveState) -> Arc<TxnState> {
+        let state = Arc::new(self.build_txn_state(active_state));
+        self.txn_state.store(Arc::clone(&state));
+        state
+    }
+
+    /// Re-publish `txn_state` from the current `active_txns` and `next_txn_id`.
+    ///
+    /// Called by recovery after restoring watermarks so that `get_snapshot()` and
+    /// `read_snapshot()` see the correct `xmax`. Without this, the ArcSwap state
+    /// would still have `xmax=1` from construction, making every recovered row
+    /// invisible (txn_id ≥ xmax → "not yet started").
+    pub fn refresh_txn_state(&self) {
+        let active_state = self.active_state.read().unwrap();
+        let state = self.build_txn_state(&active_state);
+        self.txn_state.store(Arc::new(state));
+    }
+
+    fn snapshot_from_state(state: &TxnState) -> Snapshot {
+        Snapshot::from_state(state)
+    }
+
+    fn reader_slot_key(&self) -> usize {
+        self as *const Self as usize
+    }
+
+    fn cached_reader_slot(&self) -> Option<usize> {
+        let key = self.reader_slot_key();
+        CACHED_READER_SLOT.with(|slot| match slot.get() {
+            Some((cached_key, idx)) if cached_key == key => Some(idx),
+            _ => None,
+        })
+    }
+
+    fn remember_reader_slot(&self, idx: usize) {
+        let key = self.reader_slot_key();
+        CACHED_READER_SLOT.with(|slot| slot.set(Some((key, idx))));
+    }
+
+    fn try_claim_reader_slot(&self, idx: usize) -> bool {
+        self.slots[idx]
+            .compare_exchange(EMPTY_SLOT, SETTING_UP_SLOT, AcqRel, Acquire)
+            .is_ok()
+    }
+
+    fn claim_reader_slot(&self) -> Option<usize> {
+        let cached = self.cached_reader_slot();
+        if let Some(idx) = cached
+            && self.try_claim_reader_slot(idx)
+        {
+            return Some(idx);
+        }
+
+        let start = cached
+            .map(|idx| idx.wrapping_add(1))
+            .unwrap_or_else(|| self.next_reader_slot_probe.fetch_add(1, Relaxed) as usize)
+            % MAX_READER_SLOTS;
+
+        for offset in 0..MAX_READER_SLOTS {
+            let idx = (start + offset) % MAX_READER_SLOTS;
+            if Some(idx) == cached {
+                continue;
+            }
+            if self.try_claim_reader_slot(idx) {
+                self.remember_reader_slot(idx);
+                return Some(idx);
+            }
+        }
+
+        None
     }
 
     /// The vacuum horizon: oldest snapshot `xmin` among in-flight txns (NOT
     /// min txn id — a snapshot can be older than its holder's id). Versions
     /// deleted below this bound are invisible to every live snapshot.
     pub fn global_xmin(&self) -> u64 {
-        let active = self.active_txns.read().unwrap();
-        let readers = self.readers.read().unwrap();
-        let active_min = active.values().map(|(xmin, _)| *xmin);
-        let reader_min = readers.values().copied();
-        active_min
-            .chain(reader_min)
-            .min()
-            .unwrap_or_else(|| self.next_txn_id.load(Acquire))
+        loop {
+            let epoch = self.reader_epoch.load(Acquire);
+            if epoch & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+
+            let state = self.txn_state.load();
+            let mut min_xmin = state.xmin;
+
+            for i in 0..MAX_READER_SLOTS {
+                let val = self.slots[i].load(Acquire);
+                if val != EMPTY_SLOT {
+                    min_xmin = min_xmin.min(val);
+                }
+            }
+
+            if self.overflow_nonempty.load(Acquire) {
+                let readers = self.overflow_readers.lock().unwrap();
+                for val in readers.values() {
+                    min_xmin = min_xmin.min(*val);
+                }
+            }
+
+            if self.reader_epoch.load(Acquire) == epoch {
+                return min_xmin;
+            }
+        }
     }
 
     /// Take a snapshot-only reader. Unlike `begin`, this allocates no
@@ -119,50 +307,91 @@ impl TransactionManager {
     /// Returns the `Snapshot` and a `token`; the caller MUST pass the token to
     /// [`end_read`] once the read is done, or the horizon stays pinned.
     ///
-    /// Race safety: the `readers` insert happens while still holding the
-    /// `active_txns` read lock used to compute `xmin`. That freezes the active
-    /// set across compute-and-publish, so a concurrent `global_xmin` either
-    /// runs before us (its `min(active)` already ≤ our xmin) or after our
-    /// insert is visible — never in a window where our xmin is unaccounted.
+    /// Race safety: the snapshot is loaded from `txn_state` (lock-free via
+    /// `ArcSwap`). The loaded `xmin` may be stale-low if a commit races, but
+    /// a stale-low pin only delays vacuum — it can never allow vacuum to
+    /// advance past versions this reader needs. This is safe.
     pub fn read_snapshot(&self) -> (Snapshot, u64) {
-        let active = self.active_txns.read().unwrap();
-        let xmax = self.next_txn_id.load(Acquire);
-        let xmin = active.keys().min().copied().unwrap_or(xmax);
-        let active_vec: Vec<u64> = active.keys().cloned().collect();
+        self.reader_epoch.fetch_add(1, AcqRel);
 
-        let token = self.next_reader_token.fetch_add(1, AcqRel);
-        // Publish BEFORE releasing active_txns (lock order active → readers).
-        self.readers.write().unwrap().insert(token, xmin);
-        drop(active);
-
-        (
-            Snapshot {
-                xmin,
-                xmax,
-                active: active_vec,
-            },
-            token,
-        )
+        if let Some(slot_idx) = self.claim_reader_slot() {
+            loop {
+                let state = self.txn_state.load();
+                self.slots[slot_idx].store(state.xmin, SeqCst);
+                let check = self.txn_state.load();
+                if check.xmin == state.xmin {
+                    self.reader_epoch.fetch_add(1, Release);
+                    return (Self::snapshot_from_state(&state), slot_idx as u64);
+                }
+                self.slots[slot_idx].store(SETTING_UP_SLOT, SeqCst);
+            }
+        } else {
+            let token = self.next_reader_token.fetch_add(1, AcqRel);
+            loop {
+                {
+                    let mut readers = self.overflow_readers.lock().unwrap();
+                    readers.insert(token, SETTING_UP_SLOT);
+                    self.overflow_nonempty.store(true, Release);
+                }
+                let state = self.txn_state.load();
+                self.overflow_readers
+                    .lock()
+                    .unwrap()
+                    .insert(token, state.xmin);
+                let check = self.txn_state.load();
+                if check.xmin == state.xmin {
+                    self.reader_epoch.fetch_add(1, Release);
+                    return (
+                        Self::snapshot_from_state(&state),
+                        token | OVERFLOW_READER_TOKEN_FLAG,
+                    );
+                }
+            }
+        }
     }
 
     /// Release a snapshot-only reader's horizon pin. Deregistration only ever
     /// raises `global_xmin`, so it needs no lock coordination with `begin`.
     pub fn end_read(&self, token: u64) {
-        self.readers.write().unwrap().remove(&token);
+        if token & OVERFLOW_READER_TOKEN_FLAG != 0 {
+            let real_token = token & !OVERFLOW_READER_TOKEN_FLAG;
+            let mut lock = self.overflow_readers.lock().unwrap();
+            lock.remove(&real_token);
+            if lock.is_empty() {
+                self.overflow_nonempty.store(false, Release);
+            }
+        } else {
+            let idx = token as usize;
+            self.slots[idx].store(EMPTY_SLOT, SeqCst);
+        }
     }
 
     /// Age of the oldest still-open transaction, `None` if nothing is in
     /// flight. A large value here means `global_xmin` is pinned and vacuum
     /// cannot reclaim anything — the classic forgotten-transaction stall.
     pub fn oldest_active_txn_age(&self) -> Option<Duration> {
-        let active = self.active_txns.read().unwrap();
-        active.values().map(|(_, began)| began.elapsed()).max()
+        let active_state = self.active_state.read().unwrap();
+        active_state
+            .active
+            .values()
+            .map(|(_, began)| began.elapsed())
+            .max()
     }
 
     /// Publishes the horizon of a COMPLETED full vacuum sweep. `fetch_max` so a
     /// slower concurrent sweep can never move the horizon backward. (DESIGN §8.4)
     pub fn publish_vacuum_horizon(&self, horizon: u64) {
-        self.vacuum_horizon.fetch_max(horizon, AcqRel);
+        let previous = self.vacuum_horizon.fetch_max(horizon, AcqRel);
+        let effective_horizon = previous.max(horizon);
+
+        let mut active_state = self.active_state.write().unwrap();
+        let before = active_state.recent_aborts.len();
+        active_state
+            .recent_aborts
+            .retain(|txn_id| *txn_id >= effective_horizon);
+        if active_state.recent_aborts.len() != before {
+            self.publish_txn_state(&active_state);
+        }
     }
 
     /// The oldest-active-txn-id captured at the start of the most recent
@@ -222,15 +451,15 @@ impl TransactionManager {
         // Write-lock active_txns FIRST to prevent race conditions with get_snapshot.
         // We must lock before fetching TXN_ID to ensure that no snapshot is
         // generated in between ID creation and active set insertion.
-        let mut active = self.active_txns.write().unwrap();
+        let mut active = self.active_state.write().unwrap();
 
         let txn_id = self.next_txn_id.fetch_add(1, AcqRel);
         // Snapshot xmin = oldest in-flight txn; stored for global_xmin().
-        let xmin = active.keys().min().copied().unwrap_or(txn_id);
-        active.insert(txn_id, (xmin, Instant::now()));
+        let xmin = active.active.keys().min().copied().unwrap_or(txn_id);
+        active.active.insert(txn_id, (xmin, Instant::now()));
 
-        let xmax = self.next_txn_id.load(Acquire);
-        let active_vec: Vec<u64> = active.keys().cloned().collect();
+        let state = self.publish_txn_state(&active);
+        let snapshot = Self::snapshot_from_state(&state);
 
         drop(active);
 
@@ -241,11 +470,7 @@ impl TransactionManager {
 
         Transaction {
             txn_id,
-            snapshot: Snapshot {
-                xmin,
-                xmax,
-                active: active_vec,
-            },
+            snapshot,
             tm: std::sync::Arc::clone(self),
             wrote_anything: false,
         }
@@ -261,7 +486,10 @@ impl TransactionManager {
             .write()
             .unwrap()
             .insert(txn_id, TransactionStatus::Committed);
-        self.active_txns.write().unwrap().remove(&txn_id);
+        let mut active = self.active_state.write().unwrap();
+        active.active.remove(&txn_id);
+        self.publish_txn_state(&active);
+        drop(active);
         self.notify_waiters(txn_id);
     }
 
@@ -273,7 +501,11 @@ impl TransactionManager {
             .write()
             .unwrap()
             .insert(txn_id, TransactionStatus::Aborted);
-        self.active_txns.write().unwrap().remove(&txn_id);
+        let mut active = self.active_state.write().unwrap();
+        active.active.remove(&txn_id);
+        active.recent_aborts.insert(txn_id);
+        self.publish_txn_state(&active);
+        drop(active);
         self.notify_waiters(txn_id);
     }
 
@@ -339,12 +571,20 @@ impl TransactionManager {
 
     /// Returns `true` if the transaction is recorded as `Aborted` in the CLOG.
     pub fn is_aborted(&self, txn_id: u64) -> bool {
-        self.clog.read().unwrap().get(&txn_id) == Some(&TransactionStatus::Aborted)
+        self.active_state
+            .read()
+            .unwrap()
+            .recent_aborts
+            .contains(&txn_id)
     }
 
     /// Returns `true` if the transaction is currently in the active set.
     pub fn is_active(&self, txn_id: u64) -> bool {
-        self.active_txns.read().unwrap().contains_key(&txn_id)
+        self.active_state
+            .read()
+            .unwrap()
+            .active
+            .contains_key(&txn_id)
     }
 
     /// Generates a "latest" snapshot from the current manager state.
@@ -352,14 +592,8 @@ impl TransactionManager {
     /// This captures the current `xmin`, `xmax`, and active set. It is typically
     /// used for ad-hoc reads or by `begin()` to initialize a transaction's view.
     pub fn get_snapshot(&self) -> Snapshot {
-        // Read lock active_txns to guarantee consistency
-        let active = self.active_txns.read().unwrap();
-        let xmax = self.next_txn_id.load(Acquire);
-        Snapshot {
-            xmin: active.keys().min().copied().unwrap_or(xmax),
-            xmax,
-            active: active.keys().cloned().collect(),
-        }
+        let state = self.txn_state.load();
+        Self::snapshot_from_state(&state)
     }
 
     pub fn settled_status(&self, txn_id: u64) -> TransactionStatus {
@@ -380,10 +614,11 @@ impl TransactionManager {
     /// marked Aborted in the CLOG, providing the durable shadow of the
     /// aborted entries that existed at checkpoint time.
     pub fn seed_clog_from_checkpoint(&self, pinned_aborted: &[u64]) {
-        let mut clog = self.clog.write().unwrap();
+        let mut active = self.active_state.write().unwrap();
         for &txn_id in pinned_aborted {
-            clog.insert(txn_id, TransactionStatus::Aborted);
+            active.recent_aborts.insert(txn_id);
         }
+        self.publish_txn_state(&active);
     }
 }
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -446,6 +681,28 @@ mod tests {
         assert!(
             tm.clog.read().unwrap().is_empty(),
             "read_snapshot must not write a CLOG entry"
+        );
+        tm.end_read(token);
+    }
+
+    #[test]
+    fn read_snapshot_xmin_uses_snapshot_xmin_not_txn_id() {
+        let tm = std::sync::Arc::new(TransactionManager::new());
+        // txn1: txn_id=1, stored xmin=1
+        let txn1 = tm.begin();
+        // txn2: txn_id=2, stored xmin=1 (txn1 was still active at begin)
+        let txn2 = tm.begin();
+        // Commit txn1 — txn2 is still active with snapshot xmin=1.
+        tm.mark_committed(txn1.txn_id);
+
+        let (snap, token) = tm.read_snapshot();
+        // The reader's xmin must be 1 (txn2's stored snapshot xmin),
+        // NOT 2 (txn2's txn_id / min active key). Pinning at 2 would
+        // let vacuum advance past versions in [1, 2) that the reader
+        // can still see.
+        assert_eq!(
+            snap.xmin, txn2.snapshot.xmin,
+            "read_snapshot must use the snapshot xmin (from values), not the txn_id (from keys)"
         );
         tm.end_read(token);
     }
@@ -529,6 +786,74 @@ mod tests {
         assert!(snap.active.contains(&txn1.txn_id));
         assert!(snap.active.contains(&txn3.txn_id));
         assert_eq!(snap.active.len(), 2);
+    }
+
+    #[test]
+    fn published_txn_state_tracks_begin_commit_abort() {
+        let tm = std::sync::Arc::new(TransactionManager::new());
+        let initial = tm.txn_state.load();
+        assert_eq!(initial.xmin, 1);
+        assert_eq!(initial.xmax, 1);
+        assert!(initial.active.is_empty());
+        assert!(initial.aborted.is_empty());
+        drop(initial);
+
+        let txn1_id;
+        let txn2;
+        let txn3;
+        {
+            let txn1 = tm.begin();
+            txn1_id = txn1.txn_id;
+            txn2 = tm.begin();
+            txn3 = tm.begin();
+
+            let st = tm.txn_state.load();
+            assert_eq!(&*st.active, &[txn1.txn_id, txn2.txn_id, txn3.txn_id]);
+            assert_eq!(st.xmin, txn1.txn_id);
+            assert_eq!(st.xmax, txn3.txn_id + 1);
+            assert!(st.aborted.is_empty());
+        }
+
+        tm.mark_committed(txn2.txn_id);
+        {
+            let st = tm.txn_state.load();
+            assert_eq!(&*st.active, &[txn1_id, txn3.txn_id]);
+            assert_eq!(st.xmin, txn1_id);
+            assert_eq!(st.xmax, txn3.txn_id + 1);
+        }
+
+        tm.mark_aborted(txn3.txn_id);
+        {
+            let st = tm.txn_state.load();
+            assert_eq!(&*st.active, &[txn1_id]);
+            assert_eq!(st.xmin, txn1_id);
+            assert_eq!(st.xmax, txn3.txn_id + 1);
+            assert_eq!(
+                &*st.aborted,
+                &[txn3.txn_id],
+                "aborts move into TxnState in Phase 3"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_published_snapshot_hides_later_commit() {
+        let tm = std::sync::Arc::new(TransactionManager::new());
+        let writer = tm.begin();
+        let stale = TransactionManager::snapshot_from_state(&tm.txn_state.load());
+
+        tm.mark_committed(writer.txn_id);
+
+        assert!(
+            !stale.is_committed(writer.txn_id, &tm),
+            "a transaction active in the loaded snapshot must stay invisible to it after commit"
+        );
+
+        let fresh = tm.get_snapshot();
+        assert!(
+            fresh.is_committed(writer.txn_id, &tm),
+            "a fresh snapshot after commit should see the committed transaction"
+        );
     }
 
     // ── wait_until_settled ────────────────────────────────────────────────
@@ -759,6 +1084,7 @@ mod tests {
         let _txc2 = tm.begin();
 
         tm.publish_vacuum_horizon(txc1.txn_id);
+        assert!(!tm.is_aborted(tx_abort.txn_id));
         let committed_horizon = tm.global_xmin();
         tm.truncate_clog(committed_horizon);
 

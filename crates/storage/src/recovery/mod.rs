@@ -219,6 +219,12 @@ impl RecoveryManager {
         };
         self.pool.advance_next_page_id(final_next_page_id);
 
+        // Refresh the ArcSwap-published TxnState so that get_snapshot() and
+        // read_snapshot() see the recovered next_txn_id as xmax. Without this,
+        // the state would still have xmax=1 from construction, making all
+        // recovered rows invisible.
+        self.tm.refresh_txn_state();
+
         self.pool.flush_all_pages()?;
         Ok(())
     }

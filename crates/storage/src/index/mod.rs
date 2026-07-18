@@ -63,7 +63,7 @@ enum ChainSearch<'a> {
 pub struct BTreeIndex<K: Key, V: Value> {
     pool: Arc<BufferPoolManager>,
     wal: Arc<Wal>,
-    root: Mutex<PageId>,
+    root: std::sync::atomic::AtomicU64,
     pending_recycle: Mutex<Vec<(PageId, u64)>>,
     vacuum_lock: Mutex<()>,
     _key: PhantomData<K>,
@@ -249,6 +249,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         }
 
         tm.publish_vacuum_horizon(global_xmin);
+        tm.truncate_clog(global_xmin);
         Ok(total_dead)
     }
 
@@ -280,14 +281,14 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
     }
 
     pub fn root_page_id(&self) -> PageId {
-        *self.root.lock().unwrap()
+        self.root.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn from_root(pool: Arc<BufferPoolManager>, wal: Arc<Wal>, root: PageId) -> Self {
         Self {
             pool,
             wal,
-            root: Mutex::new(root),
+            root: std::sync::atomic::AtomicU64::new(root),
             pending_recycle: Mutex::new(Vec::new()),
             vacuum_lock: Mutex::new(()),
             _val: PhantomData,
@@ -301,7 +302,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
     pub fn get(&self, key: &K::SelfType<'_>, txn: &Transaction) -> Result<Option<Vec<u8>>> {
         let key_bytes = K::as_bytes(key);
         'restart: loop {
-            let root_pid = *self.root.lock().unwrap();
+            let root_pid = self.root_page_id();
             let leaf_pid = self.find_leaf(root_pid, key)?;
 
             // Shared latch on leaf + rightlink correction.
@@ -401,7 +402,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         }
 
         'restart: loop {
-            let root_pid = *self.root.lock().unwrap();
+            let root_pid = self.root_page_id();
             let mut stack = BTStack::new();
             let mut pid = root_pid;
 
@@ -414,7 +415,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
                     drop(page);
                     self.finish_split(pid, &stack)?;
                     stack.clear();
-                    pid = *self.root.lock().unwrap();
+                    pid = self.root_page_id();
                     continue;
                 }
                 match page[0] {
@@ -561,7 +562,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
 
     /// Delete `key` by setting xmax on the visible version.
     pub fn delete(&self, key: &K::SelfType<'_>, txn: &Transaction) -> Result<()> {
-        let root_pid = *self.root.lock().unwrap();
+        let root_pid = self.root_page_id();
         let key_bytes = K::as_bytes(key);
         let mut pid = root_pid;
 
@@ -668,7 +669,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
             });
         }
 
-        let root_pid = *self.root.lock().unwrap();
+        let root_pid = self.root_page_id();
         let mut stack = BTStack::new();
         let mut pid = root_pid;
 
@@ -821,7 +822,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         K: 'static,
         R: RangeBounds<K::SelfType<'static>>,
     {
-        let root_pid = *self.root.lock().unwrap();
+        let root_pid = self.root_page_id();
 
         let (current_leaf, start_slot) = match range.start_bound() {
             Bound::Included(k) => {
@@ -879,7 +880,7 @@ impl<K: Key, V: Value> BTreeIndex<K, V> {
         K: 'static,
         R: RangeBounds<K::SelfType<'static>>,
     {
-        let root_pid = *self.root.lock().unwrap();
+        let root_pid = self.root_page_id();
 
         let (current_leaf, start_slot) = match range.end_bound() {
             Bound::Included(k) => {
