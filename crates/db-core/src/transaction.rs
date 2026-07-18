@@ -21,7 +21,7 @@
 //! by an active transaction, the current transaction loses (returns
 //! `WriteConflict`). The first transaction to set `xmax` wins.
 
-use crate::transaction_manager::{TransactionManager, TransactionStatus};
+use crate::transaction_manager::{TransactionManager, TransactionStatus, TxnState};
 use std::sync::Arc;
 
 /// A transaction's identity and its point-in-time view of the database.
@@ -104,10 +104,29 @@ impl Transaction {
 pub struct Snapshot {
     pub xmin: u64,
     pub xmax: u64,
-    pub active: Vec<u64>,
+    pub active: Arc<[u64]>,
+    pub aborted: Arc<[u64]>,
 }
 
 impl Snapshot {
+    pub fn from_parts(xmin: u64, xmax: u64, active: Arc<[u64]>, aborted: Arc<[u64]>) -> Self {
+        Self {
+            xmin,
+            xmax,
+            active,
+            aborted,
+        }
+    }
+
+    pub fn from_state(state: &TxnState) -> Self {
+        Self::from_parts(
+            state.xmin,
+            state.xmax,
+            Arc::clone(&state.active),
+            Arc::clone(&state.aborted),
+        )
+    }
+
     /// A snapshot that sees all committed data and treats all deletions as
     /// visible. Equivalent to "read the latest state."
     ///
@@ -119,7 +138,8 @@ impl Snapshot {
         Self {
             xmin: u64::MAX,
             xmax: u64::MAX,
-            active: vec![],
+            active: Arc::from([]),
+            aborted: Arc::from([]),
         }
     }
 
@@ -130,7 +150,7 @@ impl Snapshot {
     /// - The CLOG records it as committed or aborted (authoritative), OR
     /// - Its ID is below `xmin` (finished before snapshot was taken), OR
     /// - Its ID is between `xmin` and `xmax` AND not in the active list.
-    pub fn is_committed(&self, txn_id: u64, tm: &TransactionManager) -> bool {
+    pub fn is_committed(&self, txn_id: u64, _tm: &TransactionManager) -> bool {
         if txn_id == 0 {
             return true; // the "auto" transaction is always committed
         }
@@ -140,12 +160,14 @@ impl Snapshot {
         if txn_id >= self.xmax {
             return false; // started after the snapshot
         }
-        if self.active.contains(&txn_id) {
+        if self.active.binary_search(&txn_id).is_ok() {
             return false; // in-flight when the snapshot was taken
         }
-        // Settled before the snapshot (below xmax, not active) → committed
-        // unless it aborted (presumed commit).
-        !tm.is_aborted(txn_id)
+        if self.aborted.binary_search(&txn_id).is_ok() {
+            return false; // aborted
+        }
+        // Settled before the snapshot (below xmax, not active, not aborted) → committed
+        true
     }
 
     /// Is the given transaction still in-progress from this snapshot's
@@ -163,7 +185,7 @@ impl Snapshot {
         if txn_id >= self.xmax {
             return true; // not yet started → treat as in-progress
         }
-        self.active.contains(&txn_id)
+        self.active.binary_search(&txn_id).is_ok()
     }
 }
 
@@ -240,10 +262,13 @@ mod tests {
     use super::*;
 
     fn snap(xmin: u64, xmax: u64, active: &[u64]) -> Snapshot {
+        let mut active = active.to_vec();
+        active.sort_unstable();
         Snapshot {
             xmin,
             xmax,
-            active: active.to_vec(),
+            active: Arc::from(active),
+            aborted: Arc::from([]),
         }
     }
 

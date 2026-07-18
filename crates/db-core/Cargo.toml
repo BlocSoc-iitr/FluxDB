@@ -8,6 +8,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [dependencies]
 arc-swap = "1"
+crossbeam-utils = "0.8.22"
 
 [dev-dependencies]
 loom = "0.7"
